@@ -1,0 +1,324 @@
+//! Bounded, lock-free, wait-free SPSC ring buffer.
+//!
+//! Designed for single-producer, single-consumer communication between
+//! pinned cores in the DPDK engine.
+//!
+//! Cache-line padded to prevent false sharing between producer (head)
+//! and consumer (tail). On x86_64, the Release store compiles to a
+//! plain MOV — the strong memory model gives us release semantics for free.
+
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+#[repr(C)]
+struct SpscRing<T, const N: usize> {
+    head: AtomicUsize,
+    _pad0: [u8; 56], // pad to 64-byte cache line
+    tail: AtomicUsize,
+    _pad1: [u8; 56], // pad to 64-byte cache line
+    buffer: [UnsafeCell<Option<T>>; N],
+}
+
+// SAFETY: SpscRing is designed for single-producer, single-consumer use.
+// The producer only writes head and buffer[head], the consumer only writes
+// tail and reads buffer[tail]. Atomic ordering ensures visibility.
+unsafe impl<T: Send, const N: usize> Send for SpscRing<T, N> {}
+unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
+
+impl<T, const N: usize> Default for SpscRing<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, const N: usize> SpscRing<T, N> {
+    /// Create a new empty ring buffer.
+    ///
+    /// N must be a power of two for optimal performance (modulo becomes
+    /// a bitmask), but correctness does not require it.
+    fn new() -> Self {
+        Self {
+            head: AtomicUsize::new(0),
+            _pad0: [0u8; 56],
+            tail: AtomicUsize::new(0),
+            _pad1: [0u8; 56],
+            buffer: core::array::from_fn(|_| UnsafeCell::new(None)),
+        }
+    }
+
+    /// Push an item into the ring. Returns `Err(item)` if full.
+    ///
+    /// Must only be called from the producer thread.
+    #[inline(always)]
+    fn push(&self, item: T) -> Result<(), T> {
+        let head = self.head.load(Ordering::Relaxed);
+        let next_head = (head + 1) % N;
+
+        if next_head == self.tail.load(Ordering::Acquire) {
+            return Err(item);
+        }
+
+        unsafe {
+            *self.buffer[head].get() = Some(item);
+        }
+        self.head.store(next_head, Ordering::Release);
+        Ok(())
+    }
+
+    /// Pop an item from the ring. Returns `None` if empty.
+    ///
+    /// Must only be called from the consumer thread.
+    #[inline(always)]
+    fn pop(&self) -> Option<T> {
+        let tail = self.tail.load(Ordering::Relaxed);
+
+        if tail == self.head.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let item = unsafe { (*self.buffer[tail].get()).take() };
+        self.tail.store((tail + 1) % N, Ordering::Release);
+        item
+    }
+
+    /// Returns the number of items currently in the ring.
+    #[inline(always)]
+    fn len(&self) -> usize {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
+        (head + N - tail) % N
+    }
+
+    /// Returns true if the ring is empty.
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the capacity (max items before full).
+    /// Actual usable capacity is N-1 (one slot reserved to distinguish full from empty).
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        N - 1
+    }
+}
+
+struct ControlBlock<T, const N: usize> {
+    ring: Box<SpscRing<T, N>>,
+    has_rx: AtomicBool,
+    has_tx: AtomicBool,
+}
+
+pub struct Rx<T, const N: usize> {
+    cb: *mut ControlBlock<T, N>,
+}
+
+impl<T, const N: usize> Drop for Rx<T, N> {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.cb).has_rx.store(false, Ordering::Release);
+            if !(*self.cb).has_tx.load(Ordering::Acquire) {
+                // SAFETY: we are the last owner of the control block, so it's safe to
+                // deallocate it.
+                let _ = Box::from_raw(self.cb);
+            }
+        }
+    }
+}
+
+impl<T, const N: usize> Rx<T, N> {
+    pub fn pop(&self) -> Option<T> {
+        unsafe { (*self.cb).ring.pop() }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        unsafe { !(*self.cb).has_tx.load(Ordering::Acquire) }
+    }
+
+    pub fn len(&self) -> usize {
+        unsafe { (*self.cb).ring.len() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        unsafe { (*self.cb).ring.is_empty() }
+    }
+
+    pub fn capacity(&self) -> usize {
+        unsafe { (*self.cb).ring.capacity() }
+    }
+}
+
+pub struct Tx<T, const N: usize> {
+    cb: *mut ControlBlock<T, N>,
+}
+
+impl<T, const N: usize> Drop for Tx<T, N> {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.cb).has_tx.store(false, Ordering::Release);
+            if !(*self.cb).has_rx.load(Ordering::Acquire) {
+                // SAFETY: we are the last owner of the control block, so it's safe to
+                // deallocate it.
+                let _ = Box::from_raw(self.cb);
+            }
+        }
+    }
+}
+
+impl<T, const N: usize> Tx<T, N> {
+    pub fn push(&self, item: T) -> Result<(), T> {
+        unsafe { (*self.cb).ring.push(item) }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        unsafe { !(*self.cb).has_rx.load(Ordering::Acquire) }
+    }
+
+    pub fn len(&self) -> usize {
+        unsafe { (*self.cb).ring.len() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        unsafe { (*self.cb).ring.is_empty() }
+    }
+
+    pub fn capacity(&self) -> usize {
+        unsafe { (*self.cb).ring.capacity() }
+    }
+}
+
+/// Creates a new SPSC channel with the given capacity. Returns a `(Tx, Rx)` pair for sending and receiving items.
+/// The Tx handle should be used by the producer thread, and the Rx handle should be used by the consumer thread.
+/// The channel is closed when either handle is dropped; the other handle can check for closure with `is_closed()`.
+pub fn channel<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
+    let cb = Box::new(ControlBlock {
+        ring: Box::new(SpscRing::new()),
+        has_rx: AtomicBool::new(true),
+        has_tx: AtomicBool::new(true),
+    });
+    let cb_ptr = Box::into_raw(cb);
+    (Tx { cb: cb_ptr }, Rx { cb: cb_ptr })
+}
+
+// SAFETY: Tx & Rx are designed for single-producer, single-consumer use.
+// Once created via `channel`, the producer thread should only use `Tx` and the consumer
+// thread should only use `Rx`. Atomic ordering ensures visibility of the control block state.
+unsafe impl<T: Send, const N: usize> Send for Tx<T, N> {}
+unsafe impl<T: Send, const N: usize> Send for Rx<T, N> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_pop_single() {
+        let ring: SpscRing<u64, 4> = SpscRing::new();
+        assert!(ring.is_empty());
+
+        ring.push(42).unwrap();
+        assert_eq!(ring.len(), 1);
+
+        let val = ring.pop().unwrap();
+        assert_eq!(val, 42);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn push_until_full() {
+        let ring: SpscRing<u32, 4> = SpscRing::new();
+
+        // Capacity is N-1 = 3
+        ring.push(1).unwrap();
+        ring.push(2).unwrap();
+        ring.push(3).unwrap();
+        assert_eq!(ring.len(), 3);
+
+        // Should fail — ring is full
+        let result = ring.push(4);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), 4);
+    }
+
+    #[test]
+    fn pop_empty() {
+        let ring: SpscRing<u32, 4> = SpscRing::new();
+        assert!(ring.pop().is_none());
+    }
+
+    #[test]
+    fn fifo_order() {
+        let ring: SpscRing<u32, 8> = SpscRing::new();
+
+        for i in 0..7 {
+            ring.push(i).unwrap();
+        }
+        for i in 0..7 {
+            assert_eq!(ring.pop().unwrap(), i);
+        }
+    }
+
+    #[test]
+    fn wrap_around() {
+        let ring: SpscRing<u32, 4> = SpscRing::new();
+
+        // Fill and drain multiple times to test wrap-around
+        for _ in 0..10 {
+            ring.push(1).unwrap();
+            ring.push(2).unwrap();
+            ring.push(3).unwrap();
+
+            assert_eq!(ring.pop().unwrap(), 1);
+            assert_eq!(ring.pop().unwrap(), 2);
+            assert_eq!(ring.pop().unwrap(), 3);
+            assert!(ring.is_empty());
+        }
+    }
+
+    #[test]
+    fn capacity() {
+        let ring: SpscRing<u32, 16> = SpscRing::new();
+        assert_eq!(ring.capacity(), 15);
+    }
+
+    #[test]
+    fn spsc_across_threads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let ring = Arc::new(SpscRing::<u64, 1024>::new());
+        let producer_ring = Arc::clone(&ring);
+        let consumer_ring = Arc::clone(&ring);
+        let count = 10_000u64;
+
+        let producer = thread::spawn(move || {
+            for i in 0..count {
+                loop {
+                    if producer_ring.push(i).is_ok() {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        });
+
+        let consumer = thread::spawn(move || {
+            let mut received = Vec::with_capacity(count as usize);
+            while received.len() < count as usize {
+                if let Some(val) = consumer_ring.pop() {
+                    received.push(val);
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            received
+        });
+
+        producer.join().unwrap();
+        let received = consumer.join().unwrap();
+
+        // Verify FIFO ordering
+        for (i, val) in received.iter().enumerate() {
+            assert_eq!(*val, i as u64);
+        }
+    }
+}

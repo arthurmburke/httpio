@@ -1,0 +1,38 @@
+{
+  "name": "tcp (Rust + DPDK)",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  // IPC_LOCK: EAL mlock()s memory even in --no-huge mode.
+  // NET_ADMIN: needed if you experiment with virtio-user/TAP vdevs.
+  // Real NIC passthrough (vfio-pci) would additionally need --privileged
+  // and host device mounts; not enabled by default.
+  "runArgs": [
+    "--cap-add=IPC_LOCK",
+    "--cap-add=NET_ADMIN",
+    "--device=/dev/net/tun"
+  ],
+  // Keep build artifacts OFF the bind-mounted workspace. Sharing target/
+  // with the macOS host both mixes incompatible platform artifacts and
+  // trips cargo's mtime-based fingerprinting over Docker Desktop's file
+  // sharing (symptom: "crate `syn` required to be available in rlib
+  // format" and similar mid-build errors). A container-local target dir
+  // on a named volume avoids both and is much faster than VirtioFS.
+  "containerEnv": {
+    "CARGO_TARGET_DIR": "/home/vscode/.cargo-target"
+  },
+  "mounts": [
+    "source=tcp-cargo-target,target=/home/vscode/.cargo-target,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb"
+      ]
+    }
+  },
+  // The named volume is created root-owned on first use; hand it to the
+  // vscode user before the first build.
+  "postCreateCommand": "sudo chown vscode:vscode /home/vscode/.cargo-target && cargo build"
+}
