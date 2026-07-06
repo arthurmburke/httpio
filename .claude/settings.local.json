@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo build *)",
+      "Bash(cargo check *)",
+      "Bash(docker --version)",
+      "Bash(docker info *)",
+      "Bash(docker build *)",
+      "Bash(docker run *)",
+      "Bash(ls -la /Users/arthurburke/Developer/tcp/csrc/ 2>&1 | head; echo \"---\"; ls /Users/arthurburke/Developer/tcp/ 2>&1 | head)"
+    ]
+  }
+}

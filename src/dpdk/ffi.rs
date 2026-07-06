@@ -38,10 +38,11 @@ mod bindings {
 
 #[cfg(dpdk_bound)]
 pub use bindings::{
-    rte_eal_init, rte_eal_remote_launch, rte_eal_wait_lcore, rte_eth_dev_count_avail,
-    rte_eth_dev_start, rte_eth_dev_stop, rte_eth_macaddr_get, rte_eth_promiscuous_enable,
-    rte_eth_rx_queue_setup, rte_eth_tx_queue_setup, rte_ether_addr, rte_get_next_lcore,
-    rte_lcore_count, rte_mbuf, rte_mempool, rte_pktmbuf_pool_create,
+    rte_eal_cleanup, rte_eal_init, rte_eal_remote_launch, rte_eal_wait_lcore,
+    rte_eth_dev_close, rte_eth_dev_count_avail, rte_eth_dev_start, rte_eth_dev_stop,
+    rte_eth_macaddr_get, rte_eth_promiscuous_enable, rte_eth_rx_queue_setup,
+    rte_eth_tx_queue_setup, rte_ether_addr, rte_get_next_lcore, rte_lcore_count, rte_mbuf,
+    rte_mempool, rte_pktmbuf_pool_create,
 };
 
 /// `typedef int (*lcore_function_t)(void *)` -- the entry point
@@ -106,9 +107,11 @@ mod stub {
         ) -> c_int;
         pub fn rte_eth_dev_start(port_id: u16) -> c_int;
         pub fn rte_eth_dev_stop(port_id: u16) -> c_int;
+        pub fn rte_eth_dev_close(port_id: u16) -> c_int;
         pub fn rte_eth_promiscuous_enable(port_id: u16) -> c_int;
         pub fn rte_eth_macaddr_get(port_id: u16, mac_addr: *mut rte_ether_addr) -> c_int;
 
+        pub fn rte_eal_cleanup() -> c_int;
         pub fn rte_eal_remote_launch(
             f: super::LcoreFunction,
             arg: *mut c_void,
@@ -131,6 +134,8 @@ unsafe extern "C" {
     /// `rte_lcore_id()` is inline (reads a per-lcore variable), so it has
     /// no linkable symbol -- wrapped by the shim.
     pub fn dpdk_shim_lcore_id() -> c_uint;
+    /// The main (initial) lcore -- the one that called `rte_eal_init`.
+    pub fn dpdk_shim_main_lcore() -> c_uint;
     /// `RTE_MAX_LCORE` compile-time constant (the "no next lcore"
     /// sentinel returned by `rte_get_next_lcore`).
     pub fn dpdk_shim_max_lcore() -> c_uint;

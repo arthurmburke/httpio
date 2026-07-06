@@ -85,12 +85,14 @@ check "HTTP/1.1 plaintext"          "HTTP/1.1 200" http://10.9.0.2:8080/hello.tx
 check "HTTP/1.1 over TLS (custom CA)" "HTTP/1.1 200" https://test.local:8443/hello.txt "${TLS_ARGS[@]}"
 check "HTTP/2 over TLS (custom CA)"   "HTTP/2.0 200" https://test.local:9443/hello.txt "${TLS_ARGS[@]}"
 
-# Transport options piped through requests: corked connections hold
-# sub-MSS tails until protocol flush points -- if the flush wiring were
-# broken these would hang on the TLS handshake and time out.
-check "HTTP/1.1 TLS corked"        "HTTP/1.1 200" https://test.local:8443/hello.txt "${TLS_ARGS[@]}" --cork
-check "HTTP/2 TLS corked + Nagle"  "HTTP/2.0 200" https://test.local:9443/hello.txt "${TLS_ARGS[@]}" --cork --nagle
-check "HTTP/1.1 plaintext Nagle"   "HTTP/1.1 200" http://10.9.0.2:8080/hello.txt --nagle
+# Transport options piped through requests. Corked connections hold the
+# final segment until a manual flush; the CLI drives that flush itself
+# (see http_get). A corked request always negotiates HTTP/1.1 -- a
+# manually held tail can't share a multiplexed h2 connection -- so both
+# corked checks target the h1 server and expect HTTP/1.1.
+check "HTTP/1.1 TLS corked"         "HTTP/1.1 200" https://test.local:8443/hello.txt "${TLS_ARGS[@]}" --cork
+check "HTTP/1.1 TLS corked + Nagle" "HTTP/1.1 200" https://test.local:8443/hello.txt "${TLS_ARGS[@]}" --cork --nagle
+check "HTTP/1.1 plaintext Nagle"    "HTTP/1.1 200" http://10.9.0.2:8080/hello.txt --nagle
 
 # HTTP/2 connection reuse: two requests to the same h2 origin in one
 # process must multiplex over a single pooled TCP connection.

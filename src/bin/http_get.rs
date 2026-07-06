@@ -93,6 +93,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+    
     let (worker, worker_join) = match WorkerHandle::spawn(engine, port, pool, worker_lcore) {
         Ok(pair) => pair,
         Err(e) => {

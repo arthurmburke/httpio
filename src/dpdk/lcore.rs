@@ -10,10 +10,16 @@ use std::os::raw::{c_int, c_void};
 
 use super::ffi;
 
-/// The main lcore's id (the one that called `rte_eal_init`).
+/// The calling thread's lcore id.
 pub fn current_lcore_id() -> u32 {
     // SAFETY: reads a per-lcore variable; valid on any EAL thread.
     unsafe { ffi::dpdk_shim_lcore_id() }
+}
+
+/// The main (initial) lcore's id -- the one that called `rte_eal_init`.
+pub fn main_lcore_id() -> u32 {
+    // SAFETY: reads immutable EAL configuration; valid on any EAL thread.
+    unsafe { ffi::dpdk_shim_main_lcore() }
 }
 
 /// Number of lcores in the EAL coremask.
@@ -25,11 +31,21 @@ pub fn lcore_count() -> u32 {
 /// (main) one, not wrapping around. Returns `None` if EAL was started
 /// with only one lcore (pass e.g. `-l 0-1` to get a worker).
 pub fn first_worker_lcore() -> Option<u32> {
-    let main = current_lcore_id();
+    let main = main_lcore_id();
     // skip_main=1: never return the main lcore; wrap=0: stop at the end.
     let next = unsafe { ffi::rte_get_next_lcore(main, 1, 0) };
     // rte_get_next_lcore returns RTE_MAX_LCORE when there is no next
     // lcore.
+    if next >= unsafe { ffi::dpdk_shim_max_lcore() } {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+/// Get the next lcore after `lcore`.
+pub fn next_lcore(lcore: u32) -> Option<u32> {
+    let next = unsafe { ffi::rte_get_next_lcore(lcore, 0, 0) };
     if next >= unsafe { ffi::dpdk_shim_max_lcore() } {
         None
     } else {

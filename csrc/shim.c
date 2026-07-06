@@ -32,6 +32,13 @@ dpdk_shim_lcore_id(void)
 	return rte_lcore_id();
 }
 
+/* The main (initial) lcore -- the one that called rte_eal_init. */
+unsigned int
+dpdk_shim_main_lcore(void)
+{
+	return rte_get_main_lcore();
+}
+
 /* RTE_MAX_LCORE is the sentinel rte_get_next_lcore() returns when there
  * is no next lcore; expose the compile-time constant rather than
  * hard-coding its value (it varies with the DPDK build config). */

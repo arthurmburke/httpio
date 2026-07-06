@@ -252,9 +252,18 @@ fn run(
         for conn in conns.values_mut() {
             while let Some(cmd) = conn.cmd_rx.pop() {
                 match cmd {
-                    Command::Send(data) => engine.send(conn.tuple, &data),
-                    Command::SetCork(c) => engine.set_cork(conn.tuple, c),
-                    Command::Flush => engine.flush(conn.tuple),
+                    Command::Send(data) => {
+                        dbg_worker(format_args!("Send {} bytes", data.len()));
+                        engine.send(conn.tuple, &data);
+                    }
+                    Command::SetCork(c) => {
+                        dbg_worker(format_args!("SetCork {c}"));
+                        engine.set_cork(conn.tuple, c);
+                    }
+                    Command::Flush => {
+                        dbg_worker(format_args!("Flush"));
+                        engine.flush(conn.tuple);
+                    }
                     Command::Close => {
                         engine.close(conn.tuple);
                         conn.closing = true;
@@ -355,5 +364,12 @@ fn run(
             }
             true
         });
+    }
+}
+
+/// Env-gated (`TCP_DEBUG`) worker tracing; compiled in but silent unless set.
+fn dbg_worker(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("TCP_DEBUG").is_some() {
+        eprintln!("[worker] {args}");
     }
 }
