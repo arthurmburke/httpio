@@ -14,11 +14,11 @@
 use std::env;
 use std::time::Instant;
 
-use tcp::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use tcp::dpdk::{self, EthPort, PktMbufPool};
-use tcp::tcp::engine::{EngineConfig, TcpEngine};
-use tcp::tcp::socket::TcpSocket;
-use tcp::tcp::state::TcpState;
+use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+use bypio::dpdk::{self, EthPort, PktMbufPool};
+use bypio::tcp::engine::{EngineConfig, TcpEngine};
+use bypio::tcp::socket::TcpSocket;
+use bypio::tcp::state::TcpState;
 
 const PORT_ID: u16 = 0;
 const MBUF_POOL_SIZE: u32 = 8192;

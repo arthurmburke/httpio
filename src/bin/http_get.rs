@@ -17,13 +17,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{Method, Request};
 
-use tcp::http::stream::{FlushHandle, TcpOptions};
-use tcp::tcp::engine::TcpEngine;
-use tcp::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use tcp::dpdk::{self, EthPort, PktMbufPool};
-use tcp::http::client::builder::Builder;
-use tcp::tcp::worker::WorkerHandle;
-use tcp::tcp::engine::EngineConfig;
+use bypio::http::stream::{FlushHandle, TcpOptions};
+use bypio::tcp::engine::TcpEngine;
+use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+use bypio::dpdk::{self, EthPort, PktMbufPool};
+use bypio::http::client::builder::Builder;
+use bypio::tcp::worker::WorkerHandle;
+use bypio::tcp::engine::EngineConfig;
 
 const PORT_ID: u16 = 0;
 const MBUF_POOL_SIZE: u32 = 8192;
@@ -115,7 +115,7 @@ fn main() -> ExitCode {
     result
 }
 
-async fn run_requests(app: &AppArgs, worker: tcp::tcp::worker::WorkerHandle) -> ExitCode {
+async fn run_requests(app: &AppArgs, worker: bypio::tcp::worker::WorkerHandle) -> ExitCode {
     let mut builder = Builder::new();
     for ca in &app.ca_files {
         builder = match builder.add_root_ca_pem_file(ca) {
