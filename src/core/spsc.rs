@@ -14,7 +14,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 #[repr(C)]
 struct SpscRing<T, const N: usize> {
@@ -131,7 +131,7 @@ impl<T, const N: usize> SpscRx<T, N> {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.ring.flags.load(Ordering::Acquire) == 0b11
+        self.ring.flags.load(Ordering::Acquire) != 0b11
     }
 
     pub fn len(&self) -> usize {
@@ -163,7 +163,7 @@ impl<T, const N: usize> SpscTx<T, N> {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.ring.flags.load(Ordering::Acquire) == 0b11
+        self.ring.flags.load(Ordering::Acquire) != 0b11
     }
 
     pub fn len(&self) -> usize {
@@ -304,5 +304,18 @@ mod tests {
         for (i, val) in received.iter().enumerate() {
             assert_eq!(*val, i as u64);
         }
+    }
+
+    #[test]
+    pub fn test_closure() {
+        let (tx, rx) = channel::<u64, 4>();
+        assert!(!rx.is_closed());
+        drop(tx);
+        assert!(rx.is_closed());
+
+        let (tx, rx) = channel::<u64, 4>();
+        assert!(!tx.is_closed());
+        drop(rx);
+        assert!(tx.is_closed());
     }
 }
