@@ -136,9 +136,10 @@ impl HttpClient {
         parts
             .headers
             .insert(header::UPGRADE, http::HeaderValue::from_static("websocket"));
-        parts
-            .headers
-            .insert(header::CONNECTION, http::HeaderValue::from_static("Upgrade"));
+        parts.headers.insert(
+            header::CONNECTION,
+            http::HeaderValue::from_static("Upgrade"),
+        );
         parts.headers.insert(
             header::SEC_WEBSOCKET_KEY,
             http::HeaderValue::from_str(&key)?,

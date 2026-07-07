@@ -13,7 +13,8 @@
 //! on separate lines (avoiding false sharing).
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 #[repr(C)]
 struct SpscRing<T, const N: usize> {
@@ -22,6 +23,7 @@ struct SpscRing<T, const N: usize> {
     tail: AtomicUsize,
     _pad1: [u8; 56], // pad to 64-byte cache line
     buffer: [UnsafeCell<Option<T>>; N],
+    flags: AtomicU8,
 }
 
 // SAFETY: SpscRing is designed for single-producer, single-consumer use.
@@ -51,6 +53,7 @@ impl<T, const N: usize> SpscRing<T, N> {
             tail: AtomicUsize::new(0),
             _pad1: [0u8; 56],
             buffer: core::array::from_fn(|_| UnsafeCell::new(None)),
+            flags: AtomicU8::new(0b11), // 0b11 indicates there is a consumer and a producer
         }
     }
 
@@ -111,87 +114,68 @@ impl<T, const N: usize> SpscRing<T, N> {
     }
 }
 
-struct ControlBlock<T, const N: usize> {
-    ring: Box<SpscRing<T, N>>,
-    has_rx: AtomicBool,
-    has_tx: AtomicBool,
-}
-
 pub struct SpscRx<T, const N: usize> {
-    cb: *mut ControlBlock<T, N>,
+    ring: Arc<SpscRing<T, N>>,
 }
 
 impl<T, const N: usize> Drop for SpscRx<T, N> {
     fn drop(&mut self) {
-        unsafe {
-            (*self.cb).has_rx.store(false, Ordering::Release);
-            if !(*self.cb).has_tx.load(Ordering::Acquire) {
-                // SAFETY: we are the last owner of the control block, so it's safe to
-                // deallocate it.
-                let _ = Box::from_raw(self.cb);
-            }
-        }
+        // Consumer is the second bit, producer is the first bit. Clear the consumer bit.
+        self.ring.flags.fetch_and(0b10, Ordering::AcqRel);
     }
 }
 
 impl<T, const N: usize> SpscRx<T, N> {
     pub fn pop(&self) -> Option<T> {
-        unsafe { (*self.cb).ring.pop() }
+        self.ring.pop()
     }
 
     pub fn is_closed(&self) -> bool {
-        unsafe { !(*self.cb).has_tx.load(Ordering::Acquire) }
+        self.ring.flags.load(Ordering::Acquire) == 0b11
     }
 
     pub fn len(&self) -> usize {
-        unsafe { (*self.cb).ring.len() }
+        self.ring.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        unsafe { (*self.cb).ring.is_empty() }
+        self.ring.is_empty()
     }
 
     pub fn capacity(&self) -> usize {
-        unsafe { (*self.cb).ring.capacity() }
+        self.ring.capacity()
     }
 }
 
 pub struct SpscTx<T, const N: usize> {
-    cb: *mut ControlBlock<T, N>,
+    ring: Arc<SpscRing<T, N>>,
 }
 
 impl<T, const N: usize> Drop for SpscTx<T, N> {
     fn drop(&mut self) {
-        unsafe {
-            (*self.cb).has_tx.store(false, Ordering::Release);
-            if !(*self.cb).has_rx.load(Ordering::Acquire) {
-                // SAFETY: we are the last owner of the control block, so it's safe to
-                // deallocate it.
-                let _ = Box::from_raw(self.cb);
-            }
-        }
+        self.ring.flags.fetch_and(0b01, Ordering::AcqRel);
     }
 }
 
 impl<T, const N: usize> SpscTx<T, N> {
     pub fn push(&self, item: T) -> Result<(), T> {
-        unsafe { (*self.cb).ring.push(item) }
+        self.ring.push(item)
     }
 
     pub fn is_closed(&self) -> bool {
-        unsafe { !(*self.cb).has_rx.load(Ordering::Acquire) }
+        self.ring.flags.load(Ordering::Acquire) == 0b11
     }
 
     pub fn len(&self) -> usize {
-        unsafe { (*self.cb).ring.len() }
+        self.ring.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        unsafe { (*self.cb).ring.is_empty() }
+        self.ring.is_empty()
     }
 
     pub fn capacity(&self) -> usize {
-        unsafe { (*self.cb).ring.capacity() }
+        self.ring.capacity()
     }
 }
 
@@ -199,13 +183,8 @@ impl<T, const N: usize> SpscTx<T, N> {
 /// The Tx handle should be used by the producer thread, and the Rx handle should be used by the consumer thread.
 /// The channel is closed when either handle is dropped; the other handle can check for closure with `is_closed()`.
 pub fn channel<T, const N: usize>() -> (SpscTx<T, N>, SpscRx<T, N>) {
-    let cb = Box::new(ControlBlock {
-        ring: Box::new(SpscRing::new()),
-        has_rx: AtomicBool::new(true),
-        has_tx: AtomicBool::new(true),
-    });
-    let cb_ptr = Box::into_raw(cb);
-    (SpscTx { cb: cb_ptr }, SpscRx { cb: cb_ptr })
+    let ring = Arc::new(SpscRing::new());
+    (SpscTx { ring: ring.clone() }, SpscRx { ring: ring })
 }
 
 // SAFETY: Tx & Rx are designed for single-producer, single-consumer use.
