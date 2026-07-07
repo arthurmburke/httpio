@@ -21,7 +21,7 @@
 //! offered, so RSV bits or a server-selected protocol fail the handshake.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use http::{Method, Request, StatusCode, Uri, header};
+use http::{Method, Request, StatusCode, header};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -65,13 +65,40 @@ pub struct CloseFrame {
 }
 
 impl HttpClient {
-    /// Opens a WebSocket connection to a `ws://` or `wss://` URL.
+    /// Opens a WebSocket connection to a `ws://` or `wss://` URL with a
+    /// default handshake request. For custom headers (`Authorization`,
+    /// `Cookie`, `Origin`, ...) or subprotocol offers, build the request
+    /// yourself and use [`websocket_request`](Self::websocket_request).
     ///
     /// Corking is not allowed for WebSocket connections; the underlying
-    /// TCP connection is always `nodelay: true, cork: false`.
+    /// TCP connection is always uncorked.
     pub async fn websocket(&self, url: &str) -> Result<WebSocket, Error> {
-        let uri: Uri = url.parse()?;
-        match uri.scheme_str() {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(url)
+            .body(Bytes::new())?;
+        self.websocket_request(request).await
+    }
+
+    /// Opens a WebSocket connection from a caller-built handshake request,
+    /// preserving its URI (including query parameters) and headers -- e.g.
+    /// `Authorization`, `Cookie`, `Origin`, or `Sec-WebSocket-Protocol`
+    /// offers. The method must be GET and the URI scheme `ws`/`wss`.
+    ///
+    /// The protocol-mandated fields (`Upgrade`, `Connection`,
+    /// `Sec-WebSocket-Key`, `Sec-WebSocket-Version`) are set here and
+    /// override anything the caller put in those headers -- the key in
+    /// particular must match what the accept check below expects.
+    ///
+    /// If the request offers subprotocols, the server's selection is
+    /// validated against the offers and exposed via
+    /// [`WebSocket::protocol`]. The full `101` handshake response (e.g.
+    /// its `Set-Cookie` headers) is kept on [`WebSocket::handshake`].
+    ///
+    /// Corking is not allowed for WebSocket connections: a `TcpOptions`
+    /// extension with `cork: true` is rejected; `nodelay` is honored.
+    pub async fn websocket_request(&self, request: Request<Bytes>) -> Result<WebSocket, Error> {
+        match request.uri().scheme_str() {
             Some("ws" | "wss") => {}
             other => {
                 return Err(format!(
@@ -80,6 +107,21 @@ impl HttpClient {
                 .into());
             }
         }
+        if request.method() != Method::GET {
+            return Err("WebSocket handshake requests must use GET (RFC 6455 §4.1)".into());
+        }
+
+        // The subprotocols the caller is offering, remembered so the
+        // server's selection can be validated.
+        let offered_protocols: Vec<String> = request
+            .headers()
+            .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
 
         // Sec-WebSocket-Key: 16 random bytes, base64 (RFC 6455 §4.1).
         let rng = SystemRandom::new();
@@ -88,16 +130,26 @@ impl HttpClient {
             .map_err(|_| "system RNG failure generating Sec-WebSocket-Key")?;
         let key = base64(&key_bytes);
 
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .header(header::UPGRADE, "websocket")
-            .header(header::CONNECTION, "Upgrade")
-            .header(header::SEC_WEBSOCKET_KEY, key.as_str())
-            .header(header::SEC_WEBSOCKET_VERSION, "13")
-            .body(Bytes::new())?;
+        // Force the protocol-mandated fields (insert replaces any caller
+        // values), leaving all other caller headers untouched.
+        let (mut parts, body) = request.into_parts();
+        parts
+            .headers
+            .insert(header::UPGRADE, http::HeaderValue::from_static("websocket"));
+        parts
+            .headers
+            .insert(header::CONNECTION, http::HeaderValue::from_static("Upgrade"));
+        parts.headers.insert(
+            header::SEC_WEBSOCKET_KEY,
+            http::HeaderValue::from_str(&key)?,
+        );
+        parts.headers.insert(
+            header::SEC_WEBSOCKET_VERSION,
+            http::HeaderValue::from_static("13"),
+        );
+        let request = Request::from_parts(parts, body);
 
-        let response = self.h1_upgrade_request(request).await?;
+        let mut response = self.h1_upgrade_request(request).await?;
 
         // Validate the server's half of the handshake (RFC 6455 §4.1).
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
@@ -117,15 +169,33 @@ impl HttpClient {
         if accept != accept_key(&key) {
             return Err("Sec-WebSocket-Accept does not match the sent key".into());
         }
-        // We offered no subprotocols, so the server must not select one.
-        if response
+        // The server may select at most one of the offered subprotocols
+        // (RFC 6455 §4.2.2); a selection we never offered fails the
+        // handshake.
+        let protocol = match response
             .headers()
-            .contains_key(header::SEC_WEBSOCKET_PROTOCOL)
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .map(|v| v.to_str().map(str::trim))
         {
-            return Err("server selected a subprotocol that was not offered".into());
-        }
+            None => None,
+            Some(Err(_)) => return Err("Sec-WebSocket-Protocol is not valid UTF-8".into()),
+            Some(Ok(selected)) => {
+                if !offered_protocols.iter().any(|p| p == selected) {
+                    return Err(format!(
+                        "server selected subprotocol {selected:?} which was not offered"
+                    )
+                    .into());
+                }
+                Some(selected.to_string())
+            }
+        };
 
-        let upgraded = hyper::upgrade::on(response).await?;
+        // Take the upgrade slot via `&mut` so the response parts (headers
+        // like Set-Cookie) can be kept for the caller.
+        let on_upgrade = hyper::upgrade::on(&mut response);
+        let (handshake, _body) = response.into_parts();
+        let upgraded = on_upgrade.await?;
+
         Ok(WebSocket {
             io: TokioIo::new(upgraded),
             rng,
@@ -133,6 +203,8 @@ impl HttpClient {
             fragment: None,
             close_sent: false,
             close_received: false,
+            protocol,
+            handshake,
         })
     }
 }
@@ -147,9 +219,26 @@ pub struct WebSocket {
     fragment: Option<(u8, BytesMut)>,
     close_sent: bool,
     close_received: bool,
+    /// The subprotocol the server selected from the request's offers.
+    protocol: Option<String>,
+    /// The `101 Switching Protocols` response parts (status, headers,
+    /// extensions), kept for callers that need e.g. `Set-Cookie`.
+    handshake: http::response::Parts,
 }
 
 impl WebSocket {
+    /// The subprotocol the server selected from the handshake request's
+    /// `Sec-WebSocket-Protocol` offers, if any.
+    pub fn protocol(&self) -> Option<&str> {
+        self.protocol.as_deref()
+    }
+
+    /// The `101 Switching Protocols` handshake response (status, headers,
+    /// extensions) -- e.g. for reading `Set-Cookie`.
+    pub fn handshake(&self) -> &http::response::Parts {
+        &self.handshake
+    }
+
     /// Receives the next message. `Ok(None)` means the connection ended
     /// cleanly (close handshake completed, or EOF after a close). Inbound
     /// Pings are answered automatically and also returned.

@@ -256,22 +256,20 @@ impl HttpClient {
     /// Schemes: `ws`/`http` dial plain TCP; `wss`/`https` dial through the
     /// h1-only TLS connector (upgrades don't exist on multiplexed h2).
     /// Connections are never pooled and never corked -- a held tail would
-    /// stall the interactive protocol the upgrade hands over to, so this
-    /// path forces `cork: false` with `nodelay` on.
+    /// stall the interactive protocol the upgrade hands over to. A
+    /// `TcpOptions` extension asking to cork is rejected; its `nodelay`
+    /// choice is honored (default on).
     pub(crate) async fn h1_upgrade_request(
         &self,
         request: Request<Bytes>,
     ) -> Result<Response<hyper::body::Incoming>, Error> {
         let (mut parts, body) = request.into_parts();
-        // Corking is not allowed on upgrade connections; strip any
-        // options a caller may have attached rather than honoring them.
-        if let Some(options) = parts.extensions.remove::<TcpOptions>()
-            && options.cork
-        {
+        let caller_options = parts.extensions.remove::<TcpOptions>();
+        if caller_options.is_some_and(|options| options.cork) {
             return Err("corking is not allowed on upgrade (WebSocket) connections".into());
         }
         let tcp_options = TcpOptions {
-            nodelay: true,
+            nodelay: caller_options.is_none_or(|options| options.nodelay),
             cork: false,
         };
 
