@@ -10,6 +10,72 @@ use std::os::raw::{c_int, c_void};
 
 use super::ffi;
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CoreType {
+    Main,
+    Worker,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct Core {
+    pub id: u32,
+    pub socket: u32,
+    pub type_: CoreType,
+}
+
+pub struct CoreIterator {
+    current: u32,
+}
+
+impl Default for CoreIterator {
+    fn default() -> Self {
+        Self {
+            current: ffi::RTE_MAX_LCORE,
+        }
+    }
+}
+
+impl Iterator for CoreIterator {
+    type Item = Core;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // SAFETY: `rte_get_next_lcore` is safe to call with valid parameters.
+        let next = unsafe { ffi::rte_get_next_lcore(self.current, 0, 0) };
+        if next >= ffi::RTE_MAX_LCORE {
+            None
+        } else {
+            self.current = next;
+            let socket = unsafe { ffi::rte_lcore_to_socket_id(next) };
+            let type_ = if next == main_lcore_id() {
+                CoreType::Main
+            } else {
+                CoreType::Worker
+            };
+
+            Some(Core {
+                id: next,
+                socket,
+                type_,
+            })
+        }
+    }
+}
+
+pub fn get_core_info(lcore: u32) -> Core {
+    let socket = unsafe { ffi::rte_lcore_to_socket_id(lcore) };
+    let type_ = if lcore == main_lcore_id() {
+        CoreType::Main
+    } else {
+        CoreType::Worker
+    };
+
+    Core {
+        id: lcore,
+        socket,
+        type_,
+    }
+}
+
 /// The calling thread's lcore id.
 pub fn current_lcore_id() -> u32 {
     // SAFETY: `rte_lcore_id` reads a per-lcore variable; valid on any EAL

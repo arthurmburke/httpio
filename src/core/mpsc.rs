@@ -34,7 +34,6 @@ struct MpscRing<T, const N: usize> {
 unsafe impl<T: Send, const N: usize> Send for MpscRing<T, N> {}
 
 impl<T, const N: usize> MpscRing<T, N> {
-
     const _VALIDATE: () = {
         assert!(N > 0 && (N & (N - 1)) == 0, "N must be a power of 2!");
     };

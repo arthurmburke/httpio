@@ -59,7 +59,10 @@ impl SendBuffer {
         let mut out = BytesMut::with_capacity(n);
         while out.len() < n {
             let need = n - out.len();
-            let chunk = self.chunks.front_mut().expect("accounting keeps chunks in sync");
+            let chunk = self
+                .chunks
+                .front_mut()
+                .expect("accounting keeps chunks in sync");
             if chunk.len() <= need {
                 out.extend_from_slice(chunk);
                 self.chunks.pop_front();

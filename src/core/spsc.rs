@@ -36,7 +36,6 @@ impl<T, const N: usize> Default for SpscRing<T, N> {
 }
 
 impl<T, const N: usize> SpscRing<T, N> {
-
     const _VALIDATE: () = {
         assert!(N > 0 && (N & (N - 1)) == 0, "N must be a power of 2!");
     };

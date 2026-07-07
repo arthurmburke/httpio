@@ -55,7 +55,6 @@ impl EthPort {
         mtu: u32,
         socket_id: i32,
     ) -> Result<Self, PortError> {
-
         let mut info: ffi::rte_eth_dev_info = unsafe { core::mem::zeroed() };
         check("rte_eth_dev_info_get", unsafe {
             ffi::rte_eth_dev_info_get(port_id, &mut info)

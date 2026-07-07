@@ -494,14 +494,16 @@ impl Tcb {
 
         if self.want_syn {
             self.want_syn = false;
-            self.retransmit.push(self.iss, Bytes::new(), true, false, now);
+            self.retransmit
+                .push(self.iss, Bytes::new(), true, false, now);
             out.push(self.make_segment(self.iss, flags::SYN, Bytes::new(), Some(DEFAULT_MSS)));
             return out;
         }
 
         if self.want_synack {
             self.want_synack = false;
-            self.retransmit.push(self.iss, Bytes::new(), true, false, now);
+            self.retransmit
+                .push(self.iss, Bytes::new(), true, false, now);
             out.push(self.make_segment(
                 self.iss,
                 flags::SYN | flags::ACK,
