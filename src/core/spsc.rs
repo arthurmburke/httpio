@@ -1,13 +1,8 @@
-//! Bounded, lock-free ring buffers.
+//! Bounded, lock-free ring buffer.
 //!
-//! Two flavours:
-//!  - [`channel`] — SPSC (single-producer, single-consumer), the
-//!    lightest option, used for per-connection command/inbound rings
-//!    where exactly one thread owns each end.
-//!  - [`mpsc_channel`] — MPSC (multi-producer, single-consumer), used for
-//!    the worker's connection-open control ring so any number of
-//!    application threads can share one `WorkerHandle` and open
-//!    connections concurrently.
+//! [`channel`] — SPSC (single-producer, single-consumer), the
+//! lightest option, used for per-connection command/inbound rings
+//! where exactly one thread owns each end.
 //!
 //! Both are cache-line padded to keep the producer and consumer indices
 //! on separate lines (avoiding false sharing).

@@ -1,3 +1,14 @@
+//! Bounded, lock-free ring buffer.
+//!
+//! [`channel`] — MPSC (multi-producer, single-consumer), used for
+//! the worker's connection-open control ring so any number of
+//! application threads can share one `WorkerHandle` and open
+//! connections concurrently.
+//!
+//! Both are cache-line padded to keep the producer and consumer indices
+//! on separate lines (avoiding false sharing).
+
+
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
