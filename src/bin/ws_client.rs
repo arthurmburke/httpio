@@ -16,12 +16,12 @@ use std::net::Ipv4Addr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use bypio::dpdk::{self, EthPort, Mempool};
-use bypio::http::client::builder::Builder;
-use bypio::http::ws::Message;
-use bypio::tcp::engine::{EngineConfig, TcpEngine};
-use bypio::tcp::worker::WorkerHandle;
+use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+use httpio::dpdk::{self, EthPort, Mempool};
+use httpio::http::client::builder::Builder;
+use httpio::http::ws::Message;
+use httpio::tcp::engine::{EngineConfig, TcpEngine};
+use httpio::tcp::worker::WorkerHandle;
 
 const PORT_ID: u16 = 0;
 const MBUF_POOL_SIZE: u32 = 8192;

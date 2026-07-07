@@ -17,13 +17,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{Method, Request};
 
-use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use bypio::dpdk::{self, EthPort, Mempool};
-use bypio::http::client::builder::Builder;
-use bypio::http::stream::{FlushHandle, TcpOptions};
-use bypio::tcp::engine::EngineConfig;
-use bypio::tcp::engine::TcpEngine;
-use bypio::tcp::worker::WorkerHandle;
+use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+use httpio::dpdk::{self, EthPort, Mempool};
+use httpio::http::client::builder::Builder;
+use httpio::http::stream::{FlushHandle, TcpOptions};
+use httpio::tcp::engine::EngineConfig;
+use httpio::tcp::engine::TcpEngine;
+use httpio::tcp::worker::WorkerHandle;
 
 const PORT_ID: u16 = 0;
 const MBUF_POOL_SIZE: u32 = 8192;
@@ -128,7 +128,7 @@ fn main() -> ExitCode {
     result
 }
 
-async fn run_requests(app: &AppArgs, worker: bypio::tcp::worker::WorkerHandle) -> ExitCode {
+async fn run_requests(app: &AppArgs, worker: WorkerHandle) -> ExitCode {
     let mut builder = Builder::new();
     for ca in &app.ca_files {
         builder = match builder.add_root_ca_pem_file(ca) {

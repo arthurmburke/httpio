@@ -44,28 +44,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
-name = "bypio"
-version = "0.1.0"
-dependencies = [
- "bindgen",
- "bytes",
- "cc",
- "gxhash",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "pkg-config",
- "ring",
- "rustls",
- "rustls-pemfile",
- "tokio",
- "tokio-rustls",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "bytes"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -241,6 +219,28 @@ name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "httpio"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "bytes",
+ "cc",
+ "gxhash",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "pkg-config",
+ "ring",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
 
 [[package]]
 name = "hyper"

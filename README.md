@@ -1,4 +1,4 @@
-# BypassIO (bypio)
+# httpio
 
 A userspace TCP/IP stack over raw DPDK FFI bindings (bindgen-generated at
 build time from the installed DPDK headers — no `dpdk-sys` crate), plus

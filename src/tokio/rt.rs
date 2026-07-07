@@ -96,7 +96,7 @@ fn pin_thread_to_cpus<I: Iterator<Item = usize>>(cpus: I) -> io::Result<()> {
         let mut set: libc::cpu_set_t = mem::zeroed();
         libc::CPU_ZERO(&mut set);
         for cpu in cpus {
-            libc::CPU_SET(cpu, &mut set);
+            libc::CPU_SET(cpu as usize, &mut set);
         }
         if libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
             return Err(io::Error::last_os_error());

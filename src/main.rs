@@ -14,11 +14,11 @@
 use std::env;
 use std::time::Instant;
 
-use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use bypio::dpdk::{self, EthPort, Mempool};
-use bypio::tcp::engine::{EngineConfig, TcpEngine};
-use bypio::tcp::socket::TcpSocket;
-use bypio::tcp::state::TcpState;
+use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+use httpio::dpdk::{self, EthPort, Mempool};
+use httpio::tcp::engine::{EngineConfig, TcpEngine};
+use httpio::tcp::socket::TcpSocket;
+use httpio::tcp::state::TcpState;
 
 const PORT_ID: u16 = 0;
 const MBUF_POOL_SIZE: u32 = 8192;
