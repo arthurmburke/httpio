@@ -1,13 +1,19 @@
-//! Bounded, lock-free, wait-free SPSC ring buffer.
+//! Bounded, lock-free ring buffers.
 //!
-//! Designed for single-producer, single-consumer communication between
-//! pinned cores in the DPDK engine.
+//! Two flavours:
+//!  - [`channel`] — SPSC (single-producer, single-consumer), the
+//!    lightest option, used for per-connection command/inbound rings
+//!    where exactly one thread owns each end.
+//!  - [`mpsc_channel`] — MPSC (multi-producer, single-consumer), used for
+//!    the worker's connection-open control ring so any number of
+//!    application threads can share one `WorkerHandle` and open
+//!    connections concurrently.
 //!
-//! Cache-line padded to prevent false sharing between producer (head)
-//! and consumer (tail). On x86_64, the Release store compiles to a
-//! plain MOV — the strong memory model gives us release semantics for free.
+//! Both are cache-line padded to keep the producer and consumer indices
+//! on separate lines (avoiding false sharing).
 
 use std::cell::UnsafeCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[repr(C)]
@@ -23,7 +29,6 @@ struct SpscRing<T, const N: usize> {
 // The producer only writes head and buffer[head], the consumer only writes
 // tail and reads buffer[tail]. Atomic ordering ensures visibility.
 unsafe impl<T: Send, const N: usize> Send for SpscRing<T, N> {}
-unsafe impl<T: Send, const N: usize> Sync for SpscRing<T, N> {}
 
 impl<T, const N: usize> Default for SpscRing<T, N> {
     fn default() -> Self {
@@ -109,11 +114,11 @@ struct ControlBlock<T, const N: usize> {
     has_tx: AtomicBool,
 }
 
-pub struct Rx<T, const N: usize> {
+pub struct SpscRx<T, const N: usize> {
     cb: *mut ControlBlock<T, N>,
 }
 
-impl<T, const N: usize> Drop for Rx<T, N> {
+impl<T, const N: usize> Drop for SpscRx<T, N> {
     fn drop(&mut self) {
         unsafe {
             (*self.cb).has_rx.store(false, Ordering::Release);
@@ -126,7 +131,7 @@ impl<T, const N: usize> Drop for Rx<T, N> {
     }
 }
 
-impl<T, const N: usize> Rx<T, N> {
+impl<T, const N: usize> SpscRx<T, N> {
     pub fn pop(&self) -> Option<T> {
         unsafe { (*self.cb).ring.pop() }
     }
@@ -148,11 +153,11 @@ impl<T, const N: usize> Rx<T, N> {
     }
 }
 
-pub struct Tx<T, const N: usize> {
+pub struct SpscTx<T, const N: usize> {
     cb: *mut ControlBlock<T, N>,
 }
 
-impl<T, const N: usize> Drop for Tx<T, N> {
+impl<T, const N: usize> Drop for SpscTx<T, N> {
     fn drop(&mut self) {
         unsafe {
             (*self.cb).has_tx.store(false, Ordering::Release);
@@ -165,7 +170,7 @@ impl<T, const N: usize> Drop for Tx<T, N> {
     }
 }
 
-impl<T, const N: usize> Tx<T, N> {
+impl<T, const N: usize> SpscTx<T, N> {
     pub fn push(&self, item: T) -> Result<(), T> {
         unsafe { (*self.cb).ring.push(item) }
     }
@@ -190,21 +195,21 @@ impl<T, const N: usize> Tx<T, N> {
 /// Creates a new SPSC channel with the given capacity. Returns a `(Tx, Rx)` pair for sending and receiving items.
 /// The Tx handle should be used by the producer thread, and the Rx handle should be used by the consumer thread.
 /// The channel is closed when either handle is dropped; the other handle can check for closure with `is_closed()`.
-pub fn channel<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
+pub fn channel<T, const N: usize>() -> (SpscTx<T, N>, SpscRx<T, N>) {
     let cb = Box::new(ControlBlock {
         ring: Box::new(SpscRing::new()),
         has_rx: AtomicBool::new(true),
         has_tx: AtomicBool::new(true),
     });
     let cb_ptr = Box::into_raw(cb);
-    (Tx { cb: cb_ptr }, Rx { cb: cb_ptr })
+    (SpscTx { cb: cb_ptr }, SpscRx { cb: cb_ptr })
 }
 
 // SAFETY: Tx & Rx are designed for single-producer, single-consumer use.
 // Once created via `channel`, the producer thread should only use `Tx` and the consumer
 // thread should only use `Rx`. Atomic ordering ensures visibility of the control block state.
-unsafe impl<T: Send, const N: usize> Send for Tx<T, N> {}
-unsafe impl<T: Send, const N: usize> Send for Rx<T, N> {}
+unsafe impl<T: Send, const N: usize> Send for SpscTx<T, N> {}
+unsafe impl<T: Send, const N: usize> Send for SpscRx<T, N> {}
 
 #[cfg(test)]
 mod tests {
@@ -282,18 +287,15 @@ mod tests {
 
     #[test]
     fn spsc_across_threads() {
-        use std::sync::Arc;
         use std::thread;
 
-        let ring = Arc::new(SpscRing::<u64, 1024>::new());
-        let producer_ring = Arc::clone(&ring);
-        let consumer_ring = Arc::clone(&ring);
+        let (tx, rx) = channel::<u64, 1024>();
         let count = 10_000u64;
 
         let producer = thread::spawn(move || {
             for i in 0..count {
                 loop {
-                    if producer_ring.push(i).is_ok() {
+                    if tx.push(i).is_ok() {
                         break;
                     }
                     std::hint::spin_loop();
@@ -304,7 +306,7 @@ mod tests {
         let consumer = thread::spawn(move || {
             let mut received = Vec::with_capacity(count as usize);
             while received.len() < count as usize {
-                if let Some(val) = consumer_ring.pop() {
+                if let Some(val) = rx.pop() {
                     received.push(val);
                 } else {
                     std::hint::spin_loop();

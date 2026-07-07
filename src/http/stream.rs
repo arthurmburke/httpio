@@ -264,7 +264,10 @@ impl AsyncWrite for TcpStream {
 
         // One command carries the whole write; the engine's send buffer is
         // unbounded, so backpressure is only the command ring being full.
-        match this.cmd_tx.push(Command::Send(Bytes::copy_from_slice(data))) {
+        match this
+            .cmd_tx
+            .push(Command::Send(Bytes::copy_from_slice(data)))
+        {
             Ok(()) => {
                 this.drain_flush();
                 Poll::Ready(Ok(data.len()))
@@ -284,10 +287,7 @@ impl AsyncWrite for TcpStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         // Half-close: enqueue a FIN. Reading may continue afterward.
         match this.cmd_tx.push(Command::Close) {
@@ -303,4 +303,3 @@ impl AsyncWrite for TcpStream {
 // Dropping the stream drops its command sender; the worker observes the
 // closed ring and closes the engine-side connection (sending a FIN), so
 // no explicit teardown message is needed here.
-

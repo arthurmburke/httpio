@@ -137,8 +137,15 @@ impl EthPort {
 
 impl Drop for EthPort {
     fn drop(&mut self) {
+        // Stop *and* close: `rte_eth_dev_stop` alone leaves the device
+        // configured and, for the tap PMD, keeps the kernel tap attached
+        // with its multi-queue ownership held -- so a subsequent process
+        // re-attaching to the same persistent tap can't move packets
+        // ("Exclusivity flag on, cannot modify"). `rte_eth_dev_close`
+        // fully releases it.
         unsafe {
             ffi::rte_eth_dev_stop(self.port_id);
+            ffi::rte_eth_dev_close(self.port_id);
         }
     }
 }

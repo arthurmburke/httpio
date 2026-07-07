@@ -12,7 +12,6 @@
 //! server closes it (there is no idle timeout on our side). HTTP/1.1 has
 //! no such multiplexing handle and stays connection-per-request.
 
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU16, Ordering};
 
@@ -27,7 +26,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::TlsConnector;
 
+use crate::core::hashmap::HashMap;
 use crate::tcp::worker::WorkerHandle;
+
 use super::stream::{FlushHandle, TcpOptions, TcpStream};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -40,12 +41,18 @@ type Origin = (String, u16);
 type H2Pool = AsyncMutex<HashMap<Origin, http2::SendRequest<Full<Bytes>>>>;
 
 pub mod builder {
-    use std::{collections::HashMap, net::Ipv4Addr, sync::{Arc, atomic::AtomicU16}, time::{SystemTime, UNIX_EPOCH}};
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU16;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use rustls::RootCertStore;
     use tokio::sync::Mutex;
     use tokio_rustls::TlsConnector;
 
     use super::{Error, HttpClient};
+
+    use crate::core::hashmap::HashMap;
     use crate::tcp::worker::WorkerHandle;
 
     pub struct Builder {
@@ -147,7 +154,6 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-
     pub async fn get(&self, url: &str) -> Result<Response<Bytes>, Error> {
         let request = Request::builder()
             .method(Method::GET)

@@ -17,13 +17,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{Method, Request};
 
-use bypio::http::stream::{FlushHandle, TcpOptions};
-use bypio::tcp::engine::TcpEngine;
 use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
 use bypio::dpdk::{self, EthPort, PktMbufPool};
 use bypio::http::client::builder::Builder;
-use bypio::tcp::worker::WorkerHandle;
+use bypio::http::stream::{FlushHandle, TcpOptions};
 use bypio::tcp::engine::EngineConfig;
+use bypio::tcp::engine::TcpEngine;
+use bypio::tcp::worker::WorkerHandle;
 
 const PORT_ID: u16 = 0;
 const MBUF_POOL_SIZE: u32 = 8192;
@@ -93,7 +93,7 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    
+
     let (worker, worker_join) = match WorkerHandle::spawn(engine, port, pool, worker_lcore) {
         Ok(pair) => pair,
         Err(e) => {
@@ -113,6 +113,9 @@ fn main() -> ExitCode {
     // Stopping the worker: dropping the handle signalled the loop to exit;
     // wait for the lcore to finish so its port/pool drop cleanly.
     worker_join.wait();
+    // Release EAL resources (incl. the tap device) so a following process
+    // re-using the same persistent tap starts from a clean state.
+    dpdk::eal::cleanup();
     result
 }
 

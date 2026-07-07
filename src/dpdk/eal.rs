@@ -41,3 +41,15 @@ pub fn init(args: &[&str]) -> Result<i32, EalInitError> {
     }
     Ok(rc)
 }
+
+/// Releases resources acquired by [`init`] (hugepage/memory mappings,
+/// vdev/tap devices, the runtime data directory). Call once at process
+/// exit, after all lcores have been joined. Without it, a following DPDK
+/// process re-using the same resources (e.g. a persistent tap device) can
+/// misbehave.
+pub fn cleanup() {
+    // SAFETY: valid to call once after init on the main lcore.
+    unsafe {
+        ffi::rte_eal_cleanup();
+    }
+}

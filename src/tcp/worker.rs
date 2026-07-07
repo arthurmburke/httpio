@@ -20,14 +20,17 @@
 //! endpoints are `Send`, so a fresh pair is created on the app thread and
 //! one half of each is shipped to the worker inside the control message.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::core::ring::{self, Rx, Tx};
+use crate::core::hashmap::HashMap;
+use crate::core::mpsc;
+use crate::core::mpsc::{MpscRx, MpscTx};
+use crate::core::spsc;
+use crate::core::spsc::{SpscRx, SpscTx};
 use crate::dpdk::{self, EthPort, PktMbufPool, WorkerJoin};
 
 use super::engine::TcpEngine;
@@ -43,12 +46,17 @@ const IN_CAP: usize = 1024;
 /// Bytes pulled from the engine per connection per iteration.
 const RECV_CHUNK: usize = 64 * 1024;
 
-pub type CmdTx = Tx<Command, CMD_CAP>;
-pub type CmdRx = Rx<Command, CMD_CAP>;
-pub type InboundTx = Tx<Inbound, IN_CAP>;
-pub type InboundRx = Rx<Inbound, IN_CAP>;
-type CtrlTx = Tx<NewConn, CTRL_CAP>;
-type CtrlRx = Rx<NewConn, CTRL_CAP>;
+// Per-connection rings stay SPSC: exactly one thread owns each end (the
+// thread driving that connection's `TcpStream`, and the worker lcore).
+pub type CmdTx = SpscTx<Command, CMD_CAP>;
+pub type CmdRx = SpscRx<Command, CMD_CAP>;
+pub type InboundTx = SpscTx<Inbound, IN_CAP>;
+pub type InboundRx = SpscRx<Inbound, IN_CAP>;
+// The connection-open control ring is MPSC: any number of application
+// threads can share one `WorkerHandle` and open connections concurrently
+// (multiple producers), while the worker lcore is the sole consumer.
+type CtrlTx = MpscTx<NewConn, CTRL_CAP>;
+type CtrlRx = MpscRx<NewConn, CTRL_CAP>;
 
 /// App -> worker, per connection.
 pub enum Command {
@@ -111,9 +119,13 @@ struct WorkerConn {
     closing: bool,
 }
 
-/// Application-side handle to the worker. Lives on the app thread and is
-/// used to open connections; each open produces a fresh ring pair whose
-/// app-side halves become a `TcpStream`.
+/// Application-side handle to the worker, used to open connections; each
+/// open produces a fresh ring pair whose app-side halves become a
+/// `TcpStream`.
+///
+/// `Send + Sync`: the connection-open path goes through an MPSC control
+/// ring, so a single handle (e.g. behind an `Arc`) can be shared by any
+/// number of application threads all opening connections concurrently.
 pub struct WorkerHandle {
     ctrl_tx: CtrlTx,
     stop: Arc<AtomicBool>,
@@ -131,7 +143,6 @@ pub struct ConnEndpoints {
 }
 
 impl WorkerHandle {
-
     /// Launches the engine loop on `worker_lcore` and returns the app-side
     /// handle plus the lcore join handle. The engine/port/pool are moved to
     /// the worker lcore and owned there for the loop's lifetime.
@@ -141,7 +152,7 @@ impl WorkerHandle {
         pool: PktMbufPool,
         worker_lcore: u32,
     ) -> Result<(Self, WorkerJoin), dpdk::lcore::LaunchError> {
-        let (ctrl_tx, ctrl_rx) = ring::channel::<NewConn, CTRL_CAP>();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let connections_opened = Arc::new(AtomicU64::new(0));
@@ -174,8 +185,8 @@ impl WorkerHandle {
         local_port: u16,
         nodelay: bool,
     ) -> Option<ConnEndpoints> {
-        let (cmd_tx, cmd_rx) = ring::channel::<Command, CMD_CAP>();
-        let (inbound_tx, inbound_rx) = ring::channel::<Inbound, IN_CAP>();
+        let (cmd_tx, cmd_rx) = spsc::channel::<Command, CMD_CAP>();
+        let (inbound_tx, inbound_rx) = spsc::channel::<Inbound, IN_CAP>();
 
         let mut msg = NewConn {
             remote_ip,
@@ -252,18 +263,9 @@ fn run(
         for conn in conns.values_mut() {
             while let Some(cmd) = conn.cmd_rx.pop() {
                 match cmd {
-                    Command::Send(data) => {
-                        dbg_worker(format_args!("Send {} bytes", data.len()));
-                        engine.send(conn.tuple, &data);
-                    }
-                    Command::SetCork(c) => {
-                        dbg_worker(format_args!("SetCork {c}"));
-                        engine.set_cork(conn.tuple, c);
-                    }
-                    Command::Flush => {
-                        dbg_worker(format_args!("Flush"));
-                        engine.flush(conn.tuple);
-                    }
+                    Command::Send(data) => engine.send(conn.tuple, &data),
+                    Command::SetCork(c) => engine.set_cork(conn.tuple, c),
+                    Command::Flush => engine.flush(conn.tuple),
                     Command::Close => {
                         engine.close(conn.tuple);
                         conn.closing = true;
@@ -311,10 +313,10 @@ fn run(
         // 4. Deliver received bytes, then the terminal signal, to the app.
         for conn in conns.values_mut() {
             // Retry a previously un-pushable chunk first.
-            if let Some(pending) = conn.pending_in.take() {
-                if let Err(Inbound::Data(b)) = conn.inbound_tx.push(Inbound::Data(pending)) {
-                    conn.pending_in = Some(b);
-                }
+            if let Some(pending) = conn.pending_in.take()
+                && let Err(Inbound::Data(b)) = conn.inbound_tx.push(Inbound::Data(pending))
+            {
+                conn.pending_in = Some(b);
             }
             // Pull more only while nothing is stalled.
             while conn.pending_in.is_none() {
@@ -322,7 +324,8 @@ fn run(
                 if chunk.is_empty() {
                     break;
                 }
-                if let Err(Inbound::Data(b)) = conn.inbound_tx.push(Inbound::Data(Bytes::from(chunk)))
+                if let Err(Inbound::Data(b)) =
+                    conn.inbound_tx.push(Inbound::Data(Bytes::from(chunk)))
                 {
                     conn.pending_in = Some(b);
                 }
@@ -339,12 +342,13 @@ fn run(
             }
             // Deliver the terminal signal only after all data has drained,
             // retrying until the ring accepts it (never dropped).
-            if !conn.end_sent && conn.pending_in.is_none() {
-                if let Some(terminal) = conn.terminal.take() {
-                    match conn.inbound_tx.push(terminal) {
-                        Ok(()) => conn.end_sent = true,
-                        Err(returned) => conn.terminal = Some(returned),
-                    }
+            if !conn.end_sent
+                && conn.pending_in.is_none()
+                && let Some(terminal) = conn.terminal.take()
+            {
+                match conn.inbound_tx.push(terminal) {
+                    Ok(()) => conn.end_sent = true,
+                    Err(returned) => conn.terminal = Some(returned),
                 }
             }
         }
@@ -364,12 +368,5 @@ fn run(
             }
             true
         });
-    }
-}
-
-/// Env-gated (`TCP_DEBUG`) worker tracing; compiled in but silent unless set.
-fn dbg_worker(args: std::fmt::Arguments<'_>) {
-    if std::env::var_os("TCP_DEBUG").is_some() {
-        eprintln!("[worker] {args}");
     }
 }

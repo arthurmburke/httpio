@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # End-to-end test of the HTTP client over the DPDK TCP stack.
 #
-# Wiring: a persistent kernel tap device (dtap0) carries frames between
-# the DPDK net_tap vdev (our stack's port, 10.9.0.1) and the kernel
-# network stack (10.9.0.2), where real HTTP servers listen:
+# Wiring: a kernel tap device (dtap0) carries frames between the DPDK
+# net_tap vdev (our stack's port, 10.9.0.1) and the kernel network stack
+# (10.9.0.2), where real HTTP servers listen:
 #   - python http.server            :8080  plain HTTP/1.1
 #   - python http.server + ssl      :8443  HTTPS, ALPN http/1.1
 #   - nghttpd                       :9443  HTTPS, ALPN h2
 # TLS uses a freshly generated custom CA; the client must be told to
 # trust it via --ca, and resolves the cert's hostname via --resolve.
+#
+# Each check runs a fresh short-lived DPDK process. DPDK's net_tap PMD
+# leaves a persistent multi_queue tap in an unusable state after a
+# (-l 0-1, worker-lcore) process detaches, so the tap is fully torn down
+# and recreated -- and the servers restarted onto the fresh device --
+# before every process. `fresh_net` does this.
 #
 # Run inside the devcontainer as root (needs /dev/net/tun + NET_ADMIN):
 #   sudo scripts/e2e.sh
@@ -20,20 +26,14 @@ cargo build --bin http_get
 BIN="$TARGET_DIR/debug/http_get"
 
 WORK=$(mktemp -d)
+SERVER_PIDS=()
 cleanup() {
+    kill "${SERVER_PIDS[@]}" 2>/dev/null || true
     kill $(jobs -p) 2>/dev/null || true
+    ip link del dtap0 2>/dev/null || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
-
-# --- kernel side of the wire ------------------------------------------
-# Persistent tap so it exists (and keeps its IP) across the separate
-# short-lived DPDK client processes that attach to it. multi_queue is
-# required: DPDK's tap PMD attaches with IFF_MULTI_QUEUE, and TUNSETIFF
-# on a persistent device fails with EINVAL unless the flags match.
-ip tuntap add dev dtap0 mode tap multi_queue 2>/dev/null || true
-ip addr replace 10.9.0.2/24 dev dtap0
-ip link set dtap0 up
 
 # --- custom CA + server certificate ------------------------------------
 openssl ecparam -name prime256v1 -genkey -noout -out "$WORK/ca.key"
@@ -48,9 +48,21 @@ openssl x509 -req -in "$WORK/server.csr" -CA "$WORK/ca.pem" -CAkey "$WORK/ca.key
 mkdir -p "$WORK/docroot"
 echo "hello from e2e" > "$WORK/docroot/hello.txt"
 
-# --- servers on the kernel side ----------------------------------------
-(cd "$WORK/docroot" && exec python3 -m http.server --bind 10.9.0.2 --protocol HTTP/1.1 8080) &
-python3 - "$WORK" <<'PYEOF' &
+# --- net (re)initialization -------------------------------------------
+# multi_queue is required: DPDK's tap PMD attaches with IFF_MULTI_QUEUE,
+# and TUNSETIFF on a persistent device fails with EINVAL unless the flags
+# match.
+recreate_tap() {
+    ip link del dtap0 2>/dev/null || true
+    ip tuntap add dev dtap0 mode tap multi_queue
+    ip addr add 10.9.0.2/24 dev dtap0
+    ip link set dtap0 up
+}
+
+start_servers() {
+    (cd "$WORK/docroot" && exec python3 -m http.server --bind 10.9.0.2 --protocol HTTP/1.1 8080) &
+    SERVER_PIDS+=($!)
+    python3 - "$WORK" <<'PYEOF' &
 import http.server, os, ssl, sys
 work = sys.argv[1]
 os.chdir(work + "/docroot")
@@ -63,8 +75,24 @@ httpd = http.server.HTTPServer(("10.9.0.2", 8443), handler)
 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
 PYEOF
-nghttpd -d "$WORK/docroot" -a 10.9.0.2 9443 "$WORK/server.key" "$WORK/server.pem" &
-sleep 1
+    SERVER_PIDS+=($!)
+    nghttpd -d "$WORK/docroot" -a 10.9.0.2 9443 "$WORK/server.key" "$WORK/server.pem" &
+    SERVER_PIDS+=($!)
+    sleep 1
+}
+
+stop_servers() {
+    [ ${#SERVER_PIDS[@]} -gt 0 ] && kill "${SERVER_PIDS[@]}" 2>/dev/null || true
+    wait "${SERVER_PIDS[@]}" 2>/dev/null || true
+    SERVER_PIDS=()
+}
+
+# Fresh tap + fresh servers for the next DPDK process.
+fresh_net() {
+    stop_servers
+    recreate_tap
+    start_servers
+}
 
 # -l 0-1: lcore 0 runs tokio (main), lcore 1 runs the TCP engine worker.
 RUN=("$BIN" -l 0-1 --no-huge --vdev=net_tap0,iface=dtap0 -- 10.9.0.1)
@@ -73,6 +101,7 @@ TLS_ARGS=(--ca "$WORK/ca.pem" --resolve test.local=10.9.0.2)
 check() { # name, expected-version-line, args...
     local name=$1 version=$2; shift 2
     local out err
+    fresh_net
     err=$(mktemp)
     out=$("${RUN[@]}" "$@" 2>"$err") || { echo "FAIL $name: client error"; cat "$err"; exit 1; }
     grep -q "hello from e2e" <<<"$out" || { echo "FAIL $name: bad body: $out"; exit 1; }
@@ -96,6 +125,7 @@ check "HTTP/1.1 plaintext Nagle"    "HTTP/1.1 200" http://10.9.0.2:8080/hello.tx
 
 # HTTP/2 connection reuse: two requests to the same h2 origin in one
 # process must multiplex over a single pooled TCP connection.
+fresh_net
 H2URL=https://test.local:9443/hello.txt
 err=$(mktemp)
 out=$("${RUN[@]}" "$H2URL" "$H2URL" "${TLS_ARGS[@]}" 2>"$err") \
@@ -107,6 +137,7 @@ echo "PASS HTTP/2 connection reuse (2 requests, 1 connection)"
 
 # ...and HTTP/1.1 has no multiplexing handle, so the same double-fetch
 # against the h1 TLS server dials twice.
+fresh_net
 err=$(mktemp)
 H1URL=https://test.local:8443/hello.txt
 out=$("${RUN[@]}" "$H1URL" "$H1URL" "${TLS_ARGS[@]}" 2>"$err") \
@@ -117,6 +148,7 @@ echo "PASS HTTP/1.1 remains connection-per-request"
 
 # Negative: without --ca the server cert chains to an unknown CA, so the
 # TLS handshake must be rejected -- proves validation is actually on.
+fresh_net
 if "${RUN[@]}" https://test.local:8443/hello.txt --resolve test.local=10.9.0.2 >/dev/null 2>"$WORK/nocaperr"; then
     echo "FAIL unknown-CA rejection: request unexpectedly succeeded"
     exit 1

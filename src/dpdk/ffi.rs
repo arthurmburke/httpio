@@ -38,11 +38,10 @@ mod bindings {
 
 #[cfg(dpdk_bound)]
 pub use bindings::{
-    rte_eal_cleanup, rte_eal_init, rte_eal_remote_launch, rte_eal_wait_lcore,
-    rte_eth_dev_close, rte_eth_dev_count_avail, rte_eth_dev_start, rte_eth_dev_stop,
-    rte_eth_macaddr_get, rte_eth_promiscuous_enable, rte_eth_rx_queue_setup,
-    rte_eth_tx_queue_setup, rte_ether_addr, rte_get_next_lcore, rte_lcore_count, rte_mbuf,
-    rte_mempool, rte_pktmbuf_pool_create,
+    rte_eal_cleanup, rte_eal_init, rte_eal_remote_launch, rte_eal_wait_lcore, rte_eth_dev_close,
+    rte_eth_dev_count_avail, rte_eth_dev_start, rte_eth_dev_stop, rte_eth_macaddr_get,
+    rte_eth_promiscuous_enable, rte_eth_rx_queue_setup, rte_eth_tx_queue_setup, rte_ether_addr,
+    rte_get_next_lcore, rte_lcore_count, rte_mbuf, rte_mempool, rte_pktmbuf_pool_create,
 };
 
 /// `typedef int (*lcore_function_t)(void *)` -- the entry point

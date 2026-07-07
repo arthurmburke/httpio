@@ -10,9 +10,11 @@
 //! DPDK test setup; a real deployment behind a gateway would need a route
 //! table this stack doesn't have.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::core::hashmap::HashMap;
+use crate::core::hashset::HashSet;
 use crate::dpdk::{EthPort, Mbuf, PktMbufPool};
 use crate::net::{arp, eth, ipv4, tcp};
 
