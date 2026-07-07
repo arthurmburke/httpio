@@ -13,6 +13,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # ring (not the default aws-lc-rs) avoids a cmake dependency in the
 # devcontainer.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging", "std"] }
+# Already in the tree via rustls; used directly by the WebSocket client
+# for Sec-WebSocket-Key randomness and the SHA-1 accept-key check.
+ring = "0.17"
 rustls-pemfile = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "io-util", "sync"] }
 libc = "0.2"

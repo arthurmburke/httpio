@@ -248,6 +248,56 @@ impl HttpClient {
         }
     }
 
+    /// Sends `request` over a fresh HTTP/1.1 connection with protocol-
+    /// upgrade support and returns the raw response (body uncollected), so
+    /// a `101 Switching Protocols` response keeps its `OnUpgrade` slot for
+    /// `hyper::upgrade::on`. Used by the WebSocket client (`ws.rs`).
+    ///
+    /// Schemes: `ws`/`http` dial plain TCP; `wss`/`https` dial through the
+    /// h1-only TLS connector (upgrades don't exist on multiplexed h2).
+    /// Connections are never pooled and never corked -- a held tail would
+    /// stall the interactive protocol the upgrade hands over to, so this
+    /// path forces `cork: false` with `nodelay` on.
+    pub(crate) async fn h1_upgrade_request(
+        &self,
+        request: Request<Bytes>,
+    ) -> Result<Response<hyper::body::Incoming>, Error> {
+        let (mut parts, body) = request.into_parts();
+        // Corking is not allowed on upgrade connections; strip any
+        // options a caller may have attached rather than honoring them.
+        if let Some(options) = parts.extensions.remove::<TcpOptions>()
+            && options.cork
+        {
+            return Err("corking is not allowed on upgrade (WebSocket) connections".into());
+        }
+        let tcp_options = TcpOptions {
+            nodelay: true,
+            cork: false,
+        };
+
+        let scheme = parts.uri.scheme_str().unwrap_or("ws").to_ascii_lowercase();
+        let tls = matches!(scheme.as_str(), "wss" | "https");
+        let host = parts
+            .uri
+            .host()
+            .ok_or("request URI has no host (an absolute URI is required)")?
+            .to_string();
+        let default_port = if tls { 443 } else { 80 };
+        let port = parts.uri.port_u16().unwrap_or(default_port);
+
+        rewrite_to_origin_form(&mut parts, &host, port, default_port)?;
+        let request = Request::from_parts(parts, Full::new(body));
+
+        let tcp = self.dial(&host, port, tcp_options, None).await?;
+        if tls {
+            let server_name = ServerName::try_from(host.clone())?;
+            let tls_stream = self.tls_h1.connect(server_name, tcp).await?;
+            send_h1_upgradable(tls_stream, request).await
+        } else {
+            send_h1_upgradable(tcp, request).await
+        }
+    }
+
     async fn dial(
         &self,
         host: &str,
@@ -317,6 +367,37 @@ impl HttpClient {
     }
 }
 
+/// HTTP/1.1 wants an origin-form request target plus a Host header
+/// (hyper's low-level conn API doesn't add one); rewrites the parts in
+/// place, preserving the caller's method/headers/extensions.
+/// `default_port` is elided from the Host header per convention.
+fn rewrite_to_origin_form(
+    parts: &mut Parts,
+    host: &str,
+    port: u16,
+    default_port: u16,
+) -> Result<(), Error> {
+    let origin_form: Uri = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/")
+        .parse()?;
+    parts.uri = origin_form;
+    parts.version = Version::HTTP_11;
+    if !parts.headers.contains_key(header::HOST) {
+        let host_value = if port == default_port {
+            host.to_string()
+        } else {
+            format!("{host}:{port}")
+        };
+        parts
+            .headers
+            .insert(header::HOST, HeaderValue::try_from(host_value)?);
+    }
+    Ok(())
+}
+
 async fn send_h1<T>(
     io: T,
     mut parts: Parts,
@@ -335,32 +416,30 @@ where
         let _ = conn.await;
     });
 
-    // HTTP/1.1 wants an origin-form request target plus a Host header
-    // (hyper's low-level conn API doesn't add one); rewrite the parts,
-    // preserving the caller's method/headers/extensions.
-    let origin_form: Uri = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/")
-        .parse()?;
-    parts.uri = origin_form;
-    parts.version = Version::HTTP_11;
-    if !parts.headers.contains_key(header::HOST) {
-        let default_port = if scheme == "https" { 443 } else { 80 };
-        let host_value = if port == default_port {
-            host.to_string()
-        } else {
-            format!("{host}:{port}")
-        };
-        parts
-            .headers
-            .insert(header::HOST, HeaderValue::try_from(host_value)?);
-    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    rewrite_to_origin_form(&mut parts, host, port, default_port)?;
     let request = Request::from_parts(parts, Full::new(body));
 
     let response = send_request.send_request(request).await?;
     collect_response(response).await
+}
+
+/// Like [`send_h1`] but for protocol upgrades: the connection task is
+/// driven with `with_upgrades()` (so a `101 Switching Protocols` response
+/// can hand the underlying connection to `hyper::upgrade::on`) and the
+/// response is returned raw, body uncollected.
+async fn send_h1_upgradable<T>(
+    io: T,
+    request: Request<Full<Bytes>>,
+) -> Result<Response<hyper::body::Incoming>, Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut send_request, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io)).await?;
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+    Ok(send_request.send_request(request).await?)
 }
 
 /// Performs the h2 connection preface/SETTINGS exchange and spawns the

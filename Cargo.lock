@@ -57,6 +57,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "pkg-config",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "tokio",
