@@ -120,6 +120,18 @@ pub fn next_lcore(lcore: u32) -> Option<u32> {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum CoreState {
+    WAIT = 0,
+    RUNNING = 1,
+    FINISHED = 2,
+}
+
+pub fn get_lcore_state(lcore: u32) -> CoreState {
+    unsafe { std::mem::transmute(ffi::rte_eal_get_lcore_state(lcore)) }
+}
+
 #[derive(Debug)]
 pub struct LaunchError {
     pub lcore: u32,

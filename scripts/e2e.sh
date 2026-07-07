@@ -22,8 +22,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-cargo build --bin http_get
+cargo build --bin http_get --bin ws_client
 BIN="$TARGET_DIR/debug/http_get"
+WSBIN="$TARGET_DIR/debug/ws_client"
 
 WORK=$(mktemp -d)
 SERVER_PIDS=()
