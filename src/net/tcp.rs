@@ -82,9 +82,16 @@ impl TcpHeader {
 
     /// Parses the TCP header (including options) out of `buf`, which must
     /// contain at least the header; returns the header and the byte
-    /// offset where the payload begins. Verifies the checksum using the
-    /// IPv4 pseudo-header of the enclosing packet.
-    pub fn parse(buf: &[u8], src_ip: [u8; 4], dst_ip: [u8; 4]) -> Option<(Self, usize)> {
+    /// offset where the payload begins. `verify` computes and checks the
+    /// checksum (over the IPv4 pseudo-header + segment) in software;
+    /// callers pass `false` when the NIC already validated it (RX L4
+    /// checksum offload reported GOOD).
+    pub fn parse(
+        buf: &[u8],
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        verify: bool,
+    ) -> Option<(Self, usize)> {
         if buf.len() < TCP_HDR_LEN {
             return None;
         }
@@ -94,14 +101,16 @@ impl TcpHeader {
             return None;
         }
 
-        let pseudo = checksum::ipv4_pseudo_header_sum(
-            src_ip,
-            dst_ip,
-            super::ipv4::PROTO_TCP,
-            buf.len() as u16,
-        );
-        if checksum::fold(checksum::sum16(buf, pseudo)) != 0 {
-            return None;
+        if verify {
+            let pseudo = checksum::ipv4_pseudo_header_sum(
+                src_ip,
+                dst_ip,
+                super::ipv4::PROTO_TCP,
+                buf.len() as u16,
+            );
+            if checksum::fold(checksum::sum16(buf, pseudo)) != 0 {
+                return None;
+            }
         }
 
         let options = TcpOptions::parse(&buf[TCP_HDR_LEN..hdr_len]);
@@ -124,10 +133,21 @@ impl TcpHeader {
         TCP_HDR_LEN + if self.options.mss.is_some() { 4 } else { 0 }
     }
 
-    /// Writes the header (and options) into `out`, then fills in the
-    /// checksum computed over header + `payload` using the IPv4
-    /// pseudo-header. `out` must be exactly `wire_len()` bytes.
-    pub fn write(&self, out: &mut [u8], payload: &[u8], src_ip: [u8; 4], dst_ip: [u8; 4]) {
+    /// Writes the header (and options) into `out` and fills in the
+    /// checksum. `out` must be exactly `wire_len()` bytes.
+    ///
+    /// With `offload_cksum`, only the IPv4 pseudo-header checksum is
+    /// written (TX TCP checksum offload): the NIC completes it over the
+    /// header + payload. Otherwise the full checksum is computed in
+    /// software.
+    pub fn write(
+        &self,
+        out: &mut [u8],
+        payload: &[u8],
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        offload_cksum: bool,
+    ) {
         let hdr_len = self.wire_len();
         debug_assert_eq!(out.len(), hdr_len);
 
@@ -151,8 +171,13 @@ impl TcpHeader {
             super::ipv4::PROTO_TCP,
             (hdr_len + payload.len()) as u16,
         );
-        let sum = checksum::sum16(payload, checksum::sum16(out, pseudo));
-        let csum = checksum::fold(sum);
+        let csum = if offload_cksum {
+            // The NIC adds the checksum over the segment; the field carries
+            // the pseudo-header checksum only.
+            checksum::fold(pseudo)
+        } else {
+            checksum::fold(checksum::sum16(payload, checksum::sum16(out, pseudo)))
+        };
         out[16..18].copy_from_slice(&csum.to_be_bytes());
     }
 }

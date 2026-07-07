@@ -3,6 +3,8 @@
 
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+
 use crate::net::tcp::{TcpHeader, TcpOptions, flags};
 
 use super::congestion::CongestionControl;
@@ -37,7 +39,7 @@ pub struct OutSegment {
     pub ack: Seq,
     pub flags: u8,
     pub window: u16,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
     pub mss: Option<u16>,
 }
 
@@ -178,7 +180,7 @@ impl Tcb {
 
     // ---- application-facing operations ---------------------------------
 
-    pub fn send(&mut self, data: &[u8]) {
+    pub fn send(&mut self, data: Bytes) {
         self.send_buffer.push(data);
     }
 
@@ -206,7 +208,7 @@ impl Tcb {
         self.flush_requested = true;
     }
 
-    pub fn recv(&mut self, max_len: usize) -> Vec<u8> {
+    pub fn recv(&mut self, max_len: usize) -> Bytes {
         self.recv_buffer.read(max_len)
     }
 
@@ -486,24 +488,24 @@ impl Tcb {
 
         if self.want_rst {
             self.want_rst = false;
-            out.push(self.make_segment(self.snd_nxt, flags::RST, Vec::new(), None));
+            out.push(self.make_segment(self.snd_nxt, flags::RST, Bytes::new(), None));
             return out;
         }
 
         if self.want_syn {
             self.want_syn = false;
-            self.retransmit.push(self.iss, Vec::new(), true, false, now);
-            out.push(self.make_segment(self.iss, flags::SYN, Vec::new(), Some(DEFAULT_MSS)));
+            self.retransmit.push(self.iss, Bytes::new(), true, false, now);
+            out.push(self.make_segment(self.iss, flags::SYN, Bytes::new(), Some(DEFAULT_MSS)));
             return out;
         }
 
         if self.want_synack {
             self.want_synack = false;
-            self.retransmit.push(self.iss, Vec::new(), true, false, now);
+            self.retransmit.push(self.iss, Bytes::new(), true, false, now);
             out.push(self.make_segment(
                 self.iss,
                 flags::SYN | flags::ACK,
-                Vec::new(),
+                Bytes::new(),
                 Some(DEFAULT_MSS),
             ));
             return out;
@@ -553,16 +555,16 @@ impl Tcb {
             self.fin_sent = true;
             let seq = self.snd_nxt;
             self.snd_nxt = self.snd_nxt + 1;
-            self.retransmit.push(seq, Vec::new(), false, true, now);
+            self.retransmit.push(seq, Bytes::new(), false, true, now);
             self.state = match self.state {
                 TcpState::Established => TcpState::FinWait1,
                 TcpState::CloseWait => TcpState::LastAck,
                 other => other,
             };
-            out.push(self.make_segment(seq, flags::FIN | flags::ACK, Vec::new(), None));
+            out.push(self.make_segment(seq, flags::FIN | flags::ACK, Bytes::new(), None));
         } else if self.ack_pending && out.is_empty() {
             self.ack_pending = false;
-            out.push(self.make_segment(self.snd_nxt, flags::ACK, Vec::new(), None));
+            out.push(self.make_segment(self.snd_nxt, flags::ACK, Bytes::new(), None));
         }
 
         out
@@ -618,7 +620,7 @@ impl Tcb {
         }
     }
 
-    fn make_segment(&self, seq: Seq, flags: u8, payload: Vec<u8>, mss: Option<u16>) -> OutSegment {
+    fn make_segment(&self, seq: Seq, flags: u8, payload: Bytes, mss: Option<u16>) -> OutSegment {
         let window = RECV_BUFFER_CAPACITY
             .saturating_sub(self.recv_buffer.readable_len() as u32)
             .min(u16::MAX as u32) as u16;
@@ -663,6 +665,17 @@ impl Tcb {
             || self.ack_pending
             || self.retransmit_now
             || sendable_data
-            || (self.close_requested && self.send_buffer.is_empty())
+            // A FIN still waiting to be sent (close requested, buffer
+            // drained, not yet sent).
+            || (self.close_requested && !self.fin_sent && self.send_buffer.is_empty())
+    }
+
+    /// Whether a retransmission or TIME_WAIT timer is armed, i.e. the
+    /// connection needs `tick`ing on future polls even with no pending
+    /// output. Together with `has_pending_output`, this is what keeps a
+    /// connection in the engine's active set; a connection with neither is
+    /// fully idle and can be skipped until an inbound frame or app call.
+    pub fn has_armed_timer(&self) -> bool {
+        !self.retransmit.is_empty() || self.time_wait_deadline.is_some()
     }
 }

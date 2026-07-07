@@ -109,7 +109,9 @@ fn main() {
         connections.retain(|socket| {
             let data = socket.recv(&mut engine, 4096);
             if !data.is_empty() {
-                socket.send(&mut engine, &data);
+                // `data` is a refcounted `Bytes`; echoing it back moves it
+                // to the send buffer without copying.
+                socket.send(&mut engine, data);
             }
             match socket.state(&engine) {
                 Some(TcpState::CloseWait) if socket.readable_len(&engine) == 0 => {

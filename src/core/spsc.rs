@@ -13,7 +13,6 @@
 //! on separate lines (avoiding false sharing).
 
 use std::cell::UnsafeCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[repr(C)]
@@ -37,6 +36,11 @@ impl<T, const N: usize> Default for SpscRing<T, N> {
 }
 
 impl<T, const N: usize> SpscRing<T, N> {
+
+    const _VALIDATE: () = {
+        assert!(N > 0 && (N & (N - 1)) == 0, "N must be a power of 2!");
+    };
+
     /// Create a new empty ring buffer.
     ///
     /// N must be a power of two for optimal performance (modulo becomes
@@ -57,7 +61,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     #[inline(always)]
     fn push(&self, item: T) -> Result<(), T> {
         let head = self.head.load(Ordering::Relaxed);
-        let next_head = (head + 1) % N;
+        let next_head = (head + 1) & (N - 1);
 
         if next_head == self.tail.load(Ordering::Acquire) {
             return Err(item);
@@ -82,7 +86,7 @@ impl<T, const N: usize> SpscRing<T, N> {
         }
 
         let item = unsafe { (*self.buffer[tail].get()).take() };
-        self.tail.store((tail + 1) % N, Ordering::Release);
+        self.tail.store((tail + 1) & (N - 1), Ordering::Release);
         item
     }
 
@@ -91,7 +95,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     fn len(&self) -> usize {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        (head + N - tail) % N
+        (head + N - tail) & (N - 1)
     }
 
     /// Returns true if the ring is empty.

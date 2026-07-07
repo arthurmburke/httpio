@@ -13,6 +13,8 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+
 use crate::core::hashmap::HashMap;
 use crate::core::hashset::HashSet;
 use crate::dpdk::{EthPort, Mbuf, PktMbufPool};
@@ -39,6 +41,13 @@ pub struct TcpEngine {
     /// Tuples spawned from a listener's SYN, awaiting their first
     /// `Event::Established` before being handed to `accept()`.
     pending_accept: HashSet<FourTuple>,
+    /// Connections that need per-poll attention -- they have pending
+    /// output or an armed timer. `poll` processes only these, so idle
+    /// connections aren't walked every iteration. Invariant: a connection
+    /// *not* in this set has no pending output and no armed timer, so only
+    /// an inbound frame or an app call can make it need work -- and both
+    /// re-insert it here (see `mark_active`).
+    active: HashSet<FourTuple>,
 
     arp_table: HashMap<[u8; 4], [u8; 6]>,
     arp_last_request: HashMap<[u8; 4], Instant>,
@@ -54,17 +63,25 @@ impl TcpEngine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
-            listeners: HashSet::new(),
-            connections: HashMap::new(),
+            listeners: HashSet::default(),
+            connections: HashMap::default(),
             connections_opened: 0,
-            accept_queues: HashMap::new(),
-            pending_accept: HashSet::new(),
-            arp_table: HashMap::new(),
-            arp_last_request: HashMap::new(),
+            accept_queues: HashMap::default(),
+            pending_accept: HashSet::default(),
+            arp_table: HashMap::default(),
+            arp_last_request: HashMap::default(),
             pending_arp_replies: Vec::new(),
             pending_arp_requests: Vec::new(),
             pending_raw_resets: Vec::new(),
+            active: HashSet::default(),
         }
+    }
+
+    /// Marks a connection as needing attention on the next `poll`. Cheap
+    /// and idempotent; called from every path that can give a connection
+    /// pending output (app ops, inbound segments).
+    fn mark_active(&mut self, tuple: FourTuple) {
+        self.active.insert(tuple);
     }
 
     pub fn listen(&mut self, port: u16) {
@@ -81,6 +98,7 @@ impl TcpEngine {
         };
         self.connections.insert(tuple, Tcb::new_active(tuple));
         self.connections_opened += 1;
+        self.mark_active(tuple); // has a SYN to send
         tuple
     }
 
@@ -94,13 +112,14 @@ impl TcpEngine {
         self.accept_queues.get_mut(&port)?.pop_front()
     }
 
-    pub fn send(&mut self, tuple: FourTuple, data: &[u8]) {
+    pub fn send(&mut self, tuple: FourTuple, data: Bytes) {
         if let Some(tcb) = self.connections.get_mut(&tuple) {
             tcb.send(data);
+            self.mark_active(tuple);
         }
     }
 
-    pub fn recv(&mut self, tuple: FourTuple, max_len: usize) -> Vec<u8> {
+    pub fn recv(&mut self, tuple: FourTuple, max_len: usize) -> Bytes {
         self.connections
             .get_mut(&tuple)
             .map(|t| t.recv(max_len))
@@ -117,6 +136,7 @@ impl TcpEngine {
     pub fn close(&mut self, tuple: FourTuple) {
         if let Some(tcb) = self.connections.get_mut(&tuple) {
             tcb.close();
+            self.mark_active(tuple);
         }
     }
 
@@ -125,6 +145,8 @@ impl TcpEngine {
     pub fn set_nodelay(&mut self, tuple: FourTuple, nodelay: bool) {
         if let Some(tcb) = self.connections.get_mut(&tuple) {
             tcb.set_nodelay(nodelay);
+            // May unblock a Nagle-held tail.
+            self.mark_active(tuple);
         }
     }
 
@@ -133,6 +155,8 @@ impl TcpEngine {
     pub fn set_cork(&mut self, tuple: FourTuple, corked: bool) {
         if let Some(tcb) = self.connections.get_mut(&tuple) {
             tcb.set_cork(corked);
+            // Uncorking flushes a held tail.
+            self.mark_active(tuple);
         }
     }
 
@@ -140,6 +164,7 @@ impl TcpEngine {
     pub fn flush(&mut self, tuple: FourTuple) {
         if let Some(tcb) = self.connections.get_mut(&tuple) {
             tcb.flush();
+            self.mark_active(tuple);
         }
     }
 
@@ -158,41 +183,78 @@ impl TcpEngine {
         now: Instant,
     ) -> Vec<(FourTuple, Event)> {
         for mbuf in port.rx_burst(MAX_RX_BURST) {
-            self.handle_frame(mbuf.data(), now);
+            // RX checksum offload: if the NIC checked a checksum and it was
+            // wrong, drop the frame; if it verified one as good, skip the
+            // corresponding software check. When RX offload is off the
+            // flags read UNKNOWN, so both fall back to software verify.
+            if mbuf.rx_ip_cksum_bad() || mbuf.rx_l4_cksum_bad() {
+                continue;
+            }
+            let ip_ok = mbuf.rx_ip_cksum_good();
+            let l4_ok = mbuf.rx_l4_cksum_good();
+            self.handle_frame(mbuf.data(), ip_ok, l4_ok, now);
         }
 
         let mut events = Vec::new();
-        let pending_accept = &mut self.pending_accept;
-        let accept_queues = &mut self.accept_queues;
-        self.connections.retain(|tuple, tcb| {
-            tcb.tick(now);
-            for ev in tcb.events.drain(..) {
-                if ev == Event::Established && pending_accept.remove(tuple) {
-                    accept_queues
-                        .entry(tuple.local_port)
-                        .or_default()
-                        .push_back(*tuple);
-                }
-                events.push((*tuple, ev));
-            }
-            // Keep TIME_WAIT connections around until their tick() closes
-            // them; everything else closed can be dropped immediately.
-            !tcb.is_closed()
-        });
-
-        // Disjoint field borrows: `connections` is borrowed for the outer
-        // iteration while `arp_table`/`arp_last_request`/
-        // `pending_arp_requests` are borrowed separately by
-        // `build_tcp_frame` on each iteration -- routed through a free
-        // function (rather than a `&mut self` method) so the borrow
-        // checker can see the two borrows don't overlap.
         let mut out_mbufs = Vec::new();
+
+        // Process only the connections that need attention this poll.
+        // `drain` empties the set; each connection re-inserts itself in
+        // phase 2 if it still has pending output or an armed timer, so an
+        // idle connection is dropped from the set and not walked again
+        // until an inbound frame / app call re-adds it.
+        let active: Vec<FourTuple> = self.active.drain().collect();
+
+        // Phase 1: tick timers, drain events, reap fully-closed
+        // connections. The `tcb` borrow is scoped so the accept-queue /
+        // reap steps can touch other engine fields afterward.
+        for &tuple in &active {
+            let mut established = false;
+            let closed;
+            {
+                let Some(tcb) = self.connections.get_mut(&tuple) else {
+                    continue;
+                };
+                tcb.tick(now);
+                for ev in tcb.events.drain(..) {
+                    established |= ev == Event::Established;
+                    events.push((tuple, ev));
+                }
+                closed = tcb.is_closed();
+            }
+            if established && self.pending_accept.remove(&tuple) {
+                self.accept_queues
+                    .entry(tuple.local_port)
+                    .or_default()
+                    .push_back(tuple);
+            }
+            // Keep TIME_WAIT (not `is_closed`) around; drop only fully
+            // closed connections.
+            if closed {
+                self.connections.remove(&tuple);
+                self.pending_accept.remove(&tuple);
+            }
+        }
+
+        // Phase 2: build output for the connections still present, and
+        // re-arm the active set for any that still need attention.
+        //
+        // Disjoint field borrows: `connections` is borrowed for the loop
+        // while `arp_table`/`arp_last_request`/`pending_arp_requests` are
+        // borrowed separately by `build_tcp_frame` (a free function, so
+        // the borrow checker sees the borrows don't overlap), and `active`
+        // is a third disjoint field.
+        let tx_offload = port.tx_cksum_offload();
         let connections = &mut self.connections;
         let config = &self.config;
         let arp_table = &self.arp_table;
         let arp_last_request = &mut self.arp_last_request;
         let pending_arp_requests = &mut self.pending_arp_requests;
-        for (tuple, tcb) in connections.iter_mut() {
+        let active_set = &mut self.active;
+        for &tuple in &active {
+            let Some(tcb) = connections.get_mut(&tuple) else {
+                continue; // reaped in phase 1
+            };
             for seg in tcb.poll_output(now) {
                 if let Some(mbuf) = build_tcp_frame(
                     pool,
@@ -200,12 +262,16 @@ impl TcpEngine {
                     arp_table,
                     arp_last_request,
                     pending_arp_requests,
-                    tuple,
+                    &tuple,
                     tcb,
                     &seg,
+                    tx_offload,
                 ) {
                     out_mbufs.push(mbuf);
                 }
+            }
+            if tcb.has_pending_output() || tcb.has_armed_timer() {
+                active_set.insert(tuple);
             }
         }
         for (dst_mac, dst_ip) in self.pending_arp_replies.drain(..) {
@@ -241,6 +307,7 @@ impl TcpEngine {
                 dst_ip,
                 &hdr,
                 &[],
+                tx_offload,
             ) {
                 out_mbufs.push(mbuf);
             }
@@ -253,14 +320,16 @@ impl TcpEngine {
         events
     }
 
-    fn handle_frame(&mut self, frame: &[u8], now: Instant) {
+    /// `ip_ok`/`l4_ok` report that the NIC already verified the IPv4 /
+    /// TCP checksum on RX, so software verification can be skipped.
+    fn handle_frame(&mut self, frame: &[u8], ip_ok: bool, l4_ok: bool, now: Instant) {
         let Some(eth_hdr) = eth::EthHeader::parse(frame) else {
             return;
         };
         let payload = &frame[eth::ETH_HDR_LEN..];
         match eth_hdr.ethertype {
             arp::ETHERTYPE_ARP => self.handle_arp(payload),
-            eth::ETHERTYPE_IPV4 => self.handle_ipv4(payload, now),
+            eth::ETHERTYPE_IPV4 => self.handle_ipv4(payload, ip_ok, l4_ok, now),
             _ => {}
         }
     }
@@ -278,8 +347,8 @@ impl TcpEngine {
         }
     }
 
-    fn handle_ipv4(&mut self, buf: &[u8], now: Instant) {
-        let Some(ip_hdr) = ipv4::Ipv4Header::parse(buf) else {
+    fn handle_ipv4(&mut self, buf: &[u8], ip_ok: bool, l4_ok: bool, now: Instant) {
+        let Some(ip_hdr) = ipv4::Ipv4Header::parse(buf, !ip_ok) else {
             return;
         };
         if ip_hdr.protocol != ipv4::PROTO_TCP || ip_hdr.dst != self.config.local_ip {
@@ -290,7 +359,8 @@ impl TcpEngine {
             return;
         }
         let ip_payload = &buf[ipv4::IPV4_HDR_LEN..total_len];
-        let Some((tcp_hdr, hdr_len)) = tcp::TcpHeader::parse(ip_payload, ip_hdr.src, ip_hdr.dst)
+        let Some((tcp_hdr, hdr_len)) =
+            tcp::TcpHeader::parse(ip_payload, ip_hdr.src, ip_hdr.dst, !l4_ok)
         else {
             return;
         };
@@ -305,6 +375,9 @@ impl TcpEngine {
 
         if let Some(tcb) = self.connections.get_mut(&tuple) {
             tcb.on_segment(&tcp_hdr, segment_payload, now);
+            // The segment may have produced an ACK/data to send, an event,
+            // or a state change -- process it next poll.
+            self.mark_active(tuple);
             return;
         }
 
@@ -314,6 +387,7 @@ impl TcpEngine {
             let tcb = Tcb::new_from_listen(tuple, Seq::new(tcp_hdr.seq), peer_mss);
             self.connections.insert(tuple, tcb);
             self.pending_accept.insert(tuple);
+            self.mark_active(tuple); // has a SYN-ACK to send
             return;
         }
 
@@ -407,6 +481,7 @@ fn build_tcp_frame(
     tuple: &FourTuple,
     tcb: &Tcb,
     seg: &OutSegment,
+    tx_cksum_offload: bool,
 ) -> Option<Mbuf> {
     let Some(&remote_mac) = arp_table.get(&tuple.remote_ip) else {
         request_arp(arp_last_request, pending_arp_requests, tuple.remote_ip);
@@ -421,9 +496,11 @@ fn build_tcp_frame(
         tuple.remote_ip,
         &hdr,
         &seg.payload,
+        tx_cksum_offload,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_ip_tcp_frame(
     pool: &PktMbufPool,
     local_mac: [u8; 6],
@@ -432,6 +509,7 @@ fn build_ip_tcp_frame(
     remote_ip: [u8; 4],
     tcp_hdr: &tcp::TcpHeader,
     payload: &[u8],
+    tx_cksum_offload: bool,
 ) -> Option<Mbuf> {
     let tcp_len = tcp_hdr.wire_len();
     let total_len = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + tcp_len + payload.len();
@@ -465,8 +543,21 @@ fn build_ip_tcp_frame(
     buf[tcp_end..tcp_end + payload.len()].copy_from_slice(payload);
     {
         let (ip_and_before, rest) = buf.split_at_mut(tcp_start);
-        tcp_hdr.write(&mut rest[..tcp_len], payload, local_ip, remote_ip);
-        ip_hdr.write(&mut ip_and_before[ip_start..ip_end]);
+        // With TX checksum offload the NIC fills the IPv4 checksum and
+        // completes the TCP checksum; we write only the TCP pseudo-header
+        // checksum and a zero IPv4 checksum, and tag the mbuf below.
+        tcp_hdr.write(
+            &mut rest[..tcp_len],
+            payload,
+            local_ip,
+            remote_ip,
+            tx_cksum_offload,
+        );
+        ip_hdr.write(&mut ip_and_before[ip_start..ip_end], tx_cksum_offload);
+    }
+
+    if tx_cksum_offload {
+        mbuf.set_tx_ipv4_tcp_cksum(eth::ETH_HDR_LEN as u16, ipv4::IPV4_HDR_LEN as u16);
     }
 
     Some(mbuf)

@@ -20,10 +20,10 @@ webpki-roots = "0.26"
 gxhash = "3.5"
 
 [build-dependencies]
-cc = "1"
-
-# bindgen (and the libclang it needs) is only required where a real DPDK
-# build can happen. Keeping it target-gated spares non-Linux machines,
-# which use the stub FFI declarations anyway, from compiling it.
-[target.'cfg(target_os = "linux")'.build-dependencies]
+# DPDK is a hard build requirement: bindgen generates the FFI (including
+# wrappers for DPDK's `static inline` hot-path functions via
+# `wrap_static_fns`), cc compiles those generated wrappers, and pkg-config
+# locates libdpdk and its link flags. Build/test in the devcontainer.
 bindgen = "0.71"
+cc = "1"
+pkg-config = "0.3"

@@ -5,6 +5,8 @@
 //! takes `&mut TcpEngine` explicitly rather than hiding it behind
 //! `Rc<RefCell<_>>`.
 
+use bytes::Bytes;
+
 use super::engine::TcpEngine;
 use super::state::TcpState;
 use super::tcb::FourTuple;
@@ -28,13 +30,15 @@ impl TcpSocket {
         engine.accept(port).map(Self)
     }
 
-    pub fn send(&self, engine: &mut TcpEngine, data: &[u8]) {
+    /// Queues `data` for sending. Takes `Bytes` so the payload travels to
+    /// the wire by refcount rather than being copied into the send buffer.
+    pub fn send(&self, engine: &mut TcpEngine, data: Bytes) {
         engine.send(self.0, data);
     }
 
-    /// Non-blocking read of up to `max_len` bytes; returns an empty `Vec`
-    /// if nothing is available.
-    pub fn recv(&self, engine: &mut TcpEngine, max_len: usize) -> Vec<u8> {
+    /// Non-blocking read of up to `max_len` bytes; returns an empty
+    /// `Bytes` if nothing is available.
+    pub fn recv(&self, engine: &mut TcpEngine, max_len: usize) -> Bytes {
         engine.recv(self.0, max_len)
     }
 

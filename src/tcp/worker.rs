@@ -126,6 +126,7 @@ struct WorkerConn {
 /// `Send + Sync`: the connection-open path goes through an MPSC control
 /// ring, so a single handle (e.g. behind an `Arc`) can be shared by any
 /// number of application threads all opening connections concurrently.
+#[derive(Clone)]
 pub struct WorkerHandle {
     ctrl_tx: CtrlTx,
     stop: Arc<AtomicBool>,
@@ -235,10 +236,13 @@ fn run(
     stop: Arc<AtomicBool>,
     connections_opened: Arc<AtomicU64>,
 ) {
-    let mut conns: HashMap<FourTuple, WorkerConn> = HashMap::new();
+    let mut conns: HashMap<FourTuple, WorkerConn> = HashMap::default();
+    // Mirror of the last value published to `connections_opened`, so the
+    // shared (cross-core) counter is only written when it actually changes
+    // rather than on every spin.
+    let mut published_opened = 0u64;
 
     while !stop.load(Ordering::Acquire) {
-        connections_opened.store(engine.connections_opened(), Ordering::Release);
         // 1. Register newly opened connections.
         while let Some(nc) = ctrl_rx.pop() {
             let tuple = engine.connect(nc.remote_ip, nc.remote_port, nc.local_port);
@@ -257,13 +261,20 @@ fn run(
                     closing: false,
                 },
             );
+            // A connection was just opened; publish the new count (only
+            // here, since this is the only place it changes).
+            let opened = engine.connections_opened();
+            if opened != published_opened {
+                published_opened = opened;
+                connections_opened.store(opened, Ordering::Release);
+            }
         }
 
         // 2. Apply queued commands from each connection.
         for conn in conns.values_mut() {
             while let Some(cmd) = conn.cmd_rx.pop() {
                 match cmd {
-                    Command::Send(data) => engine.send(conn.tuple, &data),
+                    Command::Send(data) => engine.send(conn.tuple, data),
                     Command::SetCork(c) => engine.set_cork(conn.tuple, c),
                     Command::Flush => engine.flush(conn.tuple),
                     Command::Close => {
@@ -324,9 +335,7 @@ fn run(
                 if chunk.is_empty() {
                     break;
                 }
-                if let Err(Inbound::Data(b)) =
-                    conn.inbound_tx.push(Inbound::Data(Bytes::from(chunk)))
-                {
+                if let Err(Inbound::Data(b)) = conn.inbound_tx.push(Inbound::Data(chunk)) {
                     conn.pending_in = Some(b);
                 }
             }

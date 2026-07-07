@@ -12,7 +12,7 @@
 //!
 //! ```ignore
 //! #[global_allocator]
-//! static GLOBAL: quicktcp::mem::alloc::Alloc = quicktcp::mem::alloc::Alloc;
+//! static GLOBAL: bypio::core::alloc::Alloc = bypio::core::alloc::Alloc;
 //! ```
 //!
 //! INVARIANT (relied on by the unchecked pointer math below): every free-list

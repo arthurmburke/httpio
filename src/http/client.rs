@@ -73,7 +73,7 @@ pub mod builder {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             Self {
                 roots,
-                resolve: HashMap::new(),
+                resolve: HashMap::default(),
             }
         }
 
@@ -135,7 +135,7 @@ pub mod builder {
                 tls_h1: TlsConnector::from(Arc::new(tls_h1_config)),
                 resolve: self.resolve,
                 next_port: AtomicU16::new(next_port),
-                h2_pool: Mutex::new(HashMap::new()),
+                h2_pool: Mutex::new(HashMap::default()),
             }
         }
     }

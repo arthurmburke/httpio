@@ -1,0 +1,7 @@
+# Tune codegen for the build machine. This DPDK stack is compiled and run
+# on the same host (the devcontainer), so `target-cpu=native` is safe and
+# lets the compiler use the CPU's full instruction set -- it also satisfies
+# gxhash's requirement for AES/NEON (or AES-NI/SSE) intrinsics, which are
+# otherwise a hard compile error on aarch64.
+[build]
+rustflags = ["-C", "target-cpu=native"]

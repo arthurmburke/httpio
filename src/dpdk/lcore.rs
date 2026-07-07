@@ -12,14 +12,15 @@ use super::ffi;
 
 /// The calling thread's lcore id.
 pub fn current_lcore_id() -> u32 {
-    // SAFETY: reads a per-lcore variable; valid on any EAL thread.
-    unsafe { ffi::dpdk_shim_lcore_id() }
+    // SAFETY: `rte_lcore_id` reads a per-lcore variable; valid on any EAL
+    // thread. (A `static inline` wrapped by bindgen.)
+    unsafe { ffi::rte_lcore_id() }
 }
 
 /// The main (initial) lcore's id -- the one that called `rte_eal_init`.
 pub fn main_lcore_id() -> u32 {
     // SAFETY: reads immutable EAL configuration; valid on any EAL thread.
-    unsafe { ffi::dpdk_shim_main_lcore() }
+    unsafe { ffi::rte_get_main_lcore() }
 }
 
 /// Number of lcores in the EAL coremask.
@@ -36,7 +37,7 @@ pub fn first_worker_lcore() -> Option<u32> {
     let next = unsafe { ffi::rte_get_next_lcore(main, 1, 0) };
     // rte_get_next_lcore returns RTE_MAX_LCORE when there is no next
     // lcore.
-    if next >= unsafe { ffi::dpdk_shim_max_lcore() } {
+    if next >= ffi::RTE_MAX_LCORE {
         None
     } else {
         Some(next)
@@ -46,7 +47,7 @@ pub fn first_worker_lcore() -> Option<u32> {
 /// Get the next lcore after `lcore`.
 pub fn next_lcore(lcore: u32) -> Option<u32> {
     let next = unsafe { ffi::rte_get_next_lcore(lcore, 0, 0) };
-    if next >= unsafe { ffi::dpdk_shim_max_lcore() } {
+    if next >= ffi::RTE_MAX_LCORE {
         None
     } else {
         Some(next)

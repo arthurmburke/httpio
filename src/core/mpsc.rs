@@ -34,6 +34,11 @@ struct MpscRing<T, const N: usize> {
 unsafe impl<T: Send, const N: usize> Send for MpscRing<T, N> {}
 
 impl<T, const N: usize> MpscRing<T, N> {
+
+    const _VALIDATE: () = {
+        assert!(N > 0 && (N & (N - 1)) == 0, "N must be a power of 2!");
+    };
+
     fn new() -> Self {
         assert!(N >= 2, "MPSC ring needs capacity >= 2");
         Self {
@@ -56,7 +61,7 @@ impl<T, const N: usize> MpscRing<T, N> {
     fn push(&self, item: T) -> Result<(), T> {
         let mut pos = self.enqueue_pos.load(Ordering::Relaxed);
         loop {
-            let cell = &self.buffer[pos % N];
+            let cell = &self.buffer[pos & (N - 1)];
             let seq = cell.seq.load(Ordering::Acquire);
             // Signed distance, computed via wrapping so it stays correct
             // even as `pos` wraps the usize range.
@@ -91,7 +96,7 @@ impl<T, const N: usize> MpscRing<T, N> {
     fn pop(&self) -> Option<T> {
         let mut pos = self.dequeue_pos.load(Ordering::Relaxed);
         loop {
-            let cell = &self.buffer[pos % N];
+            let cell = &self.buffer[pos & (N - 1)];
             let seq = cell.seq.load(Ordering::Acquire);
             let diff = seq.wrapping_sub(pos.wrapping_add(1)) as isize;
             if diff == 0 {

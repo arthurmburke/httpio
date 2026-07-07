@@ -1,144 +1,100 @@
-//! Builds the real DPDK FFI layer when DPDK is available:
+//! Generates the DPDK FFI at build time and links against libdpdk.
 //!
-//! 1. **bindgen** runs over `csrc/wrapper.h` with the include flags from
-//!    `pkg-config --cflags libdpdk`, generating ABI-exact Rust bindings
-//!    (struct layouts, exported-function signatures) for the DPDK version
-//!    actually installed on this machine. Output goes to
-//!    `$OUT_DIR/dpdk_bindings.rs`, included by `src/dpdk/ffi.rs` under
-//!    `cfg(dpdk_bound)`.
-//! 2. **cc** compiles `csrc/shim.c` against the same headers. The shim
-//!    exists because a handful of DPDK datapath functions
-//!    (`rte_eth_rx_burst`, `rte_pktmbuf_alloc`, ...) are `static inline`
-//!    in the headers: they never appear as linkable symbols in
-//!    libdpdk.so, so neither bindgen nor a plain `extern "C"` block can
-//!    reach them. The shim wraps each in a real exported symbol.
-//! 3. The `-l`/`-L` tokens from `pkg-config --libs libdpdk` are forwarded
-//!    to cargo for the final link.
+//! Everything is generated -- there is no hand-written C shim. bindgen's
+//! `wrap_static_fns` emits a C file with real wrapper functions for DPDK's
+//! `static inline` hot-path (`rte_pktmbuf_alloc`, `rte_eth_rx_burst`, ...),
+//! which are otherwise unreachable from Rust because they have no linkable
+//! symbol. We compile that generated C and link it alongside the bindings.
 //!
-//! DPDK is Linux-only. Off Linux (or if libdpdk isn't installed) all of
-//! the above is skipped and `cfg(dpdk_bound)` is left unset, which makes
-//! `src/dpdk/ffi.rs` fall back to non-linkable stub declarations so
-//! `cargo check` still type-checks the whole crate. Use the devcontainer
-//! in `.devcontainer/` for a real build.
+//! DPDK is a hard requirement (Linux-only): this build script always runs
+//! bindgen + pkg-config, so `cargo build`/`check` must run where libdpdk is
+//! installed -- the devcontainer. There is no non-DPDK fallback.
 
 use std::env;
-use std::process::Command;
+use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-changed=csrc/shim.c");
-    println!("cargo:rerun-if-changed=csrc/wrapper.h");
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    // Declare the custom cfg so rustc's check-cfg lint knows to expect it.
-    println!("cargo:rustc-check-cfg=cfg(dpdk_bound)");
 
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "linux" {
-        println!(
-            "cargo:warning=tcp: DPDK is Linux-only; building with stub (non-linkable) FFI \
-             declarations on target_os=\"{target_os}\". Use the devcontainer for a real build."
+    // Locate libdpdk and emit its link flags (this also prints the
+    // cargo:rustc-link-lib/search lines for every DPDK library).
+    let dpdk = pkg_config::Config::new()
+        .statik(false)
+        .probe("libdpdk")
+        .expect(
+            "libdpdk not found via pkg-config.\n\
+             Install the DPDK dev packages (e.g. `apt install libdpdk-dev`) or set \
+             PKG_CONFIG_PATH to a prefix containing libdpdk.pc. Build in the devcontainer.",
         );
-        return;
-    }
 
-    let exists = Command::new("pkg-config")
-        .args(["--exists", "libdpdk"])
-        .status();
-    if !matches!(exists, Ok(status) if status.success()) {
-        println!(
-            "cargo:warning=tcp: pkg-config could not find `libdpdk`; building with stub \
-             (non-linkable) FFI declarations. Install the DPDK dev packages (see \
-             .devcontainer/Dockerfile) for a real build."
-        );
-        return;
-    }
+    // numa/pthread aren't always pulled in transitively by libdpdk.pc.
+    println!("cargo:rustc-link-lib=numa");
+    println!("cargo:rustc-link-lib=pthread");
 
-    let cflags = pkg_config_output(&["--cflags", "libdpdk"]);
-    let libs = pkg_config_output(&["--libs", "libdpdk"]);
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let static_fns_c = out_dir.join("dpdk_static_fns.c");
 
-    generate_bindings(&cflags);
-
-    let mut build = cc::Build::new();
-    build.file("csrc/shim.c");
-    for flag in cflags.split_whitespace() {
-        build.flag(flag);
-    }
-    build.compile("dpdk_shim");
-
-    // pkg-config for libdpdk emits the library list DPDK needs. Forward
-    // each -L/-l token to cargo for the final binary link. Other flags
-    // (e.g. -Wl,--whole-archive groups emitted for static PMD linking)
-    // aren't representable as cargo link directives; pass those via
-    // RUSTFLAGS if a static-linking setup needs them.
-    for token in libs.split_whitespace() {
-        if let Some(name) = token.strip_prefix("-l") {
-            println!("cargo:rustc-link-lib=dylib={name}");
-        } else if let Some(path) = token.strip_prefix("-L") {
-            println!("cargo:rustc-link-search=native={path}");
-        }
-    }
-
-    println!("cargo:rustc-cfg=dpdk_bound");
-}
-
-/// Runs bindgen over `csrc/wrapper.h`, allowlisting exactly the exported
-/// functions the stack calls plus the types they pull in. The allowlist
-/// keeps the generated file focused instead of transcribing every DPDK
-/// header in the include graph.
-#[cfg(target_os = "linux")]
-fn generate_bindings(cflags: &str) {
-    use std::path::PathBuf;
-
-    let bindings = bindgen::Builder::default()
-        .header("csrc/wrapper.h")
-        .clang_args(cflags.split_whitespace())
-        .allowlist_function("rte_eal_init")
-        .allowlist_function("rte_pktmbuf_pool_create")
-        .allowlist_function("rte_eth_dev_count_avail")
-        .allowlist_function("rte_eth_rx_queue_setup")
-        .allowlist_function("rte_eth_tx_queue_setup")
-        .allowlist_function("rte_eth_dev_start")
-        .allowlist_function("rte_eth_dev_stop")
-        .allowlist_function("rte_eth_dev_close")
-        .allowlist_function("rte_eth_promiscuous_enable")
-        .allowlist_function("rte_eth_macaddr_get")
-        .allowlist_function("rte_eal_cleanup")
-        .allowlist_function("rte_eal_remote_launch")
-        .allowlist_function("rte_eal_wait_lcore")
-        .allowlist_function("rte_get_next_lcore")
-        .allowlist_function("rte_lcore_count")
-        .allowlist_type("rte_mbuf")
-        .allowlist_type("rte_mempool")
-        .allowlist_type("rte_ether_addr")
+    let mut builder = bindgen::Builder::default()
+        .header("wrapper.h")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .derive_default(true)
+        .derive_debug(false)
+        .generate_comments(false)
+        .prepend_enum_name(false)
+        // Emit a C file with wrappers for `static inline` functions so the
+        // datapath (rx/tx burst, pktmbuf alloc/free/append, ...) is
+        // callable from Rust.
+        .wrap_static_fns(true)
+        .wrap_static_fns_path(&static_fns_c)
+        // Many DPDK constants (e.g. RTE_ETH_TX_OFFLOAD_*_CKSUM) are defined
+        // via the RTE_BIT64() function-macro, which bindgen can't
+        // constant-fold on its own. This falls back to clang to evaluate
+        // them so they're generated rather than hand-transcribed.
+        .clang_macro_fallback()
+        .allowlist_function("rte_.*")
+        .allowlist_type("rte_.*")
+        .allowlist_type("RTE_.*")
+        .allowlist_var("RTE_.*")
+        .allowlist_var("rte_.*")
+        // DPDK headers lean on GNU attributes/extensions clang chokes on
+        // when reduced to a bindgen parse; neutralize them.
+        .clang_arg("-D__attribute__(x)=")
+        .clang_arg("-D__extension__=");
+
+    for include in &dpdk.include_paths {
+        builder = builder.clang_arg(format!("-I{}", include.display()));
+    }
+
+    let bindings = builder
         .generate()
         .expect("bindgen failed to generate DPDK bindings (is libclang installed?)");
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     bindings
-        .write_to_file(out_dir.join("dpdk_bindings.rs"))
-        .expect("failed to write dpdk_bindings.rs");
-}
+        .write_to_file(out_dir.join("bindings.rs"))
+        .expect("failed to write bindings.rs");
 
-/// Build scripts run on the host: bindgen is only a dependency when the
-/// host is Linux, so cross-compiling *to* Linux from another OS can't
-/// generate bindings.
-#[cfg(not(target_os = "linux"))]
-fn generate_bindings(_cflags: &str) {
-    panic!(
-        "cross-compiling to Linux/DPDK from a non-Linux host is not supported by this build \
-         script; build inside the devcontainer instead"
-    );
-}
-
-fn pkg_config_output(args: &[&str]) -> String {
-    let output = Command::new("pkg-config")
-        .args(args)
-        .output()
-        .expect("failed to run pkg-config for libdpdk");
-    assert!(
-        output.status.success(),
-        "pkg-config {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).expect("pkg-config output was not valid UTF-8")
+    // Compile and link the generated static-inline wrappers.
+    let mut cc = cc::Build::new();
+    cc.file(&static_fns_c).include(".");
+    for include in &dpdk.include_paths {
+        cc.include(include);
+    }
+    for (k, v) in &dpdk.defines {
+        match v {
+            Some(val) => cc.define(k, val.as_str()),
+            None => cc.define(k, None),
+        };
+    }
+    cc.flag_if_supported("-march=native")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-deprecated-declarations")
+        // The generated wrappers trip a couple of harmless warnings: our
+        // `-D__attribute__(x)=` neutralization turns DPDK's `__rte_const`
+        // into a duplicate `const`, and a few internal arch helpers (e.g.
+        // `rte_arch_bswap16`) are declared in headers we don't include but
+        // are never actually called from Rust.
+        .flag_if_supported("-Wno-duplicate-decl-specifier")
+        .flag_if_supported("-Wno-implicit-function-declaration")
+        .compile("dpdk_static_fns");
 }
