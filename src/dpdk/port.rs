@@ -4,7 +4,7 @@ use std::ptr;
 
 use super::ffi;
 use super::mbuf::Mbuf;
-use super::mempool::PktMbufPool;
+use super::mempool::Mempool;
 
 #[derive(Debug)]
 pub struct PortError {
@@ -49,7 +49,7 @@ impl EthPort {
     /// (payload, not including the Ethernet header/CRC).
     pub fn init(
         port_id: u16,
-        rx_pool: &PktMbufPool,
+        rx_pool: &Mempool,
         nb_rx_desc: u16,
         nb_tx_desc: u16,
         mtu: u32,

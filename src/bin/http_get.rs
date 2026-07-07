@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::{Method, Request};
 
 use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use bypio::dpdk::{self, EthPort, PktMbufPool};
+use bypio::dpdk::{self, EthPort, Mempool};
 use bypio::http::client::builder::Builder;
 use bypio::http::stream::{FlushHandle, TcpOptions};
 use bypio::tcp::engine::EngineConfig;
@@ -66,24 +66,6 @@ fn main() -> ExitCode {
     let eal_args: Vec<&str> = eal_args.iter().map(String::as_str).collect();
     dpdk::eal::init(&eal_args).expect("EAL initialization failed");
 
-    let pool = PktMbufPool::create(
-        "http_mbuf_pool",
-        MBUF_POOL_SIZE,
-        MBUF_CACHE_SIZE,
-        DEFAULT_MBUF_DATA_ROOM_SIZE,
-        -1,
-    )
-    .expect("failed to create mbuf pool");
-    assert!(EthPort::count_avail() > 0, "no DPDK ports available");
-    let port = EthPort::init(PORT_ID, &pool, NB_RX_DESC, NB_TX_DESC, DEFAULT_MTU, -1)
-        .expect("failed to initialize ethdev port");
-    let mac = port.mac_addr().expect("failed to read MAC address");
-
-    let engine = TcpEngine::new(EngineConfig {
-        local_mac: mac.addr_bytes,
-        local_ip: app.local_ip,
-    });
-
     // The engine runs on a dedicated worker lcore; the tokio runtime (and
     // this thread) stay on the main lcore. Requires at least two EAL
     // lcores, e.g. `-l 0-1`.
@@ -93,6 +75,33 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
+
+    let socket_id = dpdk::lcore::get_core_info(worker_lcore).socket;
+
+    let pool = Mempool::create(
+        "http_mbuf_pool",
+        MBUF_POOL_SIZE,
+        MBUF_CACHE_SIZE,
+        DEFAULT_MBUF_DATA_ROOM_SIZE,
+        socket_id as i32,
+    )
+    .expect("failed to create mbuf pool");
+    assert!(EthPort::count_avail() > 0, "no DPDK ports available");
+    let port = EthPort::init(
+        PORT_ID,
+        &pool,
+        NB_RX_DESC,
+        NB_TX_DESC,
+        DEFAULT_MTU,
+        socket_id as i32,
+    )
+    .expect("failed to initialize ethdev port");
+    let mac = port.mac_addr().expect("failed to read MAC address");
+
+    let engine = TcpEngine::new(EngineConfig {
+        local_mac: mac.addr_bytes,
+        local_ip: app.local_ip,
+    });
 
     let (worker, worker_join) = match WorkerHandle::spawn(engine, port, pool, worker_lcore) {
         Ok(pair) => pair,

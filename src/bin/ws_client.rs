@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use bypio::dpdk::{self, EthPort, PktMbufPool};
+use bypio::dpdk::{self, EthPort, Mempool};
 use bypio::http::client::builder::Builder;
 use bypio::http::ws::Message;
 use bypio::tcp::engine::{EngineConfig, TcpEngine};
@@ -62,17 +62,33 @@ fn main() -> ExitCode {
     let eal_args: Vec<&str> = eal_args.iter().map(String::as_str).collect();
     dpdk::eal::init(&eal_args).expect("EAL initialization failed");
 
-    let pool = PktMbufPool::create(
+    let Some(worker_lcore) = dpdk::first_worker_lcore() else {
+        eprintln!(
+            "error: no worker lcore available; start EAL with at least two lcores (e.g. `-l 0-1`)"
+        );
+        return ExitCode::FAILURE;
+    };
+
+    let socket_id = dpdk::lcore::get_core_info(worker_lcore).socket;
+
+    let pool = Mempool::create(
         "ws_mbuf_pool",
         MBUF_POOL_SIZE,
         MBUF_CACHE_SIZE,
         DEFAULT_MBUF_DATA_ROOM_SIZE,
-        -1,
+        socket_id as i32,
     )
     .expect("failed to create mbuf pool");
     assert!(EthPort::count_avail() > 0, "no DPDK ports available");
-    let port = EthPort::init(PORT_ID, &pool, NB_RX_DESC, NB_TX_DESC, DEFAULT_MTU, -1)
-        .expect("failed to initialize ethdev port");
+    let port = EthPort::init(
+        PORT_ID,
+        &pool,
+        NB_RX_DESC,
+        NB_TX_DESC,
+        DEFAULT_MTU,
+        socket_id as i32,
+    )
+    .expect("failed to initialize ethdev port");
     let mac = port.mac_addr().expect("failed to read MAC address");
 
     let engine = TcpEngine::new(EngineConfig {
@@ -80,12 +96,6 @@ fn main() -> ExitCode {
         local_ip: app.local_ip,
     });
 
-    let Some(worker_lcore) = dpdk::first_worker_lcore() else {
-        eprintln!(
-            "error: no worker lcore available; start EAL with at least two lcores (e.g. `-l 0-1`)"
-        );
-        return ExitCode::FAILURE;
-    };
     let (worker, worker_join) = match WorkerHandle::spawn(engine, port, pool, worker_lcore) {
         Ok(pair) => pair,
         Err(e) => {

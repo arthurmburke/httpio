@@ -6,7 +6,7 @@
 use std::slice;
 
 use super::ffi;
-use super::mempool::PktMbufPool;
+use super::mempool::Mempool;
 
 /// Owning handle to a single `rte_mbuf`. Freed via `rte_pktmbuf_free` on
 /// drop unless ownership is explicitly handed off (e.g. to `tx_burst`,
@@ -33,7 +33,7 @@ impl Mbuf {
         Self { raw }
     }
 
-    pub fn alloc(pool: &PktMbufPool) -> Option<Self> {
+    pub fn alloc(pool: &Mempool) -> Option<Self> {
         // SAFETY: pool.as_raw() is a valid, live mempool for the process
         // lifetime (see PktMbufPool::drop).
         let raw = unsafe { ffi::rte_pktmbuf_alloc(pool.as_raw()) };

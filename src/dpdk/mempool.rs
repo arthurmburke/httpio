@@ -11,14 +11,14 @@ use super::ffi;
 /// frame plus headroom for prepending headers.
 pub const DEFAULT_MBUF_DATA_ROOM_SIZE: u16 = 2048 + 128;
 
-pub struct PktMbufPool {
+pub struct Mempool {
     pub(super) raw: *mut ffi::rte_mempool,
 }
 
 // The pool is a thread-safe DPDK object (ring_mp_mc by default); the raw
 // pointer itself has no Rust-side interior state we're racing on.
-unsafe impl Send for PktMbufPool {}
-unsafe impl Sync for PktMbufPool {}
+unsafe impl Send for Mempool {}
+unsafe impl Sync for Mempool {}
 
 #[derive(Debug)]
 pub struct MempoolCreateError;
@@ -30,7 +30,7 @@ impl std::fmt::Display for MempoolCreateError {
 }
 impl std::error::Error for MempoolCreateError {}
 
-impl PktMbufPool {
+impl Mempool {
     /// Creates a pool of `n` mbufs, each with `data_room_size` bytes of
     /// packet buffer, on the given NUMA socket (`-1` for "any socket" /
     /// `SOCKET_ID_ANY`).
@@ -65,7 +65,7 @@ impl PktMbufPool {
     }
 }
 
-impl Drop for PktMbufPool {
+impl Drop for Mempool {
     fn drop(&mut self) {
         // DPDK has no general-purpose exported "destroy this mempool"
         // primitive that's safe to call from a hand-written shim without

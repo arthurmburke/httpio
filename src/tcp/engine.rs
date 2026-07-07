@@ -17,7 +17,7 @@ use bytes::Bytes;
 
 use crate::core::hashmap::HashMap;
 use crate::core::hashset::HashSet;
-use crate::dpdk::{EthPort, Mbuf, PktMbufPool};
+use crate::dpdk::{EthPort, Mbuf, Mempool};
 use crate::net::{arp, eth, ipv4, tcp};
 
 use super::seq::Seq;
@@ -179,7 +179,7 @@ impl TcpEngine {
     pub fn poll(
         &mut self,
         port: &EthPort,
-        pool: &PktMbufPool,
+        pool: &Mempool,
         now: Instant,
     ) -> Vec<(FourTuple, Event)> {
         for mbuf in port.rx_burst(MAX_RX_BURST) {
@@ -473,7 +473,7 @@ fn request_arp(
 
 #[allow(clippy::too_many_arguments)]
 fn build_tcp_frame(
-    pool: &PktMbufPool,
+    pool: &Mempool,
     config: &EngineConfig,
     arp_table: &HashMap<[u8; 4], [u8; 6]>,
     arp_last_request: &mut HashMap<[u8; 4], Instant>,
@@ -502,7 +502,7 @@ fn build_tcp_frame(
 
 #[allow(clippy::too_many_arguments)]
 fn build_ip_tcp_frame(
-    pool: &PktMbufPool,
+    pool: &Mempool,
     local_mac: [u8; 6],
     remote_mac: [u8; 6],
     local_ip: [u8; 4],
@@ -564,7 +564,7 @@ fn build_ip_tcp_frame(
 }
 
 fn build_arp_frame(
-    pool: &PktMbufPool,
+    pool: &Mempool,
     operation: u16,
     local_mac: [u8; 6],
     local_ip: [u8; 4],

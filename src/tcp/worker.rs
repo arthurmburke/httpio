@@ -31,7 +31,7 @@ use crate::core::mpsc;
 use crate::core::mpsc::{MpscRx, MpscTx};
 use crate::core::spsc;
 use crate::core::spsc::{SpscRx, SpscTx};
-use crate::dpdk::{self, EthPort, PktMbufPool, WorkerJoin};
+use crate::dpdk::{self, EthPort, Mempool, WorkerJoin};
 
 use super::engine::TcpEngine;
 use super::state::TcpState;
@@ -150,7 +150,7 @@ impl WorkerHandle {
     pub fn spawn(
         engine: TcpEngine,
         port: EthPort,
-        pool: PktMbufPool,
+        pool: Mempool,
         worker_lcore: u32,
     ) -> Result<(Self, WorkerJoin), dpdk::lcore::LaunchError> {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
@@ -231,7 +231,7 @@ impl Drop for WorkerHandle {
 fn run(
     mut engine: TcpEngine,
     port: EthPort,
-    pool: PktMbufPool,
+    pool: Mempool,
     ctrl_rx: CtrlRx,
     stop: Arc<AtomicBool>,
     connections_opened: Arc<AtomicU64>,

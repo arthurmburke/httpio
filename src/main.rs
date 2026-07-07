@@ -15,7 +15,7 @@ use std::env;
 use std::time::Instant;
 
 use bypio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
-use bypio::dpdk::{self, EthPort, PktMbufPool};
+use bypio::dpdk::{self, EthPort, Mempool};
 use bypio::tcp::engine::{EngineConfig, TcpEngine};
 use bypio::tcp::socket::TcpSocket;
 use bypio::tcp::state::TcpState;
@@ -47,7 +47,7 @@ fn main() {
         .unwrap_or([192, 168, 1, 10]);
     let listen_port: u16 = app_args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7);
 
-    let pool = PktMbufPool::create(
+    let pool = Mempool::create(
         "tcp_mbuf_pool",
         MBUF_POOL_SIZE,
         MBUF_CACHE_SIZE,
