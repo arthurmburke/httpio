@@ -50,6 +50,10 @@ pub enum HttpError {
     /// HTTP/2 connection handshake, sending the request, or reading the
     /// response body.
     Protocol,
+    /// The provided HeaderValue is invalid. Provides some context regarding
+    /// why the header is invalid and what it was used for but does not include
+    /// the exact header content.
+    InvalidHeaderValue(&'static str),
 }
 
 impl fmt::Display for HttpError {
@@ -88,6 +92,9 @@ impl fmt::Display for HttpError {
                 "the HTTP protocol exchange with the origin failed (connection handshake, \
                  request, or response body)",
             ),
+            HttpError::InvalidHeaderValue(reason) => {
+                write!(f, "the provided header value is invalid: {}", reason)
+            }
         }
     }
 }

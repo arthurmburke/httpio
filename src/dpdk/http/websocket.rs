@@ -28,7 +28,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::client::Client;
-use crate::http::errors::WebSocketError;
+use crate::http::errors::{HttpError::InvalidHeaderValue, WebSocketError};
 
 /// Upper bound on a single inbound frame's payload.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -126,8 +126,9 @@ impl WebSocketClient {
         parts.headers.insert(
             header::SEC_WEBSOCKET_KEY,
             // The key is base64, always a valid header value.
-            http::HeaderValue::from_str(&key)
-                .expect("base64 Sec-WebSocket-Key is a valid header value"),
+            http::HeaderValue::from_str(&key).map_err(|_| {
+                InvalidHeaderValue("base64 Sec-WebSocket-Key is a valid header value")
+            })?,
         );
         parts.headers.insert(
             header::SEC_WEBSOCKET_VERSION,
