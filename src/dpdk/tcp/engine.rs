@@ -17,8 +17,8 @@ use bytes::Bytes;
 
 use crate::core::hashmap::HashMap;
 use crate::core::hashset::HashSet;
+use crate::dpdk::net::{arp, eth, ipv4, tcp};
 use crate::dpdk::{EthPort, Mbuf, Mempool};
-use crate::net::{arp, eth, ipv4, tcp};
 
 use super::seq::Seq;
 use super::state::TcpState;

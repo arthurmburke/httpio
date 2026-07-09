@@ -6,9 +6,12 @@
 //! which are otherwise unreachable from Rust because they have no linkable
 //! symbol. We compile that generated C and link it alongside the bindings.
 //!
-//! DPDK is a hard requirement (Linux-only): this build script always runs
-//! bindgen + pkg-config, so `cargo build`/`check` must run where libdpdk is
-//! installed -- the devcontainer. There is no non-DPDK fallback.
+//! libdpdk availability is detected automatically: this script probes
+//! pkg-config for it and, when found, sets the `dpdk` cfg and generates +
+//! links the FFI. When it's absent (e.g. on macOS) the script is a near
+//! no-op, the `dpdk` cfg stays unset, and the `dpdk` module and its binaries
+//! are compiled out -- leaving just `core` + the `http` traits, which need
+//! no native libraries. Build the DPDK stack in the devcontainer.
 
 use std::env;
 use std::path::PathBuf;
@@ -17,17 +20,26 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    // `dpdk` is a build-script-set cfg (not a Cargo feature); declare it so
+    // the unexpected_cfgs lint knows it's expected whether or not it's set.
+    println!("cargo::rustc-check-cfg=cfg(dpdk)");
 
     // Locate libdpdk and emit its link flags (this also prints the
-    // cargo:rustc-link-lib/search lines for every DPDK library).
-    let dpdk = pkg_config::Config::new()
-        .statik(false)
-        .probe("libdpdk")
-        .expect(
-            "libdpdk not found via pkg-config.\n\
-             Install the DPDK dev packages (e.g. `apt install libdpdk-dev`) or set \
-             PKG_CONFIG_PATH to a prefix containing libdpdk.pc. Build in the devcontainer.",
+    // cargo:rustc-link-lib/search lines for every DPDK library). If it isn't
+    // installed, build the rest of the crate without the DPDK stack rather
+    // than failing.
+    let Ok(dpdk) = pkg_config::Config::new().statik(false).probe("libdpdk") else {
+        println!(
+            "cargo::warning=libdpdk not found via pkg-config; building without the DPDK stack \
+             (core + http traits only). Install the DPDK dev packages (e.g. \
+             `apt install libdpdk-dev`) or set PKG_CONFIG_PATH to build it -- the devcontainer \
+             has it."
         );
+        return;
+    };
+
+    // libdpdk is present: turn on the DPDK stack.
+    println!("cargo::rustc-cfg=dpdk");
 
     // numa/pthread aren't always pulled in transitively by libdpdk.pc.
     println!("cargo:rustc-link-lib=numa");

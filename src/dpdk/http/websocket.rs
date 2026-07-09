@@ -2,7 +2,7 @@
 //! stream.
 //!
 //! The opening handshake is an HTTP/1.1 GET + `Upgrade: websocket` sent
-//! through [`HttpClient::h1_upgrade_request`], so it inherits the client's
+//! through [`Client::h1_upgrade_request`], so it inherits the client's
 //! dialing, `--resolve` mapping, and TLS (custom CAs, SNI) as-is: `ws://`
 //! is plain TCP, `wss://` goes through the h1-only TLS connector. After a
 //! validated `101 Switching Protocols`, the connection is taken over via
@@ -27,7 +27,8 @@ use hyper_util::rt::TokioIo;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::client::{Error, HttpClient};
+use super::client::Client;
+use crate::http::errors::WebSocketError;
 
 /// Upper bound on a single inbound frame's payload.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -45,41 +46,29 @@ const OP_PONG: u8 = 0xA;
 /// 101, re-wrapped for tokio.
 type WsIo = TokioIo<Upgraded>;
 
-/// A complete WebSocket message (inbound fragmentation already
-/// reassembled).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Message {
-    Text(String),
-    Binary(Bytes),
-    /// Surfaced for observability; a Pong reply has already been sent
-    /// automatically.
-    Ping(Bytes),
-    Pong(Bytes),
-    Close(Option<CloseFrame>),
+// The message types are the generic ones from the transport-agnostic
+// `http::websocket` module; re-exported here so callers holding a [`Ws`]
+// can name them without reaching across modules.
+pub use crate::http::websocket::{CloseFrame, Message};
+
+/// An established WebSocket connection.
+pub struct WebSocketClient {
+    io: WsIo,
+    rng: SystemRandom,
+    /// Raw inbound bytes not yet parsed into frames.
+    read_buf: BytesMut,
+    /// In-progress fragmented message: (data opcode, accumulated payload).
+    fragment: Option<(u8, BytesMut)>,
+    close_sent: bool,
+    close_received: bool,
+    /// The subprotocol the server selected from the request's offers.
+    protocol: Option<String>,
+    /// The `101 Switching Protocols` response parts (status, headers,
+    /// extensions), kept for callers that need e.g. `Set-Cookie`.
+    handshake: http::response::Parts,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CloseFrame {
-    pub code: u16,
-    pub reason: String,
-}
-
-impl HttpClient {
-    /// Opens a WebSocket connection to a `ws://` or `wss://` URL with a
-    /// default handshake request. For custom headers (`Authorization`,
-    /// `Cookie`, `Origin`, ...) or subprotocol offers, build the request
-    /// yourself and use [`websocket_request`](Self::websocket_request).
-    ///
-    /// Corking is not allowed for WebSocket connections; the underlying
-    /// TCP connection is always uncorked.
-    pub async fn websocket(&self, url: &str) -> Result<WebSocket, Error> {
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri(url)
-            .body(Bytes::new())?;
-        self.websocket_request(request).await
-    }
-
+impl WebSocketClient {
     /// Opens a WebSocket connection from a caller-built handshake request,
     /// preserving its URI (including query parameters) and headers -- e.g.
     /// `Authorization`, `Cookie`, `Origin`, or `Sec-WebSocket-Protocol`
@@ -91,24 +80,19 @@ impl HttpClient {
     /// particular must match what the accept check below expects.
     ///
     /// If the request offers subprotocols, the server's selection is
-    /// validated against the offers and exposed via
-    /// [`WebSocket::protocol`]. The full `101` handshake response (e.g.
-    /// its `Set-Cookie` headers) is kept on [`WebSocket::handshake`].
+    /// validated against the offers and exposed via [`Self::protocol`]. The
+    /// full `101` handshake response (e.g. its `Set-Cookie` headers) is
+    /// kept on [`Self::handshake`].
     ///
     /// Corking is not allowed for WebSocket connections: a `TcpOptions`
     /// extension with `cork: true` is rejected; `nodelay` is honored.
-    pub async fn websocket_request(&self, request: Request<Bytes>) -> Result<WebSocket, Error> {
+    pub async fn open(client: &Client, request: Request<Bytes>) -> Result<Self, WebSocketError> {
         match request.uri().scheme_str() {
             Some("ws" | "wss") => {}
-            other => {
-                return Err(format!(
-                    "unsupported WebSocket scheme {other:?} (use ws:// or wss://)"
-                )
-                .into());
-            }
+            _ => return Err(WebSocketError::UnsupportedScheme),
         }
         if request.method() != Method::GET {
-            return Err("WebSocket handshake requests must use GET (RFC 6455 §4.1)".into());
+            return Err(WebSocketError::MethodNotGet);
         }
 
         // The subprotocols the caller is offering, remembered so the
@@ -126,8 +110,7 @@ impl HttpClient {
         // Sec-WebSocket-Key: 16 random bytes, base64 (RFC 6455 §4.1).
         let rng = SystemRandom::new();
         let mut key_bytes = [0u8; 16];
-        rng.fill(&mut key_bytes)
-            .map_err(|_| "system RNG failure generating Sec-WebSocket-Key")?;
+        rng.fill(&mut key_bytes).map_err(|_| WebSocketError::Rng)?;
         let key = base64(&key_bytes);
 
         // Force the protocol-mandated fields (insert replaces any caller
@@ -142,7 +125,9 @@ impl HttpClient {
         );
         parts.headers.insert(
             header::SEC_WEBSOCKET_KEY,
-            http::HeaderValue::from_str(&key)?,
+            // The key is base64, always a valid header value.
+            http::HeaderValue::from_str(&key)
+                .expect("base64 Sec-WebSocket-Key is a valid header value"),
         );
         parts.headers.insert(
             header::SEC_WEBSOCKET_VERSION,
@@ -150,25 +135,33 @@ impl HttpClient {
         );
         let request = Request::from_parts(parts, body);
 
-        let mut response = self.h1_upgrade_request(request).await?;
+        let mut response = client.h1_upgrade_request(request).await?;
 
         // Validate the server's half of the handshake (RFC 6455 §4.1).
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
-            return Err(format!(
-                "WebSocket handshake failed: expected 101 Switching Protocols, got {}",
-                response.status()
-            )
-            .into());
+            return Err(WebSocketError::UnexpectedStatus(response.status()));
         }
-        require_token(response.headers(), &header::UPGRADE, "websocket")?;
-        require_token(response.headers(), &header::CONNECTION, "upgrade")?;
+        require_token(
+            response.headers(),
+            &header::UPGRADE,
+            "websocket",
+            WebSocketError::MissingUpgradeHeader,
+            WebSocketError::BadUpgradeHeader,
+        )?;
+        require_token(
+            response.headers(),
+            &header::CONNECTION,
+            "upgrade",
+            WebSocketError::MissingConnectionHeader,
+            WebSocketError::BadConnectionHeader,
+        )?;
         let accept = response
             .headers()
             .get(header::SEC_WEBSOCKET_ACCEPT)
             .and_then(|v| v.to_str().ok())
-            .ok_or("WebSocket handshake response is missing Sec-WebSocket-Accept")?;
+            .ok_or(WebSocketError::MissingAcceptHeader)?;
         if accept != accept_key(&key) {
-            return Err("Sec-WebSocket-Accept does not match the sent key".into());
+            return Err(WebSocketError::AcceptMismatch);
         }
         // The server may select at most one of the offered subprotocols
         // (RFC 6455 §4.2.2); a selection we never offered fails the
@@ -179,13 +172,10 @@ impl HttpClient {
             .map(|v| v.to_str().map(str::trim))
         {
             None => None,
-            Some(Err(_)) => return Err("Sec-WebSocket-Protocol is not valid UTF-8".into()),
+            Some(Err(_)) => return Err(WebSocketError::InvalidProtocolHeader),
             Some(Ok(selected)) => {
                 if !offered_protocols.iter().any(|p| p == selected) {
-                    return Err(format!(
-                        "server selected subprotocol {selected:?} which was not offered"
-                    )
-                    .into());
+                    return Err(WebSocketError::UnofferedSubprotocol);
                 }
                 Some(selected.to_string())
             }
@@ -195,9 +185,11 @@ impl HttpClient {
         // like Set-Cookie) can be kept for the caller.
         let on_upgrade = hyper::upgrade::on(&mut response);
         let (handshake, _body) = response.into_parts();
-        let upgraded = on_upgrade.await?;
+        let upgraded = on_upgrade
+            .await
+            .map_err(|_| WebSocketError::UpgradeIncomplete)?;
 
-        Ok(WebSocket {
+        Ok(WebSocketClient {
             io: TokioIo::new(upgraded),
             rng,
             read_buf: BytesMut::with_capacity(8 * 1024),
@@ -208,26 +200,7 @@ impl HttpClient {
             handshake,
         })
     }
-}
 
-/// An established WebSocket connection.
-pub struct WebSocket {
-    io: WsIo,
-    rng: SystemRandom,
-    /// Raw inbound bytes not yet parsed into frames.
-    read_buf: BytesMut,
-    /// In-progress fragmented message: (data opcode, accumulated payload).
-    fragment: Option<(u8, BytesMut)>,
-    close_sent: bool,
-    close_received: bool,
-    /// The subprotocol the server selected from the request's offers.
-    protocol: Option<String>,
-    /// The `101 Switching Protocols` response parts (status, headers,
-    /// extensions), kept for callers that need e.g. `Set-Cookie`.
-    handshake: http::response::Parts,
-}
-
-impl WebSocket {
     /// The subprotocol the server selected from the handshake request's
     /// `Sec-WebSocket-Protocol` offers, if any.
     pub fn protocol(&self) -> Option<&str> {
@@ -243,7 +216,7 @@ impl WebSocket {
     /// Receives the next message. `Ok(None)` means the connection ended
     /// cleanly (close handshake completed, or EOF after a close). Inbound
     /// Pings are answered automatically and also returned.
-    pub async fn recv(&mut self) -> Result<Option<Message>, Error> {
+    pub async fn recv(&mut self) -> Result<Option<Message>, WebSocketError> {
         loop {
             if self.close_sent && self.close_received {
                 return Ok(None);
@@ -253,23 +226,27 @@ impl WebSocket {
                     return Ok(Some(message));
                 }
             }
-            let n = self.io.read_buf(&mut self.read_buf).await?;
+            let n = self
+                .io
+                .read_buf(&mut self.read_buf)
+                .await
+                .map_err(|e| WebSocketError::Io(e.kind()))?;
             if n == 0 {
                 // EOF. Clean only if the close handshake got at least our
                 // half out (some peers close TCP without echoing Close).
                 if self.close_received || self.close_sent {
                     return Ok(None);
                 }
-                return Err("connection closed without a Close frame".into());
+                return Err(WebSocketError::UncleanClose);
             }
         }
     }
 
     /// Sends one message (never fragmented on the wire; sizes up to the
     /// frame maximum go out as a single frame).
-    pub async fn send(&mut self, message: Message) -> Result<(), Error> {
+    pub async fn send(&mut self, message: Message) -> Result<(), WebSocketError> {
         if self.close_sent {
-            return Err("websocket is closing or closed".into());
+            return Err(WebSocketError::SendAfterClose);
         }
         match message {
             Message::Text(text) => self.write_frame(OP_TEXT, text.as_bytes()).await,
@@ -289,7 +266,7 @@ impl WebSocket {
     /// Starts (or completes) the closing handshake. After this, `send`
     /// fails and `recv` keeps delivering anything already in flight until
     /// the peer's Close (or EOF) arrives.
-    pub async fn close(&mut self, frame: Option<CloseFrame>) -> Result<(), Error> {
+    pub async fn close(&mut self, frame: Option<CloseFrame>) -> Result<(), WebSocketError> {
         if self.close_sent {
             return Ok(());
         }
@@ -306,11 +283,11 @@ impl WebSocket {
     }
 
     /// Applies one parsed frame; returns a `Message` when one is complete.
-    async fn handle_frame(&mut self, frame: RawFrame) -> Result<Option<Message>, Error> {
+    async fn handle_frame(&mut self, frame: RawFrame) -> Result<Option<Message>, WebSocketError> {
         match frame.opcode {
             OP_TEXT | OP_BINARY => {
                 if self.fragment.is_some() {
-                    return Err("new data frame arrived inside a fragmented message".into());
+                    return Err(WebSocketError::UnexpectedDataFrame);
                 }
                 if frame.fin {
                     return Ok(Some(into_data_message(frame.opcode, frame.payload)?));
@@ -320,10 +297,10 @@ impl WebSocket {
             }
             OP_CONTINUATION => {
                 let Some((_, buffered)) = self.fragment.as_mut() else {
-                    return Err("continuation frame without a started message".into());
+                    return Err(WebSocketError::UnexpectedContinuation);
                 };
                 if buffered.len() + frame.payload.len() > MAX_MESSAGE {
-                    return Err("fragmented message exceeds the maximum message size".into());
+                    return Err(WebSocketError::MessageTooLarge);
                 }
                 buffered.put_slice(&frame.payload);
                 if !frame.fin {
@@ -361,17 +338,15 @@ impl WebSocket {
                 }
                 Ok(Some(Message::Close(close_frame)))
             }
-            other => Err(format!("unknown WebSocket opcode {other:#x}").into()),
+            other => Err(WebSocketError::UnknownOpcode(other)),
         }
     }
 
     /// Writes one masked frame (client frames must be masked, RFC 6455
     /// §5.3) and flushes.
-    async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), Error> {
+    async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WebSocketError> {
         let mut mask = [0u8; 4];
-        self.rng
-            .fill(&mut mask)
-            .map_err(|_| "system RNG failure generating mask")?;
+        self.rng.fill(&mut mask).map_err(|_| WebSocketError::Rng)?;
 
         let n = payload.len();
         let mut out = BytesMut::with_capacity(14 + n);
@@ -392,9 +367,29 @@ impl WebSocket {
             *byte ^= mask[i & 3];
         }
 
-        self.io.write_all(&out).await?;
-        self.io.flush().await?;
+        self.io
+            .write_all(&out)
+            .await
+            .map_err(|e| WebSocketError::Io(e.kind()))?;
+        self.io
+            .flush()
+            .await
+            .map_err(|e| WebSocketError::Io(e.kind()))?;
         Ok(())
+    }
+}
+
+impl crate::http::websocket::WebSocket for WebSocketClient {
+    async fn recv(&mut self) -> Result<Option<Message>, WebSocketError> {
+        WebSocketClient::recv(self).await
+    }
+
+    async fn send(&mut self, message: Message) -> Result<(), WebSocketError> {
+        WebSocketClient::send(self, message).await
+    }
+
+    async fn close(&mut self, frame: Option<CloseFrame>) -> Result<(), WebSocketError> {
+        WebSocketClient::close(self, frame).await
     }
 }
 
@@ -407,17 +402,17 @@ struct RawFrame {
 /// Parses one complete frame off the front of `buf`, or `Ok(None)` if more
 /// bytes are needed. Enforces client-side rules: RSV bits clear (no
 /// extensions were negotiated) and server frames unmasked.
-fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, Error> {
+fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, WebSocketError> {
     if buf.len() < 2 {
         return Ok(None);
     }
     let b0 = buf[0];
     let b1 = buf[1];
     if b0 & 0x70 != 0 {
-        return Err("RSV bits set but no extension was negotiated".into());
+        return Err(WebSocketError::ReservedBitsSet);
     }
     if b1 & 0x80 != 0 {
-        return Err("server-to-client frame is masked".into());
+        return Err(WebSocketError::MaskedServerFrame);
     }
 
     let (header_len, payload_len) = match (b1 & 0x7F) as usize {
@@ -433,14 +428,14 @@ fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, Error> {
             }
             let len = u64::from_be_bytes(buf[2..10].try_into().expect("10 bytes checked"));
             if len > MAX_FRAME as u64 {
-                return Err("frame exceeds the maximum frame size".into());
+                return Err(WebSocketError::FrameTooLarge);
             }
             (10, len as usize)
         }
         n => (2, n),
     };
     if payload_len > MAX_FRAME {
-        return Err("frame exceeds the maximum frame size".into());
+        return Err(WebSocketError::FrameTooLarge);
     }
     if buf.len() < header_len + payload_len {
         return Ok(None);
@@ -457,12 +452,12 @@ fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, Error> {
     }))
 }
 
-fn into_data_message(opcode: u8, payload: Bytes) -> Result<Message, Error> {
+fn into_data_message(opcode: u8, payload: Bytes) -> Result<Message, WebSocketError> {
     if opcode == OP_TEXT {
         // Text messages must be valid UTF-8 (RFC 6455 §5.6); invalid data
         // fails the connection.
-        let text = String::from_utf8(payload.to_vec())
-            .map_err(|_| "text message contains invalid UTF-8")?;
+        let text =
+            String::from_utf8(payload.to_vec()).map_err(|_| WebSocketError::InvalidUtf8Text)?;
         Ok(Message::Text(text))
     } else {
         Ok(Message::Binary(payload))
@@ -471,30 +466,30 @@ fn into_data_message(opcode: u8, payload: Bytes) -> Result<Message, Error> {
 
 /// Control frames must not be fragmented and carry at most 125 bytes
 /// (RFC 6455 §5.5).
-fn validate_control(frame: &RawFrame) -> Result<(), Error> {
+fn validate_control(frame: &RawFrame) -> Result<(), WebSocketError> {
     if !frame.fin {
-        return Err("control frame is fragmented".into());
+        return Err(WebSocketError::FragmentedControlFrame);
     }
     check_control_len(&frame.payload)
 }
 
-fn check_control_len(payload: &[u8]) -> Result<(), Error> {
+fn check_control_len(payload: &[u8]) -> Result<(), WebSocketError> {
     if payload.len() > 125 {
-        return Err("control frame payload exceeds 125 bytes".into());
+        return Err(WebSocketError::ControlFrameTooLarge);
     }
     Ok(())
 }
 
 /// Close payloads are empty, or a 2-byte code plus an optional UTF-8
 /// reason (RFC 6455 §5.5.1).
-fn parse_close_payload(payload: &[u8]) -> Result<Option<CloseFrame>, Error> {
+fn parse_close_payload(payload: &[u8]) -> Result<Option<CloseFrame>, WebSocketError> {
     match payload.len() {
         0 => Ok(None),
-        1 => Err("close frame payload of one byte is invalid".into()),
+        1 => Err(WebSocketError::MalformedClosePayload),
         _ => Ok(Some(CloseFrame {
             code: u16::from_be_bytes([payload[0], payload[1]]),
             reason: String::from_utf8(payload[2..].to_vec())
-                .map_err(|_| "close reason contains invalid UTF-8")?,
+                .map_err(|_| WebSocketError::InvalidUtf8CloseReason)?,
         })),
     }
 }
@@ -542,22 +537,26 @@ fn base64(data: &[u8]) -> String {
 
 /// Requires `headers[name]` to contain `token` in its comma-separated
 /// token list, case-insensitively (how Upgrade/Connection are matched).
+/// Reports `missing` if the header is absent and `mismatch` if it's present
+/// but lacks the token.
 fn require_token(
     headers: &http::HeaderMap,
     name: &header::HeaderName,
     token: &str,
-) -> Result<(), Error> {
+    missing: WebSocketError,
+    mismatch: WebSocketError,
+) -> Result<(), WebSocketError> {
     let value = headers
         .get(name)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| format!("WebSocket handshake response is missing {name}"))?;
+        .ok_or(missing)?;
     if value
         .split(',')
         .any(|t| t.trim().eq_ignore_ascii_case(token))
     {
         Ok(())
     } else {
-        Err(format!("WebSocket handshake response {name} does not include {token:?}").into())
+        Err(mismatch)
     }
 }
 

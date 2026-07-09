@@ -8,7 +8,6 @@
 //! Both are cache-line padded to keep the producer and consumer indices
 //! on separate lines (avoiding false sharing).
 
-
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,6 +42,12 @@ struct MpscRing<T, const N: usize> {
 // so no two threads touch the same slot's `Option<T>` at once; all other
 // state is atomic. Moving `T` across threads only requires `T: Send`.
 unsafe impl<T: Send, const N: usize> Send for MpscRing<T, N> {}
+// SAFETY: the whole point of the MPMC algorithm is concurrent access
+// through a shared `&self` -- many producers `push` and the lone consumer
+// `pop` at once, each owning only the slot it won the index CAS for until
+// it republishes `seq`. So sharing `&MpscRing` across threads is sound;
+// like `Send`, it only moves `T` between threads, hence `T: Send`.
+unsafe impl<T: Send, const N: usize> Sync for MpscRing<T, N> {}
 
 impl<T, const N: usize> MpscRing<T, N> {
     const _VALIDATE: () = {

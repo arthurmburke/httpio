@@ -5,10 +5,19 @@ edition = "2024"
 build = "build.rs"
 
 [dependencies]
+# Used by `core` and the transport-agnostic `http` traits, so always needed.
 bytes = "1"
 http = "1"
-http-body-util = "0.1"
+gxhash = "3.5"
+# The `http` trait module references `hyper::body::Incoming` in its upgrade
+# API, so hyper is always required.
 hyper = { version = "1", features = ["client", "http1", "http2"] }
+
+# Used only by the `dpdk` module, which is gated by the `have_dpdk` cfg that
+# build.rs sets when libdpdk is found. These are all portable Rust and build
+# on any host; only libdpdk itself (a C library) gates the stack, so they
+# stay regular (non-optional) dependencies.
+http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 # ring (not the default aws-lc-rs) avoids a cmake dependency in the
 # devcontainer.
@@ -21,13 +30,14 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 libc = "0.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "0.26"
-gxhash = "3.5"
 
 [build-dependencies]
-# DPDK is a hard build requirement: bindgen generates the FFI (including
-# wrappers for DPDK's `static inline` hot-path functions via
-# `wrap_static_fns`), cc compiles those generated wrappers, and pkg-config
-# locates libdpdk and its link flags. Build/test in the devcontainer.
+# build.rs probes pkg-config for libdpdk; when it's present it sets the
+# `have_dpdk` cfg and uses bindgen to generate the FFI (including wrappers
+# for DPDK's `static inline` hot-path functions via `wrap_static_fns`) and
+# cc to compile them. When libdpdk is absent the script is a near no-op and
+# the DPDK stack is compiled out. Build/test the DPDK stack in the
+# devcontainer.
 bindgen = "0.71"
 cc = "1"
 pkg-config = "0.3"

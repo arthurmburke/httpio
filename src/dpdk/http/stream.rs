@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::tcp::worker::{CmdTx, Command, Inbound, InboundRx, WorkerHandle};
+use crate::dpdk::tcp::worker::{CmdTx, Command, Inbound, InboundRx, WorkerHandle};
 
 /// Per-connection TCP transport options. Attach to an HTTP request via
 /// `http::Extensions` (`request.extensions_mut().insert(TcpOptions {..})`)

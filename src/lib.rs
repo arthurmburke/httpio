@@ -3,8 +3,10 @@
 //! See README.md.
 
 pub mod core;
+/// The userspace DPDK TCP/IP stack and the HTTP/WebSocket client built on
+/// it. Gated on the `dpdk` cfg, which `build.rs` sets when libdpdk is found
+/// on the compiling system; without it the crate is just [`core`] and the
+/// transport-agnostic [`http`] traits.
+#[cfg(dpdk)]
 pub mod dpdk;
 pub mod http;
-pub mod net;
-pub mod tcp;
-pub mod tokio;

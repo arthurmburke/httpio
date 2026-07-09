@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use crate::net::tcp::{TcpHeader, TcpOptions, flags};
+use crate::dpdk::net::tcp::{TcpHeader, TcpOptions, flags};
 
 use super::congestion::CongestionControl;
 use super::rto::{MAX_RETRANSMITS, RetransmitQueue, RtoEstimator};
