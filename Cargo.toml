@@ -43,6 +43,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 libc = "0.2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 webpki-roots = "0.26"
+futures = "0.3"
 
 [build-dependencies]
 # build.rs probes pkg-config for libdpdk; when it's present it sets the

@@ -17,9 +17,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::future::ready;
 use http::request::Parts;
 use http::{HeaderValue, Method, Request, Response, Uri, Version, header};
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
@@ -32,7 +35,7 @@ use serde::de::DeserializeOwned;
 
 use crate::core::hashmap::HashMap;
 use crate::dpdk::tcp::worker::WorkerHandle;
-use crate::http::codec::{self, Empty};
+use crate::http::codec::{self, ByteStream, Empty, EncodedBody};
 use crate::http::errors::HttpError;
 
 use super::stream::{FlushHandle, TcpOptions, TcpStream};
@@ -195,19 +198,58 @@ impl Client {
         R: DeserializeOwned + 'static,
     {
         let (parts, body) = request.into_parts();
-        let body = codec::encode(parts.headers.get(header::CONTENT_TYPE), body)?;
-        let response = self.send_bytes(Request::from_parts(parts, body)).await?;
-        let (parts, body) = response.into_parts();
+        let response = match codec::encode(parts.headers.get(header::CONTENT_TYPE), body)? {
+            EncodedBody::Full(bytes) => {
+                self.send_buffered(Request::from_parts(parts, bytes)).await?
+            }
+            // A ByteStream body is sent chunk-by-chunk with chunked framing;
+            // streaming is HTTP/1.1-only (a stream can't ride the pooled
+            // Full<Bytes> h2 connections).
+            EncodedBody::Stream(stream) => self.send_stream(parts, stream).await?,
+        };
+
+        let (parts, incoming) = response.into_parts();
+        // A ByteStream response target takes the body unbuffered: hand over
+        // the chunk stream without collecting. Data frames pass through as
+        // `Ok` chunks (trailer frames are skipped); a mid-body transport
+        // failure surfaces as one final `Err` item, after which the stream
+        // is fused shut -- so truncation is distinguishable from EOF.
+        if codec::is_stream::<R>() {
+            let chunks = BodyStream::new(incoming)
+                .filter_map(|frame| {
+                    ready(match frame {
+                        Ok(frame) => frame.into_data().ok().map(Ok),
+                        Err(_) => Some(Err(HttpError::Protocol)),
+                    })
+                })
+                .scan(false, |errored, item| {
+                    if *errored {
+                        return ready(None);
+                    }
+                    *errored = item.is_err();
+                    ready(Some(item))
+                });
+            let body = codec::stream_response::<R, _>(chunks)
+                .expect("is_stream::<R>() checked above");
+            return Ok(Response::from_parts(parts, body));
+        }
+
+        let body = incoming
+            .collect()
+            .await
+            .map_err(|_| HttpError::Protocol)?
+            .to_bytes();
         let body = codec::decode(parts.headers.get(header::CONTENT_TYPE), body)?;
         Ok(Response::from_parts(parts, body))
     }
 
-    /// Sends a request whose body is already raw bytes and collects the raw
-    /// response body -- the transport pipeline the generic [`request`] wraps.
-    ///
-    /// The response's status/version/headers/extensions are the `http`
-    /// crate's own parts, untouched; the body is fully collected.
-    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+    /// Sends a request whose body is already fully-buffered bytes and
+    /// returns the raw response (body uncollected) -- the transport pipeline
+    /// the generic [`request`](Self::request) wraps.
+    async fn send_buffered(
+        &self,
+        request: Request<Bytes>,
+    ) -> Result<Response<Incoming>, HttpError> {
         let (mut parts, body) = request.into_parts();
         let tcp_options = parts.extensions.remove::<TcpOptions>().unwrap_or_default();
         let flush_handle = parts.extensions.remove::<FlushHandle>();
@@ -239,7 +281,7 @@ impl Client {
                     .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
                 // Cork only now that the TLS handshake has completed.
                 tls.get_mut().0.request_cork();
-                return send_h1(tls, parts, body, &host, port, &scheme).await;
+                return send_h1(tls, parts, Full::new(body), &host, port, &scheme).await;
             }
 
             // Fast path: multiplex onto an existing h2 connection.
@@ -270,12 +312,72 @@ impl Client {
                     .insert((host.to_ascii_lowercase(), port), send_request.clone());
                 send_h2_on(send_request, parts, body).await
             } else {
-                send_h1(tls, parts, body, &host, port, &scheme).await
+                send_h1(tls, parts, Full::new(body), &host, port, &scheme).await
             }
         } else {
             let tcp = self
                 .dial(&host, port, tcp_options, flush_handle.as_ref())
                 .await?;
+            // Plain HTTP has no handshake, so cork right away.
+            if tcp_options.cork {
+                tcp.request_cork();
+            }
+            send_h1(tcp, parts, Full::new(body), &host, port, &scheme).await
+        }
+    }
+
+    /// Sends a request whose body is a [`ByteStream`], chunk-by-chunk as the
+    /// stream yields (hyper uses chunked transfer-encoding, since the total
+    /// length is unknown).
+    ///
+    /// Streaming is HTTP/1.1-only: the h2 pool multiplexes `Full<Bytes>`
+    /// connections, which a stream can't join, so `https` dials through the
+    /// h1-only ALPN connector and is never pooled. Corking composes (both are
+    /// h1 paths): the held tail is released by the caller's `FlushHandle`,
+    /// exactly as for buffered requests.
+    async fn send_stream(
+        &self,
+        mut parts: Parts,
+        body: ByteStream<'static>,
+    ) -> Result<Response<Incoming>, HttpError> {
+        let tcp_options = parts.extensions.remove::<TcpOptions>().unwrap_or_default();
+        let flush_handle = parts.extensions.remove::<FlushHandle>();
+
+        if flush_handle.is_none() && tcp_options.cork {
+            return Err(HttpError::CorkWithoutFlushHandle);
+        }
+
+        let scheme = parts.uri.scheme_str().unwrap_or("http").to_string();
+        let host = parts.uri.host().ok_or(HttpError::MissingHost)?.to_string();
+        let port = parts
+            .uri
+            .port_u16()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+        // Each chunk becomes one hyper data frame, by move -- no copy here.
+        // A producer `Err` becomes a hyper body error, aborting the request.
+        let body = StreamBody::new(body.into_inner().map(|item| {
+            item.map(Frame::data)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }));
+
+        let tcp = self
+            .dial(&host, port, tcp_options, flush_handle.as_ref())
+            .await?;
+        if scheme == "https" {
+            let server_name =
+                ServerName::try_from(host.clone()).map_err(|_| HttpError::InvalidHost)?;
+            let mut tls = self
+                .tls_h1
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
+            if tcp_options.cork {
+                // Cork only now that the TLS handshake has completed.
+                tls.get_mut().0.request_cork();
+            }
+            send_h1(tls, parts, body, &host, port, &scheme).await
+        } else {
             // Plain HTTP has no handshake, so cork right away.
             if tcp_options.cork {
                 tcp.request_cork();
@@ -433,16 +535,19 @@ fn rewrite_to_origin_form(
     Ok(())
 }
 
-async fn send_h1<T>(
+async fn send_h1<T, B>(
     io: T,
     mut parts: Parts,
-    body: Bytes,
+    body: B,
     host: &str,
     port: u16,
     scheme: &str,
-) -> Result<Response<Bytes>, HttpError>
+) -> Result<Response<Incoming>, HttpError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (mut send_request, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
         .await
@@ -455,13 +560,12 @@ where
 
     let default_port = if scheme == "https" { 443 } else { 80 };
     rewrite_to_origin_form(&mut parts, host, port, default_port)?;
-    let request = Request::from_parts(parts, Full::new(body));
+    let request = Request::from_parts(parts, body);
 
-    let response = send_request
+    send_request
         .send_request(request)
         .await
-        .map_err(|_| HttpError::Protocol)?;
-    collect_response(response).await
+        .map_err(|_| HttpError::Protocol)
 }
 
 /// Like [`send_h1`] but for protocol upgrades: the connection task is
@@ -510,30 +614,14 @@ async fn send_h2_on(
     mut send_request: http2::SendRequest<Full<Bytes>>,
     mut parts: Parts,
     body: Bytes,
-) -> Result<Response<Bytes>, HttpError> {
+) -> Result<Response<Incoming>, HttpError> {
     // HTTP/2 derives :scheme/:authority/:path from the absolute URI the
     // caller already supplied; just pin the version.
     parts.version = Version::HTTP_2;
     let request = Request::from_parts(parts, Full::new(body));
 
-    let response = send_request
+    send_request
         .send_request(request)
         .await
-        .map_err(|_| HttpError::Protocol)?;
-    collect_response(response).await
-}
-
-/// Collects the streaming body and re-assembles the response around it,
-/// leaving every other part (status, version, headers, extensions) as
-/// hyper/`http` produced them.
-async fn collect_response(
-    response: Response<hyper::body::Incoming>,
-) -> Result<Response<Bytes>, HttpError> {
-    let (parts, body) = response.into_parts();
-    let body = body
-        .collect()
-        .await
-        .map_err(|_| HttpError::Protocol)?
-        .to_bytes();
-    Ok(Response::from_parts(parts, body))
+        .map_err(|_| HttpError::Protocol)
 }

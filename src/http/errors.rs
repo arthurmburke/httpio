@@ -62,6 +62,10 @@ pub enum HttpError {
     /// The request body could not be encoded, or the response body decoded,
     /// for its `Content-Type`; see the [`CodecError`].
     Codec(CodecError),
+    /// The producer of a streaming request body
+    /// ([`ByteStream`](crate::http::codec::ByteStream)) failed, aborting the
+    /// request; the [`io::ErrorKind`] gives the producer's reason.
+    BodyProducer(io::ErrorKind),
 }
 
 impl fmt::Display for HttpError {
@@ -104,6 +108,9 @@ impl fmt::Display for HttpError {
                 write!(f, "the provided header value is invalid: {}", reason)
             }
             HttpError::Codec(e) => write!(f, "body codec error: {e}"),
+            HttpError::BodyProducer(kind) => {
+                write!(f, "the streaming request body producer failed: {kind}")
+            }
             HttpError::MalformedRequest => f.write_str("the http Request was malformed"),
         }
     }
