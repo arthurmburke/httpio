@@ -21,14 +21,20 @@
 //! offered, so RSV bits or a server-selected protocol fail the handshake.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use http::{Method, Request, StatusCode, header};
+use http::{
+    Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, Version, header,
+    request::Parts,
+};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::client::Client;
-use crate::http::errors::{HttpError::InvalidHeaderValue, WebSocketError};
+use crate::http::errors::{
+    HttpError::{self, InvalidHeaderValue},
+    WebSocketError,
+};
 
 /// Upper bound on a single inbound frame's payload.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -86,19 +92,20 @@ impl WebSocketClient {
     ///
     /// Corking is not allowed for WebSocket connections: a `TcpOptions`
     /// extension with `cork: true` is rejected; `nodelay` is honored.
-    pub async fn open(client: &Client, request: Request<Bytes>) -> Result<Self, WebSocketError> {
-        match request.uri().scheme_str() {
+    pub async fn open(
+        client: &Client,
+        uri: Uri,
+        mut headers: HeaderMap<HeaderValue>,
+        extensions: Extensions,
+    ) -> Result<Self, WebSocketError> {
+        match uri.scheme_str() {
             Some("ws" | "wss") => {}
             _ => return Err(WebSocketError::UnsupportedScheme),
-        }
-        if request.method() != Method::GET {
-            return Err(WebSocketError::MethodNotGet);
         }
 
         // The subprotocols the caller is offering, remembered so the
         // server's selection can be validated.
-        let offered_protocols: Vec<String> = request
-            .headers()
+        let offered_protocols: Vec<String> = headers
             .get_all(header::SEC_WEBSOCKET_PROTOCOL)
             .iter()
             .filter_map(|v| v.to_str().ok())
@@ -115,26 +122,32 @@ impl WebSocketClient {
 
         // Force the protocol-mandated fields (insert replaces any caller
         // values), leaving all other caller headers untouched.
-        let (mut parts, body) = request.into_parts();
-        parts
-            .headers
-            .insert(header::UPGRADE, http::HeaderValue::from_static("websocket"));
-        parts.headers.insert(
+
+        headers.insert(header::UPGRADE, http::HeaderValue::from_static("websocket"));
+        headers.insert(
             header::CONNECTION,
             http::HeaderValue::from_static("Upgrade"),
         );
-        parts.headers.insert(
+        headers.insert(
             header::SEC_WEBSOCKET_KEY,
             // The key is base64, always a valid header value.
             http::HeaderValue::from_str(&key).map_err(|_| {
                 InvalidHeaderValue("base64 Sec-WebSocket-Key is a valid header value")
             })?,
         );
-        parts.headers.insert(
+        headers.insert(
             header::SEC_WEBSOCKET_VERSION,
             http::HeaderValue::from_static("13"),
         );
-        let request = Request::from_parts(parts, body);
+        let mut request = Request::builder()
+            .version(Version::HTTP_11)
+            .uri(uri)
+            .method(Method::GET)
+            .body(Bytes::new())
+            .map_err(|_| HttpError::MalformedRequest)?;
+
+        *request.headers_mut() = headers;
+        *request.extensions_mut() = extensions;
 
         let mut response = client.h1_upgrade_request(request).await?;
 

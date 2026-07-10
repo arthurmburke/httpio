@@ -6,12 +6,22 @@ build = "build.rs"
 
 [dependencies]
 # Used by `core` and the transport-agnostic `http` traits, so always needed.
-bytes = "1"
+# `serde` lets the `Raw` codec body derive Serialize/Deserialize.
+bytes = { version = "1", features = ["serde"] }
 http = "1"
 gxhash = "3.5"
 # The `http` trait module references `hyper::body::Incoming` in its upgrade
 # API, so hyper is always required.
 hyper = { version = "1", features = ["client", "http1", "http2"] }
+
+# Content-negotiated body codecs (`http::codec`): a generic body is
+# (de)serialized per the Content-Type header. One crate per supported media
+# type. All portable Rust.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"                                  # application/json
+serde_urlencoded = "0.7"                          # application/x-www-form-urlencoded
+serde_plain = "1"                                 # text/plain
+quick-xml = { version = "0.37", features = ["serialize"] }  # application/xml
 
 # Used only by the `dpdk` module, which is gated by the `have_dpdk` cfg that
 # build.rs sets when libdpdk is found. These are all portable Rust and build

@@ -35,8 +35,7 @@ mod dpdk_app {
     use std::process::ExitCode;
     use std::time::Duration;
 
-    use bytes::Bytes;
-    use http::{Method, Request};
+    use http::{Extensions, HeaderMap};
     use httpio::dpdk::http::client::builder::Builder;
     use httpio::dpdk::http::websocket::WebSocketClient;
     use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
@@ -165,11 +164,9 @@ mod dpdk_app {
 
         let mut ws = match WebSocketClient::open(
             &client,
-            Request::builder()
-                .method(Method::GET)
-                .uri(app.url.clone())
-                .body(Bytes::new())
-                .expect("failed to build request"),
+            app.url.clone().parse().expect("not a valid URI"),
+            HeaderMap::new(),
+            Extensions::new(),
         )
         .await
         {

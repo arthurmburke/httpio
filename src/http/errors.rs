@@ -12,10 +12,15 @@ use std::io;
 
 use http::StatusCode;
 
+use super::codec::CodecError;
+
 /// Why an HTTP request -- or a WebSocket upgrade request -- could not be
 /// completed. Returned by [`HttpClient`](crate::http::client::HttpClient).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpError {
+    /// The request was malformed during construction. This can occur if the
+    /// body cannot be written to the output.
+    MalformedRequest,
     /// The request URI had no host. An absolute URI with a scheme and host
     /// (e.g. `https://example.com/path`) is required, since the URI is also
     /// what decides where to connect.
@@ -54,6 +59,9 @@ pub enum HttpError {
     /// why the header is invalid and what it was used for but does not include
     /// the exact header content.
     InvalidHeaderValue(&'static str),
+    /// The request body could not be encoded, or the response body decoded,
+    /// for its `Content-Type`; see the [`CodecError`].
+    Codec(CodecError),
 }
 
 impl fmt::Display for HttpError {
@@ -95,11 +103,26 @@ impl fmt::Display for HttpError {
             HttpError::InvalidHeaderValue(reason) => {
                 write!(f, "the provided header value is invalid: {}", reason)
             }
+            HttpError::Codec(e) => write!(f, "body codec error: {e}"),
+            HttpError::MalformedRequest => f.write_str("the http Request was malformed"),
         }
     }
 }
 
-impl std::error::Error for HttpError {}
+impl std::error::Error for HttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            HttpError::Codec(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<CodecError> for HttpError {
+    fn from(e: CodecError) -> Self {
+        HttpError::Codec(e)
+    }
+}
 
 /// Why the HTTP client builder could not load a CA certificate bundle (its
 /// `add_root_ca_pem` / `add_root_ca_pem_file` methods).

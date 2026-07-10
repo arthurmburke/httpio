@@ -27,8 +27,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::TlsConnector;
 
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
 use crate::core::hashmap::HashMap;
 use crate::dpdk::tcp::worker::WorkerHandle;
+use crate::http::codec::{self, Empty};
 use crate::http::errors::HttpError;
 
 use super::stream::{FlushHandle, TcpOptions, TcpStream};
@@ -159,31 +163,51 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn get(&self, url: &str) -> Result<Response<Bytes>, HttpError> {
+    /// Convenience GET with an [`Empty`] body; the response is decoded into
+    /// `R` from its `Content-Type`. See [`request`](Self::request).
+    pub async fn get<R: DeserializeOwned + 'static>(
+        &self,
+        url: &str,
+    ) -> Result<Response<R>, HttpError> {
         let request = Request::builder()
             .method(Method::GET)
             .uri(url)
-            .body(Bytes::new())
+            .body(Empty)
             .map_err(|_| HttpError::MalformedUri)?;
         self.request(request).await
     }
 
-    /// Sends one request. The request URI must be absolute (scheme +
-    /// host) since it's also what decides where to connect. For `https`
-    /// the protocol (HTTP/1.1 vs HTTP/2) follows the server's ALPN
-    /// choice; plain `http` speaks HTTP/1.1.
+    /// Sends one request, encoding the body `B` to bytes for the request's
+    /// `Content-Type` and decoding the response body into `R` from the
+    /// response's `Content-Type` (see [`codec`](crate::http::codec)).
     ///
-    /// HTTP/2 connections are reused: if a live pooled connection to the
-    /// origin exists, this request is multiplexed onto it instead of
-    /// dialing a new one. HTTP/1.1 dials per request.
+    /// The request URI must be absolute (scheme + host) since it's also what
+    /// decides where to connect. For `https` the protocol (HTTP/1.1 vs
+    /// HTTP/2) follows the server's ALPN choice; plain `http` speaks
+    /// HTTP/1.1. HTTP/2 connections are reused per origin.
+    ///
+    /// Transport tuning: insert a [`TcpOptions`] into the request's
+    /// extensions to control TCP_NODELAY / corking for the connection this
+    /// request uses (consumed here, not forwarded to the server).
+    pub async fn request<B, R>(&self, request: Request<B>) -> Result<Response<R>, HttpError>
+    where
+        B: Serialize + 'static,
+        R: DeserializeOwned + 'static,
+    {
+        let (parts, body) = request.into_parts();
+        let body = codec::encode(parts.headers.get(header::CONTENT_TYPE), body)?;
+        let response = self.send_bytes(Request::from_parts(parts, body)).await?;
+        let (parts, body) = response.into_parts();
+        let body = codec::decode(parts.headers.get(header::CONTENT_TYPE), body)?;
+        Ok(Response::from_parts(parts, body))
+    }
+
+    /// Sends a request whose body is already raw bytes and collects the raw
+    /// response body -- the transport pipeline the generic [`request`] wraps.
     ///
     /// The response's status/version/headers/extensions are the `http`
     /// crate's own parts, untouched; the body is fully collected.
-    ///
-    /// Transport tuning: insert a [`TcpOptions`] into the request's
-    /// extensions to control TCP_NODELAY / corking for the connection
-    /// this request uses (consumed here, not forwarded to the server).
-    pub async fn request(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+    async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
         let (mut parts, body) = request.into_parts();
         let tcp_options = parts.extensions.remove::<TcpOptions>().unwrap_or_default();
         let flush_handle = parts.extensions.remove::<FlushHandle>();
@@ -368,10 +392,10 @@ impl Client {
 }
 
 impl crate::http::client::HttpClient for Client {
-    fn request(
+    fn request<B: Serialize + Send + 'static, R: DeserializeOwned + 'static>(
         &self,
-        request: Request<Bytes>,
-    ) -> impl Future<Output = Result<Response<Bytes>, HttpError>> + Send {
+        request: Request<B>,
+    ) -> impl Future<Output = Result<Response<R>, HttpError>> + Send {
         async { Client::request(self, request).await }
     }
 }

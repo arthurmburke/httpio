@@ -33,7 +33,6 @@ mod dpdk_app {
     use std::process::ExitCode;
     use std::time::Duration;
 
-    use bytes::Bytes;
     use http::{Method, Request};
 
     use httpio::dpdk::http::client::builder::Builder;
@@ -43,6 +42,7 @@ mod dpdk_app {
     use httpio::dpdk::tcp::engine::TcpEngine;
     use httpio::dpdk::tcp::worker::WorkerHandle;
     use httpio::dpdk::{self, EthPort, Mempool};
+    use httpio::http::codec::{Empty, Raw};
 
     const PORT_ID: u16 = 0;
     const MBUF_POOL_SIZE: u32 = 8192;
@@ -167,7 +167,7 @@ mod dpdk_app {
             let mut request = match Request::builder()
                 .method(Method::GET)
                 .uri(url.as_str())
-                .body(Bytes::new())
+                .body(Empty)
             {
                 Ok(request) => request,
                 Err(e) => {
@@ -195,7 +195,8 @@ mod dpdk_app {
                 None
             };
 
-            let outcome = tokio::time::timeout(REQUEST_TIMEOUT, client.request(request)).await;
+            let outcome =
+                tokio::time::timeout(REQUEST_TIMEOUT, client.request::<Empty, Raw>(request)).await;
             if let Some(flusher) = flusher {
                 flusher.abort();
             }
@@ -214,7 +215,7 @@ mod dpdk_app {
                         eprintln!("{}: {}", name, String::from_utf8_lossy(value.as_bytes()));
                     }
                     std::io::stdout()
-                        .write_all(response.body())
+                        .write_all(&response.body().0)
                         .expect("failed to write body");
                 }
             }
