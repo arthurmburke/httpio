@@ -200,7 +200,8 @@ impl Client {
         let (parts, body) = request.into_parts();
         let response = match codec::encode(parts.headers.get(header::CONTENT_TYPE), body)? {
             EncodedBody::Full(bytes) => {
-                self.send_buffered(Request::from_parts(parts, bytes)).await?
+                self.send_buffered(Request::from_parts(parts, bytes))
+                    .await?
             }
             // A ByteStream body is sent chunk-by-chunk with chunked framing;
             // streaming is HTTP/1.1-only (a stream can't ride the pooled
@@ -229,8 +230,8 @@ impl Client {
                     *errored = item.is_err();
                     ready(Some(item))
                 });
-            let body = codec::stream_response::<R, _>(chunks)
-                .expect("is_stream::<R>() checked above");
+            let body =
+                codec::stream_response::<R, _>(chunks).expect("is_stream::<R>() checked above");
             return Ok(Response::from_parts(parts, body));
         }
 

@@ -150,7 +150,7 @@ pub struct Raw(pub Bytes);
 
 impl<T> From<T> for Raw
 where
-    T: AsRef<[u8]> + Send + 'static
+    T: AsRef<[u8]> + Send + 'static,
 {
     fn from(value: T) -> Self {
         Raw(Bytes::from_owner(value))

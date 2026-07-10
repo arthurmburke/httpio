@@ -21,10 +21,7 @@
 //! offered, so RSV bits or a server-selected protocol fail the handshake.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use http::{
-    Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, Version, header,
-    request::Parts,
-};
+use http::{Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use ring::rand::{SecureRandom, SystemRandom};
