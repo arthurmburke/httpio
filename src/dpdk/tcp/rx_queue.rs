@@ -1,9 +1,12 @@
 //! Receive-side reassembly: buffers out-of-order segments and delivers
 //! in-order bytes to the application as gaps get filled.
 //!
-//! Received payloads are copied out of the (soon-to-be-freed) mbuf exactly
-//! once, into a `Bytes`; from then on they move through the ready queue and
-//! out to the application by refcount, never re-copied.
+//! Zero-copy: received payloads arrive as refcounted slices of the RX mbuf
+//! (see [`Mbuf::into_bytes`](crate::dpdk::Mbuf::into_bytes)) and move through
+//! the ready queue and out to the application by refcount -- the payload is
+//! never copied. The flip side is that a buffered or application-held chunk
+//! pins its whole mbuf (data room ~2KB) until dropped, so pool sizing must
+//! cover the receive window plus whatever the application retains.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -49,9 +52,10 @@ impl ReassemblyBuffer {
     ///
     /// Segments (or portions of them) at or before `rcv_nxt` are
     /// duplicates and dropped; segments strictly after `rcv_nxt` are
-    /// buffered until the gap closes. `data` is borrowed from the mbuf and
-    /// copied once here into an owned `Bytes`.
-    pub fn insert(&mut self, seq: Seq, data: &[u8], rcv_nxt: Seq) -> Seq {
+    /// buffered until the gap closes. `data` is an owned, mbuf-backed
+    /// `Bytes` and is stored (or prefix-trimmed via an O(1) slice) by
+    /// refcount -- no copy.
+    pub fn insert(&mut self, seq: Seq, data: Bytes, rcv_nxt: Seq) -> Seq {
         if data.is_empty() {
             return rcv_nxt;
         }
@@ -60,23 +64,24 @@ impl ReassemblyBuffer {
             return rcv_nxt; // entirely duplicate
         }
 
-        let (seq, data): (Seq, &[u8]) = if seq.lt(rcv_nxt) {
+        let (seq, data): (Seq, Bytes) = if seq.lt(rcv_nxt) {
             // Partially duplicate: trim the already-delivered prefix.
             let skip = rcv_nxt.distance(seq).unsigned_abs() as usize;
-            (rcv_nxt, &data[skip..])
+            (rcv_nxt, data.slice(skip..))
         } else {
             (seq, data)
         };
 
         let mut rcv_nxt = rcv_nxt;
         if seq == rcv_nxt {
-            self.push_ready(Bytes::copy_from_slice(data));
-            rcv_nxt = rcv_nxt + data.len() as u32;
+            let len = data.len() as u32;
+            self.push_ready(data);
+            rcv_nxt = rcv_nxt + len;
             rcv_nxt = self.drain_contiguous(rcv_nxt);
         } else {
-            self.out_of_order
-                .entry(seq.0)
-                .or_insert_with(|| Bytes::copy_from_slice(data));
+            // A duplicate out-of-order retransmit keeps the copy already
+            // buffered; the incoming duplicate is dropped (freeing its mbuf).
+            self.out_of_order.entry(seq.0).or_insert(data);
         }
         rcv_nxt
     }

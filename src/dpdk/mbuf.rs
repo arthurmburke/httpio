@@ -5,6 +5,8 @@
 
 use std::slice;
 
+use bytes::Bytes;
+
 use super::ffi;
 use super::mempool::Mempool;
 
@@ -183,6 +185,25 @@ impl Mbuf {
             == ffi::RTE_MBUF_F_RX_L4_CKSUM_GOOD as u64
     }
 
+    /// Converts this mbuf into a [`Bytes`] that *owns* it: the returned
+    /// `Bytes` views the packet data in place (zero-copy) and
+    /// `rte_pktmbuf_free`s the mbuf when the last reference drops. Slices of
+    /// it (`slice`/`slice_ref`/`split_to`) share the refcount, so a payload
+    /// carved out of a frame keeps the mbuf alive without ever copying.
+    ///
+    /// Cross-thread notes: the last reference may drop on a different thread
+    /// than the RX lcore (e.g. the application thread). That's safe -- the
+    /// pool is created with `rte_pktmbuf_pool_create`, whose default mempool
+    /// ops (`ring_mp_mc`) are multi-producer/multi-consumer, and per-lcore
+    /// caches are only touched by registered EAL lcores.
+    ///
+    /// Trade-off: the whole mbuf (data room ~2KB) stays pinned until the
+    /// last `Bytes` reference drops, so long-held small payloads hold more
+    /// pool memory than a copy would.
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+
     /// Requests NIC TX checksum offload for an IPv4 + TCP packet: the
     /// device fills in the IPv4 header checksum and completes the TCP
     /// checksum. The caller must leave the IPv4 checksum field zero and put
@@ -202,6 +223,15 @@ impl Mbuf {
             (*self.raw).__bindgen_anon_3.tx_offload =
                 (l2_len as u64 & 0x7f) | ((l3_len as u64 & 0x1ff) << 7);
         }
+    }
+}
+
+/// The view [`Mbuf::into_bytes`] hands to `Bytes::from_owner`: the packet
+/// data region. The pointer is into DPDK memory and doesn't move when the
+/// `Mbuf` handle itself is moved.
+impl AsRef<[u8]> for Mbuf {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
     }
 }
 

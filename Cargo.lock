@@ -242,6 +242,7 @@ dependencies = [
  "gxhash",
  "http",
  "http-body-util",
+ "httparse",
  "hyper",
  "hyper-util",
  "libc",

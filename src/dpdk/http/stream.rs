@@ -4,6 +4,13 @@
 //! `crate::tcp::worker`): writes push `Command`s, reads pop `Inbound`
 //! messages. There is no lock and no shared engine access on this side.
 //!
+//! Zero-copy path: [`AsyncRead`]/[`AsyncWrite`] must copy (a borrowed write
+//! slice into an owned `Bytes`, an owned `Bytes` into the caller's read
+//! buffer), so a caller that already holds -- or wants -- owned [`Bytes`] can
+//! use [`send`](TcpStream::send)/[`recv`](TcpStream::recv) instead, which move
+//! the `Bytes` straight across the ring with no copy at this boundary. hyper's
+//! header/handshake framing keeps using the `AsyncRead`/`AsyncWrite` impls.
+//!
 //! Busy-poll: when a read has no data yet (or a write can't enqueue
 //! because the command ring is momentarily full), the poll self-wakes and
 //! returns `Pending`, so the task re-polls promptly. This matches DPDK's
@@ -102,7 +109,8 @@ pub struct TcpStream {
     flush: Option<Arc<AtomicBool>>,
     /// Handshake completed (worker sent `Established`).
     established: bool,
-    /// In-order received chunks not yet copied out to the reader.
+    /// In-order received chunks not yet delivered to the reader (copied out
+    /// by `poll_read`, or handed over as-is by `poll_recv`).
     read_queue: VecDeque<Bytes>,
     /// Peer finished sending; deliver EOF once `read_queue` drains.
     got_eof: bool,
@@ -151,6 +159,72 @@ impl TcpStream {
         // Best-effort: the command ring is empty right after connect, so a
         // single push cannot fail here in practice.
         let _ = self.cmd_tx.push(Command::SetCork(true));
+    }
+
+    /// Zero-copy write: hands owned `data` straight to the worker as a
+    /// `Command::Send`, avoiding the copy the [`AsyncWrite`] path is forced to
+    /// make from its borrowed `&[u8]`. Busy-polls (self-waking) while the
+    /// command ring is full; errors if the connection was reset.
+    ///
+    /// Ordering matches the write ring -- these bytes queue behind anything
+    /// already written, and a pending cork flush is released once they land.
+    pub async fn send(&mut self, data: Bytes) -> io::Result<()> {
+        let mut data = Some(data);
+        poll_fn(|cx| self.poll_send(cx, &mut data)).await
+    }
+
+    /// Poll form of [`send`](Self::send). On success `data` is taken; while
+    /// the command ring is full it is left in place for the next poll.
+    pub fn poll_send(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: &mut Option<Bytes>,
+    ) -> Poll<io::Result<()>> {
+        self.drain_inbound();
+        if self.got_reset {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+        }
+        let bytes = data.take().expect("poll_send polled without a payload");
+        match self.cmd_tx.push(Command::Send(bytes)) {
+            Ok(()) => {
+                self.drain_flush();
+                Poll::Ready(Ok(()))
+            }
+            // Ring full: recover the payload so the caller retries the move.
+            Err(Command::Send(bytes)) => {
+                *data = Some(bytes);
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Err(_) => unreachable!("only Command::Send is pushed here"),
+        }
+    }
+
+    /// Zero-copy read: pops the next received chunk as owned [`Bytes`] (a
+    /// refcounted view), avoiding the copy the [`AsyncRead`] path is forced to
+    /// make into the caller's `ReadBuf`. `Ok(None)` is a clean EOF; busy-polls
+    /// (self-waking) until a chunk, EOF, or reset is available.
+    pub async fn recv(&mut self) -> io::Result<Option<Bytes>> {
+        poll_fn(|cx| self.poll_recv(cx)).await
+    }
+
+    /// Poll form of [`recv`](Self::recv). Buffered data is delivered before a
+    /// reset is surfaced, matching [`AsyncRead`].
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+        self.drain_flush();
+        self.drain_inbound();
+        if let Some(chunk) = self.read_queue.pop_front() {
+            return Poll::Ready(Ok(Some(chunk)));
+        }
+        if self.got_reset {
+            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+        }
+        if self.got_eof {
+            // Clean EOF.
+            return Poll::Ready(Ok(None));
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     fn poll_established(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

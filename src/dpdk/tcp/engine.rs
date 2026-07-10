@@ -192,7 +192,12 @@ impl TcpEngine {
             }
             let ip_ok = mbuf.rx_ip_cksum_good();
             let l4_ok = mbuf.rx_l4_cksum_good();
-            self.handle_frame(mbuf.data(), ip_ok, l4_ok, now);
+            // Zero-copy RX: the frame becomes a `Bytes` that owns the mbuf,
+            // so a data segment's payload is delivered to the application as
+            // a refcounted slice of it -- never copied. The mbuf is freed
+            // when the last reference (possibly on the app thread) drops.
+            let frame = mbuf.into_bytes();
+            self.handle_frame(&frame, ip_ok, l4_ok, now);
         }
 
         let mut events = Vec::new();
@@ -322,14 +327,16 @@ impl TcpEngine {
 
     /// `ip_ok`/`l4_ok` report that the NIC already verified the IPv4 /
     /// TCP checksum on RX, so software verification can be skipped.
-    fn handle_frame(&mut self, frame: &[u8], ip_ok: bool, l4_ok: bool, now: Instant) {
+    /// `frame` is the received Ethernet frame as an mbuf-owning `Bytes`
+    /// (see [`Mbuf::into_bytes`]); parsing borrows it as a slice, and only a
+    /// TCP data payload is sliced out of it (by refcount, zero-copy).
+    fn handle_frame(&mut self, frame: &Bytes, ip_ok: bool, l4_ok: bool, now: Instant) {
         let Some(eth_hdr) = eth::EthHeader::parse(frame) else {
             return;
         };
-        let payload = &frame[eth::ETH_HDR_LEN..];
         match eth_hdr.ethertype {
-            arp::ETHERTYPE_ARP => self.handle_arp(payload),
-            eth::ETHERTYPE_IPV4 => self.handle_ipv4(payload, ip_ok, l4_ok, now),
+            arp::ETHERTYPE_ARP => self.handle_arp(&frame[eth::ETH_HDR_LEN..]),
+            eth::ETHERTYPE_IPV4 => self.handle_ipv4(frame, ip_ok, l4_ok, now),
             _ => {}
         }
     }
@@ -347,7 +354,8 @@ impl TcpEngine {
         }
     }
 
-    fn handle_ipv4(&mut self, buf: &[u8], ip_ok: bool, l4_ok: bool, now: Instant) {
+    fn handle_ipv4(&mut self, frame: &Bytes, ip_ok: bool, l4_ok: bool, now: Instant) {
+        let buf = &frame[eth::ETH_HDR_LEN..];
         let Some(ip_hdr) = ipv4::Ipv4Header::parse(buf, !ip_ok) else {
             return;
         };
@@ -374,7 +382,10 @@ impl TcpEngine {
         };
 
         if let Some(tcb) = self.connections.get_mut(&tuple) {
-            tcb.on_segment(&tcp_hdr, segment_payload, now);
+            // Zero-copy: the payload is a refcounted slice of the mbuf-owning
+            // frame `Bytes` (empty payloads resolve to `Bytes::new()`, which
+            // pins nothing).
+            tcb.on_segment(&tcp_hdr, frame.slice_ref(segment_payload), now);
             // The segment may have produced an ACK/data to send, an event,
             // or a state change -- process it next poll.
             self.mark_active(tuple);

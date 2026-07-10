@@ -234,7 +234,11 @@ impl Tcb {
 
     /// RFC 9293 §3.10.7: processes one incoming segment against the
     /// current state.
-    pub fn on_segment(&mut self, hdr: &TcpHeader, payload: &[u8], now: Instant) {
+    ///
+    /// `payload` is an owned, refcounted slice of the RX mbuf (see
+    /// [`Mbuf::into_bytes`](crate::dpdk::Mbuf::into_bytes)); if accepted it
+    /// moves into the reassembly buffer without being copied.
+    pub fn on_segment(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
         if hdr.has_flag(flags::RST) {
             self.on_reset();
             return;
@@ -288,7 +292,10 @@ impl Tcb {
         }
     }
 
-    fn on_segment_general(&mut self, hdr: &TcpHeader, payload: &[u8], now: Instant) {
+    fn on_segment_general(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
+        // The payload moves into the reassembly buffer below; keep its
+        // length for the checks that need it afterward.
+        let payload_len = payload.len() as u32;
         // RFC 9293 §3.10.7.4 step 1: drop segments outside the receive
         // window entirely (for SynReceived/Listen-derived TCBs the window
         // isn't open yet, so any incoming SYN retransmit / stray segment
@@ -297,7 +304,7 @@ impl Tcb {
             // RFC 9293 §3.10.7.4 step 1 (simplified): the segment must
             // overlap the currently advertised receive window.
             let seq = Seq::new(hdr.seq);
-            let seg_len = payload.len() as u32 + if hdr.has_flag(flags::FIN) { 1 } else { 0 };
+            let seg_len = payload_len + if hdr.has_flag(flags::FIN) { 1 } else { 0 };
             let rcv_wnd = RECV_BUFFER_CAPACITY
                 .saturating_sub(self.recv_buffer.readable_len() as u32)
                 .max(1);
@@ -319,7 +326,7 @@ impl Tcb {
         }
 
         if hdr.has_flag(flags::ACK) {
-            self.process_ack(hdr, payload.len() as u32, now);
+            self.process_ack(hdr, payload_len, now);
             if self.state.is_closed() {
                 return;
             }
@@ -337,7 +344,7 @@ impl Tcb {
         }
 
         if hdr.has_flag(flags::FIN) && self.state.is_synchronized() {
-            self.on_fin(hdr, payload.len() as u32);
+            self.on_fin(hdr, payload_len);
         }
     }
 

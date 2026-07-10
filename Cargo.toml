@@ -13,6 +13,9 @@ gxhash = "3.5"
 # The `http` trait module references `hyper::body::Incoming` in its upgrade
 # API, so hyper is always required.
 hyper = { version = "1", features = ["client", "http1", "http2"] }
+# Incremental HTTP/1.1 response-head parser for the hand-rolled, zero-copy h1
+# codec (`dpdk::http::h1`). Tiny, allocation-free, the de-facto standard.
+httparse = "1"
 
 # Content-negotiated body codecs (`http::codec`): a generic body is
 # (de)serialized per the Content-Type header. One crate per supported media
