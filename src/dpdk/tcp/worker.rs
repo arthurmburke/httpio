@@ -129,11 +129,24 @@ struct WorkerConn {
 #[derive(Clone)]
 pub struct WorkerHandle {
     ctrl_tx: CtrlTx,
-    stop: Arc<AtomicBool>,
+    /// Shared only by application-side handles. Dropping the final clone drops
+    /// `WorkerLifetime`, which signals the worker without a racy strong-count
+    /// check. The worker itself deliberately does not own this token.
+    _lifetime: Arc<WorkerLifetime>,
     /// Published by the worker each iteration: total active opens so far.
     /// A cross-core observability counter (e.g. to confirm h2 connection
     /// reuse), not a live count.
     connections_opened: Arc<AtomicU64>,
+}
+
+struct WorkerLifetime {
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 /// The app-side endpoints of one connection's ring pair, returned by
@@ -166,7 +179,7 @@ impl WorkerHandle {
         Ok((
             WorkerHandle {
                 ctrl_tx,
-                stop,
+                _lifetime: Arc::new(WorkerLifetime { stop }),
                 connections_opened,
             },
             join,
@@ -216,14 +229,6 @@ impl WorkerHandle {
     /// the worker lcore). Useful to confirm connection reuse.
     pub fn connections_opened(&self) -> u64 {
         self.connections_opened.load(Ordering::Acquire)
-    }
-}
-
-impl Drop for WorkerHandle {
-    fn drop(&mut self) {
-        // Signal the worker loop to exit. The launched join handle (held
-        // by the caller) is what actually waits for it to finish.
-        self.stop.store(true, Ordering::Release);
     }
 }
 
@@ -377,5 +382,27 @@ fn run(
             }
             true
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_cloned_handle_does_not_stop_the_worker() {
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = WorkerHandle {
+            ctrl_tx,
+            _lifetime: Arc::new(WorkerLifetime { stop: stop.clone() }),
+            connections_opened: Arc::new(AtomicU64::new(0)),
+        };
+
+        drop(handle.clone());
+        assert!(!stop.load(Ordering::Acquire));
+
+        drop(handle);
+        assert!(stop.load(Ordering::Acquire));
     }
 }

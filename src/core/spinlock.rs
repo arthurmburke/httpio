@@ -33,17 +33,8 @@ impl<T> SpinLock<T> {
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        // SAFETY: we hold the lock, so we have exclusive access to `data`.
-        let result = f(unsafe { &mut *self.data.get() });
-        self.locked.store(false, Ordering::Release);
-        result
+        let mut guard = self.lock();
+        f(guard.as_mut())
     }
 
     pub fn lock(&self) -> Guard<'_, T> {
@@ -90,8 +81,11 @@ pub struct RwSpinLock<T> {
     data: UnsafeCell<T>,
 }
 
-// SAFETY: all access to `data` goes through `with_read` or `with_write`, which hold the appropriate locks.
-unsafe impl<T> Sync for RwSpinLock<T> where T: Send {}
+// SAFETY: all access to `data` goes through `with_read` or `with_write`, which
+// hold the appropriate locks. `T: Sync` is required because multiple readers
+// may hold `&T` concurrently; `T: Send` is required for exclusive mutation on
+// a thread other than the one that created the lock.
+unsafe impl<T> Sync for RwSpinLock<T> where T: Send + Sync {}
 
 impl<T> RwSpinLock<T> {
     pub const fn new(value: T) -> Self {
@@ -102,25 +96,8 @@ impl<T> RwSpinLock<T> {
     }
 
     pub fn with_read<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        loop {
-            let state = self.state.load(Ordering::Acquire);
-            if state & 1 == 0 {
-                // No writer, try to increment reader count
-                if self
-                    .state
-                    .compare_exchange_weak(state, state + 2, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    break;
-                }
-            } else {
-                core::hint::spin_loop();
-            }
-        }
-        // SAFETY: we hold a read lock, so we have shared access to `data`.
-        let result = f(unsafe { &*self.data.get() });
-        self.state.fetch_sub(2, Ordering::Release);
-        result
+        let guard = self.read_lock();
+        f(guard.as_ref())
     }
 
     pub fn read_lock(&self) -> ReadGuard<'_, T> {
@@ -147,17 +124,8 @@ impl<T> RwSpinLock<T> {
     }
 
     pub fn with_write<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        while self
-            .state
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        // SAFETY: we hold a write lock, so we have exclusive access to `data`.
-        let result = f(unsafe { &mut *self.data.get() });
-        self.state.store(0, Ordering::Release);
-        result
+        let mut guard = self.write_lock();
+        f(guard.as_mut())
     }
 
     pub fn write_lock(&self) -> WriteGuard<'_, T> {
@@ -213,5 +181,42 @@ impl<'a, T> Drop for ReadGuard<'a, T> {
 impl<'a, T> AsRef<T> for ReadGuard<'a, T> {
     fn as_ref(&self) -> &T {
         self.data
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RwSpinLock, SpinLock};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn spin_lock_is_released_when_with_panics() {
+        let lock = SpinLock::new(1);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            lock.with(|_| panic!("boom"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(lock.with(|value| *value), 1);
+    }
+
+    #[test]
+    fn read_lock_is_released_when_with_read_panics() {
+        let lock = RwSpinLock::new(1);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            lock.with_read(|_| panic!("boom"));
+        }));
+        assert!(result.is_err());
+        lock.with_write(|value| *value += 1);
+        assert_eq!(lock.with_read(|value| *value), 2);
+    }
+
+    #[test]
+    fn write_lock_is_released_when_with_write_panics() {
+        let lock = RwSpinLock::new(1);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            lock.with_write(|_| panic!("boom"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(lock.with_read(|value| *value), 1);
     }
 }

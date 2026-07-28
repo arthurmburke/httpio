@@ -50,12 +50,9 @@ unsafe impl<T: Send, const N: usize> Send for MpscRing<T, N> {}
 unsafe impl<T: Send, const N: usize> Sync for MpscRing<T, N> {}
 
 impl<T, const N: usize> MpscRing<T, N> {
-    const _VALIDATE: () = {
-        assert!(N > 0 && (N & (N - 1)) == 0, "N must be a power of 2!");
-    };
-
     fn new() -> Self {
         assert!(N >= 2, "MPSC ring needs capacity >= 2");
+        assert!(N.is_power_of_two(), "N must be a power of 2");
         Self {
             enqueue_pos: AtomicUsize::new(0),
             _pad0: [0u8; 56],
@@ -238,6 +235,12 @@ mod tests {
         assert!(!tx.is_closed());
         drop(rx);
         assert!(tx.is_closed());
+    }
+
+    #[test]
+    #[should_panic(expected = "N must be a power of 2")]
+    fn rejects_non_power_of_two_capacity() {
+        let _ = channel::<u32, 3>();
     }
 
     #[test]

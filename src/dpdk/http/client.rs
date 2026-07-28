@@ -495,11 +495,11 @@ impl Client {
 }
 
 impl crate::http::client::HttpClient for Client {
-    fn request<B: Serialize + Send + 'static, R: DeserializeOwned + 'static>(
+    async fn request<B: Serialize + Send + 'static, R: DeserializeOwned + 'static>(
         &self,
         request: Request<B>,
-    ) -> impl Future<Output = Result<Response<R>, HttpError>> + Send {
-        async { Client::request(self, request).await }
+    ) -> Result<Response<R>, HttpError> {
+        Client::request(self, request).await
     }
 }
 

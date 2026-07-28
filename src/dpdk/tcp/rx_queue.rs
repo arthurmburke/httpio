@@ -96,10 +96,7 @@ impl ReassemblyBuffer {
     /// chunks move into `ready` by refcount (only a possible prefix trim,
     /// which is an O(1) slice).
     fn drain_contiguous(&mut self, mut rcv_nxt: Seq) -> Seq {
-        loop {
-            let Some((&start, _)) = self.out_of_order.first_key_value() else {
-                break;
-            };
+        while let Some((&start, _)) = self.out_of_order.first_key_value() {
             let start_seq = Seq::new(start);
             if start_seq.gt(rcv_nxt) {
                 break; // still a gap

@@ -77,7 +77,7 @@ impl CongestionControl {
     /// Call on every duplicate ACK (one that does not advance `snd_una`).
     /// Returns `true` exactly once recovery should trigger a fast
     /// retransmit (the 3rd duplicate).
-    pub fn on_duplicate_ack(&mut self, snd_una: u32) -> bool {
+    pub fn on_duplicate_ack(&mut self, recovery_point: u32) -> bool {
         if matches!(self.phase, Phase::FastRecovery { .. }) {
             // Already in recovery: RFC 5681's "artificial inflation" --
             // each further dup ack means another segment left the
@@ -89,9 +89,7 @@ impl CongestionControl {
         if self.dup_ack_count == 3 {
             self.ssthresh = (self.cwnd / 2).max(2 * self.mss);
             self.cwnd = self.ssthresh + 3 * self.mss;
-            self.phase = Phase::FastRecovery {
-                recovery_point: snd_una,
-            };
+            self.phase = Phase::FastRecovery { recovery_point };
             true
         } else {
             false

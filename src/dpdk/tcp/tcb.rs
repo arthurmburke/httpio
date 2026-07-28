@@ -240,7 +240,9 @@ impl Tcb {
     /// moves into the reassembly buffer without being copied.
     pub fn on_segment(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
         if hdr.has_flag(flags::RST) {
-            self.on_reset();
+            if self.reset_is_acceptable(hdr) {
+                self.on_reset();
+            }
             return;
         }
 
@@ -253,6 +255,38 @@ impl Tcb {
     fn on_reset(&mut self) {
         self.state = TcpState::Closed;
         self.events.push(Event::Reset);
+    }
+
+    /// Validates an incoming reset before allowing it to tear down the
+    /// connection. In SYN-SENT, RFC 9293 requires an acceptable ACK. In
+    /// synchronized states, RFC 5961 §3 accepts an exact RCV.NXT match and
+    /// sends a challenge ACK for another sequence number inside the window.
+    fn reset_is_acceptable(&mut self, hdr: &TcpHeader) -> bool {
+        match self.state {
+            TcpState::SynSent => {
+                if !hdr.has_flag(flags::ACK) {
+                    return false;
+                }
+                let ack = Seq::new(hdr.ack);
+                ack.gt(self.iss) && ack.leq(self.snd_nxt)
+            }
+            TcpState::TimeWait => false,
+            state if state.is_synchronized() => {
+                let seq = Seq::new(hdr.seq);
+                if seq == self.rcv_nxt {
+                    return true;
+                }
+
+                let rcv_wnd = RECV_BUFFER_CAPACITY
+                    .saturating_sub(self.recv_buffer.readable_len() as u32)
+                    .max(1);
+                if seq.in_range(self.rcv_nxt, self.rcv_nxt + rcv_wnd) {
+                    self.ack_pending = true;
+                }
+                false
+            }
+            _ => false,
+        }
     }
 
     fn on_segment_syn_sent(&mut self, hdr: &TcpHeader, now: Instant) {
@@ -397,8 +431,18 @@ impl Tcb {
             // keepalive-style ACK, not a loss signal.
             let is_dup_candidate =
                 payload_len == 0 && !hdr.has_flag(flags::SYN) && !hdr.has_flag(flags::FIN);
-            if is_dup_candidate && self.flight_size() > 0 {
-                self.congestion.on_duplicate_ack(self.snd_una.0);
+            if is_dup_candidate
+                && self.flight_size() > 0
+                && self.congestion.on_duplicate_ack(self.snd_nxt.0)
+            {
+                // Karn's algorithm: an ACK after this retransmission is
+                // ambiguous and must not produce an RTT sample. Restart
+                // the oldest segment's timer from this transmission.
+                if let Some(seg) = self.retransmit.segments.front_mut() {
+                    seg.retransmitted = true;
+                    seg.last_sent_at = now;
+                }
+                self.retransmit_now = true;
             }
             self.update_send_window(hdr, ack);
         }
@@ -686,5 +730,97 @@ impl Tcb {
     /// fully idle and can be skipped until an inbound frame or app call.
     pub fn has_armed_timer(&self) -> bool {
         !self.retransmit.is_empty() || self.time_wait_deadline.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tuple() -> FourTuple {
+        FourTuple {
+            local_ip: [10, 0, 0, 1],
+            local_port: 49152,
+            remote_ip: [10, 0, 0, 2],
+            remote_port: 80,
+        }
+    }
+
+    fn header(seq: Seq, ack: Seq, flags: u8, window: u16) -> TcpHeader {
+        TcpHeader {
+            src_port: 80,
+            dst_port: 49152,
+            seq: seq.0,
+            ack: ack.0,
+            flags,
+            window,
+            urgent_pointer: 0,
+            options: TcpOptions::default(),
+        }
+    }
+
+    fn establish(now: Instant) -> Tcb {
+        let mut tcb = Tcb::new_active(tuple());
+        let _syn = tcb.poll_output(now);
+        let syn_ack = header(
+            Seq::new(1000),
+            tcb.snd_nxt,
+            flags::SYN | flags::ACK,
+            u16::MAX,
+        );
+        tcb.on_segment(&syn_ack, Bytes::new(), now);
+        let _ack = tcb.poll_output(now);
+        assert_eq!(tcb.state, TcpState::Established);
+        tcb
+    }
+
+    #[test]
+    fn syn_sent_ignores_reset_without_an_acceptable_ack() {
+        let now = Instant::now();
+        let mut tcb = Tcb::new_active(tuple());
+        let rst = header(Seq::new(0), Seq::new(0), flags::RST, 0);
+
+        tcb.on_segment(&rst, Bytes::new(), now);
+
+        assert_eq!(tcb.state, TcpState::SynSent);
+        assert!(tcb.events.is_empty());
+    }
+
+    #[test]
+    fn established_ignores_out_of_window_reset() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        let rst = header(
+            tcb.rcv_nxt + RECV_BUFFER_CAPACITY + 1,
+            tcb.snd_una,
+            flags::RST,
+            0,
+        );
+
+        tcb.on_segment(&rst, Bytes::new(), now);
+
+        assert_eq!(tcb.state, TcpState::Established);
+        assert!(!tcb.events.contains(&Event::Reset));
+    }
+
+    #[test]
+    fn third_duplicate_ack_schedules_fast_retransmit() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.send(Bytes::from_static(b"payload"));
+        let sent = tcb.poll_output(now);
+        assert_eq!(sent.len(), 1);
+        let ack = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
+
+        for _ in 0..3 {
+            tcb.on_segment(&ack, Bytes::new(), now);
+        }
+        let retransmitted = tcb.poll_output(now);
+
+        assert!(
+            retransmitted
+                .iter()
+                .any(|seg| seg.payload == b"payload"[..])
+        );
     }
 }
