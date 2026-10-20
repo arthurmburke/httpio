@@ -1,22 +1,25 @@
-//! Descriptive, non-allocating error types for the HTTP client.
+//! Descriptive error types for the HTTP client.
 //!
 //! These replace an opaque `Box<dyn Error>`: each is a plain `enum` returned
-//! by value -- no heap allocation on the error path, and callers can `match`
-//! on the exact cause instead of string-sniffing. Every variant documents
-//! and (via [`Display`](std::fmt::Display)) describes what went wrong; the
-//! few that wrap an underlying failure keep a `Copy` [`io::ErrorKind`] so the
-//! reason survives without allocating.
+//! by value, and callers can `match` on the exact cause instead of
+//! string-sniffing. Every variant documents and (via
+//! [`Display`](std::fmt::Display)) describes what went wrong; the ones that
+//! wrap an underlying failure keep a `Copy` [`io::ErrorKind`]. Only
+//! [`HttpError::Status`] carries data from the server (the response body), so
+//! `HttpError` is `Clone` rather than `Copy`; cloning it is cheap
+//! ([`Bytes`] is reference-counted).
 
 use std::fmt;
 use std::io;
 
+use bytes::Bytes;
 use http::StatusCode;
 
 use super::codec::CodecError;
 
 /// Why an HTTP request -- or a WebSocket upgrade request -- could not be
 /// completed. Returned by [`HttpClient`](crate::http::client::HttpClient).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpError {
     /// The request was malformed during construction. This can occur if the
     /// body cannot be written to the output.
@@ -66,6 +69,28 @@ pub enum HttpError {
     /// ([`ByteStream`](crate::http::codec::ByteStream)) failed, aborting the
     /// request; the [`io::ErrorKind`] gives the producer's reason.
     BodyProducer(io::ErrorKind),
+    /// The server answered with a non-success status. `body` is the raw
+    /// response body (often an error document explaining why), so callers
+    /// can report the server's reason instead of just the code.
+    Status { status: StatusCode, body: Bytes },
+}
+
+impl HttpError {
+    /// The server's status, if it answered with a non-success one.
+    pub fn status(&self) -> Option<StatusCode> {
+        match self {
+            HttpError::Status { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// The server's response body, if it answered with a non-success status.
+    pub fn body(&self) -> Option<&Bytes> {
+        match self {
+            HttpError::Status { body, .. } => Some(body),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for HttpError {
@@ -112,6 +137,17 @@ impl fmt::Display for HttpError {
                 write!(f, "the streaming request body producer failed: {kind}")
             }
             HttpError::MalformedRequest => f.write_str("the http Request was malformed"),
+            HttpError::Status { status, body } => {
+                // Show the start of the server's explanation, as text, if it sent one.
+                const SHOWN: usize = 300;
+                let text = String::from_utf8_lossy(&body[..body.len().min(SHOWN)]);
+                let more = if body.len() > SHOWN { "..." } else { "" };
+                if text.trim().is_empty() {
+                    write!(f, "the server answered {status}")
+                } else {
+                    write!(f, "the server answered {status}: {}{more}", text.trim())
+                }
+            }
         }
     }
 }
@@ -171,7 +207,7 @@ impl std::error::Error for BuilderError {}
 /// Why a WebSocket connection could not be opened, or why a frame exchange
 /// on an open connection failed. Returned by
 /// [`WebSocket`](crate::http::websocket::WebSocket).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebSocketError {
     /// The handshake request URI scheme was not `ws` or `wss`.
     UnsupportedScheme,
