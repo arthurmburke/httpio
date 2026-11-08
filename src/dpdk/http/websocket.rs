@@ -20,12 +20,18 @@
 //! the close handshake is echoed. Extensions and subprotocols are not
 //! offered, so RSV bits or a server-selected protocol fail the handshake.
 
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use futures::{Sink, Stream, ready};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use ring::rand::{SecureRandom, SystemRandom};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::client::Client;
 use crate::http::errors::{
@@ -69,6 +75,9 @@ pub struct WebSocketClient {
     /// The `101 Switching Protocols` response parts (status, headers,
     /// extensions), kept for callers that need e.g. `Set-Cookie`.
     handshake: http::response::Parts,
+    /// Outgoing frame, already masked and encoded.
+    write_buf: Option<Bytes>,
+    write_pos: usize,
 }
 
 impl WebSocketClient {
@@ -209,6 +218,8 @@ impl WebSocketClient {
             close_received: false,
             protocol,
             handshake,
+            write_buf: None,
+            write_pos: 0,
         })
     }
 
@@ -356,28 +367,7 @@ impl WebSocketClient {
     /// Writes one masked frame (client frames must be masked, RFC 6455
     /// §5.3) and flushes.
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WebSocketError> {
-        let mut mask = [0u8; 4];
-        self.rng.fill(&mut mask).map_err(|_| WebSocketError::Rng)?;
-
-        let n = payload.len();
-        let mut out = BytesMut::with_capacity(14 + n);
-        out.put_u8(0x80 | opcode); // FIN | opcode: sends are never fragmented
-        if n <= 125 {
-            out.put_u8(0x80 | n as u8);
-        } else if n <= u16::MAX as usize {
-            out.put_u8(0x80 | 126);
-            out.put_u16(n as u16);
-        } else {
-            out.put_u8(0x80 | 127);
-            out.put_u64(n as u64);
-        }
-        out.put_slice(&mask);
-        let start = out.len();
-        out.put_slice(payload);
-        for (i, byte) in out[start..].iter_mut().enumerate() {
-            *byte ^= mask[i & 3];
-        }
-
+        let out = self.encode_frame(opcode, payload)?;
         self.io
             .write_all(&out)
             .await
@@ -388,19 +378,200 @@ impl WebSocketClient {
             .map_err(|e| WebSocketError::Io(e.kind()))?;
         Ok(())
     }
+
+    fn encode_frame(&self, opcode: u8, payload: &[u8]) -> Result<Bytes, WebSocketError> {
+        let mut mask = [0u8; 4];
+        self.rng.fill(&mut mask).map_err(|_| WebSocketError::Rng)?;
+
+        let n = payload.len();
+        let mut out = BytesMut::with_capacity(14 + n);
+
+        // FIN | opcode
+        out.put_u8(0x80 | opcode);
+
+        if n <= 125 {
+            out.put_u8(0x80 | n as u8);
+        } else if n <= u16::MAX as usize {
+            out.put_u8(0x80 | 126);
+            out.put_u16(n as u16);
+        } else {
+            out.put_u8(0x80 | 127);
+            out.put_u64(n as u64);
+        }
+
+        out.put_slice(&mask);
+
+        let start = out.len();
+        out.put_slice(payload);
+
+        for (i, byte) in out[start..].iter_mut().enumerate() {
+            *byte ^= mask[i & 3];
+        }
+
+        Ok(out.freeze())
+    }
+
+    fn stage_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WebSocketError> {
+        assert!(
+            self.write_buf.is_none(),
+            "stage_frame called before poll_ready"
+        );
+
+        let frame = self.encode_frame(opcode, payload)?;
+        self.write_buf = Some(frame);
+        self.write_pos = 0;
+
+        Ok(())
+    }
+
+    fn poll_write_pending(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
+        loop {
+            let Some(frame) = self.write_buf.as_ref() else {
+                return Poll::Ready(Ok(()));
+            };
+
+            if self.write_pos == frame.len() {
+                self.write_buf = None;
+                self.write_pos = 0;
+                continue;
+            }
+
+            let remaining = &frame[self.write_pos..];
+
+            let n = match Pin::new(&mut self.io).poll_write(cx, remaining) {
+                Poll::Pending => return Poll::Pending,
+
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(WebSocketError::Io(std::io::ErrorKind::WriteZero)));
+                }
+
+                Poll::Ready(Ok(n)) => n,
+
+                Poll::Ready(Err(e)) => {
+                    return Poll::Ready(Err(WebSocketError::Io(e.kind())));
+                }
+            };
+
+            self.write_pos += n;
+        }
+    }
 }
 
-impl crate::http::websocket::WebSocket for WebSocketClient {
-    async fn recv(&mut self) -> Result<Option<Message>, WebSocketError> {
-        WebSocketClient::recv(self).await
+impl Stream for WebSocketClient {
+    type Item = Result<Message, WebSocketError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use futures::FutureExt;
+        let fut = self.recv().boxed();
+        futures::pin_mut!(fut);
+        match fut.poll_unpin(cx) {
+            std::task::Poll::Ready(Ok(Some(msg))) => std::task::Poll::Ready(Some(Ok(msg))),
+            std::task::Poll::Ready(Ok(None)) => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl Sink<Message> for WebSocketClient {
+    type Error = WebSocketError;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+
+        if this.close_sent {
+            return Poll::Ready(Err(WebSocketError::SendAfterClose));
+        }
+
+        // One-frame buffer: the previous frame must be
+        // fully written before we accept another.
+        this.poll_write_pending(cx)
     }
 
-    async fn send(&mut self, message: Message) -> Result<(), WebSocketError> {
-        WebSocketClient::send(self, message).await
+    fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+        let this = self.get_mut();
+
+        if this.close_sent {
+            return Err(WebSocketError::SendAfterClose);
+        }
+
+        match message {
+            Message::Text(text) => {
+                this.stage_frame(OP_TEXT, text.as_bytes())?;
+            }
+
+            Message::Binary(data) => {
+                this.stage_frame(OP_BINARY, &data)?;
+            }
+
+            Message::Ping(data) => {
+                check_control_len(&data)?;
+                this.stage_frame(OP_PING, &data)?;
+            }
+
+            Message::Pong(data) => {
+                check_control_len(&data)?;
+                this.stage_frame(OP_PONG, &data)?;
+            }
+
+            Message::Close(frame) => {
+                let mut payload = BytesMut::new();
+
+                if let Some(frame) = frame {
+                    payload.put_u16(frame.code);
+                    payload.put_slice(frame.reason.as_bytes());
+                }
+
+                check_control_len(&payload)?;
+
+                this.stage_frame(OP_CLOSE, &payload)?;
+
+                // No further messages may be enqueued.
+                this.close_sent = true;
+            }
+        }
+
+        Ok(())
     }
 
-    async fn close(&mut self, frame: Option<CloseFrame>) -> Result<(), WebSocketError> {
-        WebSocketClient::close(self, frame).await
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+
+        // Finish writing the encoded frame.
+        ready!(this.poll_write_pending(cx))?;
+
+        // Flush the underlying transport.
+        match Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(WebSocketError::Io(e.kind()))),
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+
+        // Finish any previously queued message.
+        ready!(this.poll_write_pending(cx))?;
+
+        if !this.close_sent {
+            // Queue a WebSocket Close frame.
+            this.stage_frame(OP_CLOSE, &[])?;
+            this.close_sent = true;
+        }
+
+        // Write the Close frame.
+        ready!(this.poll_write_pending(cx))?;
+
+        // Make sure it reaches the transport.
+        match Pin::new(&mut this.io).poll_flush(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(WebSocketError::Io(e.kind()))),
+        }
     }
 }
 

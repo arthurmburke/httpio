@@ -20,15 +20,3 @@ pub struct CloseFrame {
 }
 
 use super::errors::WebSocketError;
-
-pub trait WebSocket {
-    fn recv(&mut self) -> impl Future<Output = Result<Option<Message>, WebSocketError>> + Send;
-
-    fn send(&mut self, message: Message)
-    -> impl Future<Output = Result<(), WebSocketError>> + Send;
-
-    fn close(
-        &mut self,
-        frame: Option<CloseFrame>,
-    ) -> impl Future<Output = Result<(), WebSocketError>> + Send;
-}

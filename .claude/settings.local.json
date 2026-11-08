@@ -11,7 +11,12 @@
       "Bash(docker info *)",
       "Bash(docker build *)",
       "Bash(docker run *)",
-      "Bash(ls -la /Users/arthurburke/Developer/tcp/csrc/ 2>&1 | head; echo \"---\"; ls /Users/arthurburke/Developer/tcp/ 2>&1 | head)"
+      "Bash(ls -la /Users/arthurburke/Developer/tcp/csrc/ 2>&1 | head; echo \"---\"; ls /Users/arthurburke/Developer/tcp/ 2>&1 | head)",
+      "Bash(docker image *)",
+      "Bash(docker volume *)",
+      "Bash(open -a Docker)",
+      "Bash(break)",
+      "Bash(python3 -)"
     ]
   }
 }
