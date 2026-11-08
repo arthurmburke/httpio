@@ -18,5 +18,3 @@ pub struct CloseFrame {
     pub code: u16,
     pub reason: String,
 }
-
-use super::errors::WebSocketError;
