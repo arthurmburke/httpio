@@ -98,6 +98,7 @@ mod dpdk_app {
         let mut engine = TcpEngine::new(EngineConfig {
             local_mac: mac.addr_bytes,
             local_ip,
+            gateway: None,
         });
         engine.listen(listen_port);
 

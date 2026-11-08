@@ -119,6 +119,39 @@ struct WorkerConn {
     closing: bool,
 }
 
+impl WorkerConn {
+    fn on_event(&mut self, ev: Event) {
+        match ev {
+            Event::Established => {
+                if self.inbound_tx.push(Inbound::Established).is_ok() {
+                    self.established = true;
+                }
+                // If the ring were somehow full, the app hasn't
+                // consumed anything yet, so it will next iteration.
+            }
+            Event::PeerClosed => self.peer_fin = true,
+            Event::Reset => {
+                // Distinguish a failed handshake from a reset of an
+                // established connection so the app reports the right
+                // error.
+                self.terminal.get_or_insert(if self.established {
+                    Inbound::Reset
+                } else {
+                    Inbound::ConnectFailed
+                });
+            }
+            Event::Closed => {
+                // A close before ESTABLISHED is a failed active open;
+                // an established-then-closed connection is delivered as
+                // EOF via the peer_fin path below.
+                if !self.established {
+                    self.terminal.get_or_insert(Inbound::ConnectFailed);
+                }
+            }
+        }
+    }
+}
+
 /// Application-side handle to the worker, used to open connections; each
 /// open produces a fresh ring pair whose app-side halves become a
 /// `TcpStream`.
@@ -296,34 +329,7 @@ fn run(
             let Some(conn) = conns.get_mut(&tuple) else {
                 continue;
             };
-            match ev {
-                Event::Established => {
-                    if conn.inbound_tx.push(Inbound::Established).is_ok() {
-                        conn.established = true;
-                    }
-                    // If the ring were somehow full, the app hasn't
-                    // consumed anything yet, so it will next iteration.
-                }
-                Event::PeerClosed => conn.peer_fin = true,
-                Event::Reset => {
-                    // Distinguish a failed handshake from a reset of an
-                    // established connection so the app reports the right
-                    // error.
-                    conn.terminal.get_or_insert(if conn.established {
-                        Inbound::Reset
-                    } else {
-                        Inbound::ConnectFailed
-                    });
-                }
-                Event::Closed => {
-                    // A close before ESTABLISHED is a failed active open;
-                    // an established-then-closed connection is delivered as
-                    // EOF via the peer_fin path below.
-                    if !conn.established {
-                        conn.terminal.get_or_insert(Inbound::ConnectFailed);
-                    }
-                }
-            }
+            conn.on_event(ev);
         }
 
         // 4. Deliver received bytes, then the terminal signal, to the app.
@@ -388,6 +394,36 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abort_notifies_both_connecting_and_established_readers() {
+        for established in [false, true] {
+            let (_cmd_tx, cmd_rx) = spsc::channel::<Command, CMD_CAP>();
+            let (inbound_tx, _inbound_rx) = spsc::channel::<Inbound, IN_CAP>();
+            let mut conn = WorkerConn {
+                tuple: FourTuple {
+                    local_ip: [10, 0, 0, 1],
+                    local_port: 1234,
+                    remote_ip: [10, 0, 0, 2],
+                    remote_port: 80,
+                },
+                cmd_rx,
+                inbound_tx,
+                pending_in: None,
+                established,
+                peer_fin: false,
+                terminal: None,
+                end_sent: false,
+                closing: false,
+            };
+            conn.on_event(Event::Reset);
+            if established {
+                assert!(matches!(conn.terminal, Some(Inbound::Reset)));
+            } else {
+                assert!(matches!(conn.terminal, Some(Inbound::ConnectFailed)));
+            }
+        }
+    }
 
     #[test]
     fn dropping_a_cloned_handle_does_not_stop_the_worker() {

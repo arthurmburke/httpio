@@ -3,8 +3,10 @@
 //! (status/progress goes to stderr), performs the close handshake, exits.
 //!
 //! Usage:
-//!   ws_client <EAL args> -- <LOCAL_IP> <URL> [--ca <PEM>]... \
-//!       [--resolve HOST=IP]... [--send MSG]
+//!   ws_client <EAL args> -- <LOCAL_IP[/PREFIX]> <URL> [--ca <PEM>]... \
+//!       [--resolve HOST=IP]... [--gateway IP] [--send MSG]
+//!
+//! `--gateway` sends peers outside LOCAL_IP/PREFIX through that router.
 //!
 //! Example (in the devcontainer, kernel-visible tap interface):
 //!   ws_client -l 0-1 --no-huge --vdev=net_tap0,iface=dtap0 -- 10.9.0.1 \
@@ -53,7 +55,8 @@ mod dpdk_app {
     const TIMEOUT: Duration = Duration::from_secs(15);
 
     struct AppArgs {
-        local_ip: [u8; 4],
+        /// Local IP and route; `local_mac` is filled in once the port is up.
+        engine: EngineConfig,
         url: String,
         ca_files: Vec<String>,
         resolves: Vec<(String, Ipv4Addr)>,
@@ -73,8 +76,8 @@ mod dpdk_app {
             Err(msg) => {
                 eprintln!("error: {msg}");
                 eprintln!(
-                    "usage: ws_client <EAL args> -- <LOCAL_IP> <URL> [--ca <PEM>]... \
-                     [--resolve HOST=IP]... [--send MSG]"
+                    "usage: ws_client <EAL args> -- <LOCAL_IP[/PREFIX]> <URL> [--ca <PEM>]... \
+                     [--resolve HOST=IP]... [--gateway IP] [--send MSG]"
                 );
                 return ExitCode::FAILURE;
             }
@@ -114,7 +117,7 @@ mod dpdk_app {
 
         let engine = TcpEngine::new(EngineConfig {
             local_mac: mac.addr_bytes,
-            local_ip: app.local_ip,
+            ..app.engine
         });
 
         let (worker, worker_join) = match WorkerHandle::spawn(engine, port, pool, worker_lcore) {
@@ -233,6 +236,7 @@ mod dpdk_app {
         let mut ca_files = Vec::new();
         let mut resolves = Vec::new();
         let mut send = String::from("hello over websocket");
+        let mut gateway = None;
 
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -251,6 +255,9 @@ mod dpdk_app {
                         .map_err(|_| format!("invalid IPv4 address {ip:?}"))?;
                     resolves.push((host.to_string(), ip));
                 }
+                "--gateway" => {
+                    gateway = Some(it.next().ok_or("--gateway requires an IP")?.clone());
+                }
                 "--send" => {
                     send = it.next().ok_or("--send requires a message")?.clone();
                 }
@@ -262,10 +269,7 @@ mod dpdk_app {
             return Err("expected positional arguments: LOCAL_IP URL".into());
         };
         Ok(AppArgs {
-            local_ip: local_ip
-                .parse::<Ipv4Addr>()
-                .map(|ip| ip.octets())
-                .map_err(|_| format!("invalid IPv4 address {local_ip:?}"))?,
+            engine: EngineConfig::from_cli([0; 6], local_ip, gateway.as_deref())?,
             url: url.clone(),
             ca_files,
             resolves,

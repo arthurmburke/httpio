@@ -30,7 +30,9 @@ pub struct CoreIterator {
 impl Default for CoreIterator {
     fn default() -> Self {
         Self {
-            current: ffi::RTE_MAX_LCORE,
+            // DPDK increments before searching. UINT_MAX wraps to zero,
+            // matching RTE_LCORE_FOREACH's initial unsigned -1.
+            current: u32::MAX,
         }
     }
 }
@@ -94,13 +96,11 @@ pub fn lcore_count() -> u32 {
     unsafe { ffi::rte_lcore_count() }
 }
 
-/// Picks the first worker lcore: the next enabled lcore after the current
-/// (main) one, not wrapping around. Returns `None` if EAL was started
+/// Picks the lowest enabled worker lcore. Returns `None` if EAL was started
 /// with only one lcore (pass e.g. `-l 0-1` to get a worker).
 pub fn first_worker_lcore() -> Option<u32> {
-    let main = main_lcore_id();
     // skip_main=1: never return the main lcore; wrap=0: stop at the end.
-    let next = unsafe { ffi::rte_get_next_lcore(main, 1, 0) };
+    let next = unsafe { ffi::rte_get_next_lcore(u32::MAX, 1, 0) };
     // rte_get_next_lcore returns RTE_MAX_LCORE when there is no next
     // lcore.
     if next >= ffi::RTE_MAX_LCORE {

@@ -16,12 +16,52 @@ use super::seq::Seq;
 
 #[derive(Default)]
 pub struct ReassemblyBuffer {
-    /// Out-of-order segments, keyed by starting sequence number.
-    out_of_order: BTreeMap<u32, Bytes>,
+    /// TCP sequence order, including wraparound. Accepted segments are
+    /// within one receive window (less than half the sequence space).
+    out_of_order: BTreeMap<Seq, Bytes>,
     /// In-order chunks ready for the application to `recv()`.
     ready: VecDeque<Bytes>,
     /// Total bytes across `ready` (kept incrementally to avoid summing).
     ready_len: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reassembles_across_wrap_with_a_future_low_key() {
+        let mut buffer = ReassemblyBuffer::default();
+        let start = Seq::new(u32::MAX - 9);
+        buffer.insert(start + 5, Bytes::from_static(b"fghij"), start);
+        buffer.insert(Seq::new(5), Bytes::from_static(b"pqrst"), start);
+        let next = buffer.insert(start, Bytes::from_static(b"abcde"), start);
+        assert_eq!(next, Seq::new(0));
+        let next = buffer.insert(next, Bytes::from_static(b"klmno"), next);
+        assert_eq!(next, Seq::new(10));
+        assert!(!buffer.has_out_of_order());
+        let mut data = Vec::new();
+        while buffer.readable_len() != 0 {
+            data.extend_from_slice(&buffer.read(100));
+        }
+        assert_eq!(data, b"abcdefghijklmnopqrst");
+    }
+
+    #[test]
+    fn trims_overlapping_segments_across_wrap() {
+        let mut buffer = ReassemblyBuffer::default();
+        let start = Seq::new(u32::MAX - 3);
+        buffer.insert(start + 2, Bytes::from_static(b"cdefgh"), start);
+        buffer.insert(Seq::new(3), Bytes::from_static(b"hijk"), start);
+        let next = buffer.insert(start, Bytes::from_static(b"abcde"), start);
+        assert_eq!(next, Seq::new(7));
+        assert!(!buffer.has_out_of_order());
+        let mut data = Vec::new();
+        while buffer.readable_len() != 0 {
+            data.extend_from_slice(&buffer.read(100));
+        }
+        assert_eq!(data, b"abcdefghijk");
+    }
 }
 
 impl ReassemblyBuffer {
@@ -81,7 +121,7 @@ impl ReassemblyBuffer {
         } else {
             // A duplicate out-of-order retransmit keeps the copy already
             // buffered; the incoming duplicate is dropped (freeing its mbuf).
-            self.out_of_order.entry(seq.0).or_insert(data);
+            self.out_of_order.entry(seq).or_insert(data);
         }
         rcv_nxt
     }
@@ -97,7 +137,7 @@ impl ReassemblyBuffer {
     /// which is an O(1) slice).
     fn drain_contiguous(&mut self, mut rcv_nxt: Seq) -> Seq {
         while let Some((&start, _)) = self.out_of_order.first_key_value() {
-            let start_seq = Seq::new(start);
+            let start_seq = start;
             if start_seq.gt(rcv_nxt) {
                 break; // still a gap
             }

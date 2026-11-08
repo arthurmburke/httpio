@@ -50,10 +50,16 @@ IPv4 + TCP, no kernel network stack involved.
   `http_get` exposes these as `--cork` and `--nagle`.
 - **Minimal ARP**: request/reply, since without it there's no way to
   address a real Ethernet frame to a peer.
+- **Default route**: `EngineConfig::gateway` sends peers outside the
+  local prefix to the gateway's MAC (one route, like
+  `ip route add default via`). Without a gateway every peer is assumed
+  on-link. `EngineConfig::from_cli(mac, "10.0.1.25/24", Some("10.0.1.1"))`
+  builds one from strings; `http_get`/`ws_client` take `LOCAL_IP/PREFIX`
+  and `--gateway IP`.
 
 Not implemented (explicitly out of scope): window scaling, SACK, timestamps,
 delayed ACK, IPv6, IP fragmentation/options, multi-segment (chained) mbufs,
-routing/gateway support (every peer must be on the same L2 segment).
+a route table beyond the single default gateway.
 
 ## Building: use the devcontainer
 
@@ -88,6 +94,8 @@ generates a throwaway CA + server certificate, and exercises the
 - HTTP/1.1 plaintext
 - HTTP/1.1 over TLS with the custom CA (ALPN `http/1.1`)
 - HTTP/2 over TLS with the custom CA (ALPN `h2`)
+- an off-subnet peer reached only via `--gateway` (needs a writable
+  `/proc/sys`, i.e. a `--privileged` container; skipped otherwise)
 - and verifies the TLS handshake is *rejected* when the CA isn't trusted.
 
 ### Fetching a URL manually

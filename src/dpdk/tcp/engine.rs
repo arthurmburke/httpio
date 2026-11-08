@@ -3,12 +3,11 @@
 //! listened port), drives timers, and serializes each `Tcb`'s pending
 //! output back onto the wire.
 //!
-//! Addressing is intentionally simple: no routing table or default
-//! gateway -- every peer is assumed directly reachable on the local
-//! Ethernet segment, resolved via a minimal built-in ARP responder/
-//! resolver. That's the right fit for a back-to-back or single-subnet
-//! DPDK test setup; a real deployment behind a gateway would need a route
-//! table this stack doesn't have.
+//! Addressing is a single default route: peers inside the local subnet are
+//! reached directly, everything else through the configured gateway (see
+//! [`EngineConfig::next_hop`]). Either way the next hop's MAC comes from a
+//! minimal built-in ARP responder/resolver. With no gateway configured,
+//! every peer is assumed to be on the local Ethernet segment.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -27,9 +26,74 @@ use super::tcb::{Event, FourTuple, OutSegment, Tcb};
 const ARP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_RX_BURST: usize = 64;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EngineConfig {
     pub local_mac: [u8; 6],
     pub local_ip: [u8; 4],
+    /// Default route. `None`: every peer is on-link (ARP for it directly).
+    pub gateway: Option<Gateway>,
+}
+
+/// A default route: destinations outside `local_ip/prefix_len` are sent to
+/// `ip`'s MAC address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gateway {
+    pub ip: [u8; 4],
+    /// Prefix length of the local subnet (0..=32). 32 sends every peer,
+    /// even same-subnet ones, through the gateway.
+    pub prefix_len: u8,
+}
+
+impl EngineConfig {
+    /// Builds a config from CLI-style strings: `local` is `IP` or
+    /// `IP/PREFIX` (like `ip addr add`), `gateway` an optional `IP` (like
+    /// `ip route add default via`). A gateway with no prefix on `local`
+    /// routes every peer through the gateway (prefix 32); a prefix with no
+    /// gateway is accepted and ignored.
+    pub fn from_cli(local_mac: [u8; 6], local: &str, gateway: Option<&str>) -> Result<Self, String> {
+        let (ip, prefix_len) = match local.split_once('/') {
+            Some((ip, len)) => {
+                let len: u8 = len
+                    .parse()
+                    .ok()
+                    .filter(|l| *l <= 32)
+                    .ok_or_else(|| format!("invalid prefix length in {local:?}"))?;
+                (ip, len)
+            }
+            None => (local, 32),
+        };
+        let gateway = gateway
+            .map(|gw| parse_ipv4(gw).map(|ip| Gateway { ip, prefix_len }))
+            .transpose()?;
+        Ok(Self {
+            local_mac,
+            local_ip: parse_ipv4(ip)?,
+            gateway,
+        })
+    }
+
+    /// The IP whose MAC a frame to `dst` is addressed to: `dst` itself when
+    /// it is on-link, else the gateway.
+    pub fn next_hop(&self, dst: [u8; 4]) -> [u8; 4] {
+        match self.gateway {
+            Some(gw) if !same_subnet(self.local_ip, dst, gw.prefix_len) => gw.ip,
+            _ => dst,
+        }
+    }
+}
+
+fn parse_ipv4(s: &str) -> Result<[u8; 4], String> {
+    s.parse::<std::net::Ipv4Addr>()
+        .map(|ip| ip.octets())
+        .map_err(|_| format!("invalid IPv4 address {s:?}"))
+}
+
+fn same_subnet(a: [u8; 4], b: [u8; 4], prefix_len: u8) -> bool {
+    // `checked_shl(32)` is None: a /0 mask matches everything.
+    let mask = u32::MAX
+        .checked_shl(32 - u32::from(prefix_len.min(32)))
+        .unwrap_or(0);
+    (u32::from_be_bytes(a) ^ u32::from_be_bytes(b)) & mask == 0
 }
 
 pub struct TcpEngine {
@@ -120,10 +184,15 @@ impl TcpEngine {
     }
 
     pub fn recv(&mut self, tuple: FourTuple, max_len: usize) -> Bytes {
-        self.connections
+        let data = self
+            .connections
             .get_mut(&tuple)
             .map(|t| t.recv(max_len))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if !data.is_empty() {
+            self.mark_active(tuple);
+        }
+        data
     }
 
     pub fn readable_len(&self, tuple: FourTuple) -> usize {
@@ -210,12 +279,10 @@ impl TcpEngine {
         // until an inbound frame / app call re-adds it.
         let active: Vec<FourTuple> = self.active.drain().collect();
 
-        // Phase 1: tick timers, drain events, reap fully-closed
-        // connections. The `tcb` borrow is scoped so the accept-queue /
-        // reap steps can touch other engine fields afterward.
+        // Phase 1: tick timers and drain events. Closed connections remain
+        // until phase 2 has serialized any final reset.
         for &tuple in &active {
             let mut established = false;
-            let closed;
             {
                 let Some(tcb) = self.connections.get_mut(&tuple) else {
                     continue;
@@ -225,19 +292,12 @@ impl TcpEngine {
                     established |= ev == Event::Established;
                     events.push((tuple, ev));
                 }
-                closed = tcb.is_closed();
             }
             if established && self.pending_accept.remove(&tuple) {
                 self.accept_queues
                     .entry(tuple.local_port)
                     .or_default()
                     .push_back(tuple);
-            }
-            // Keep TIME_WAIT (not `is_closed`) around; drop only fully
-            // closed connections.
-            if closed {
-                self.connections.remove(&tuple);
-                self.pending_accept.remove(&tuple);
             }
         }
 
@@ -250,6 +310,11 @@ impl TcpEngine {
         // the borrow checker sees the borrows don't overlap), and `active`
         // is a third disjoint field.
         let tx_offload = port.tx_cksum_offload();
+        let local_mss = port
+            .mtu()
+            .min(u32::from(pool.packet_capacity()).saturating_sub(eth::ETH_HDR_LEN as u32))
+            .saturating_sub((ipv4::IPV4_HDR_LEN + tcp::TCP_HDR_LEN) as u32)
+            .min(u16::MAX as u32) as u16;
         let connections = &mut self.connections;
         let config = &self.config;
         let arp_table = &self.arp_table;
@@ -258,8 +323,9 @@ impl TcpEngine {
         let active_set = &mut self.active;
         for &tuple in &active {
             let Some(tcb) = connections.get_mut(&tuple) else {
-                continue; // reaped in phase 1
+                continue;
             };
+            tcb.set_local_mss(local_mss);
             for seg in tcb.poll_output(now) {
                 if let Some(mbuf) = build_tcp_frame(
                     pool,
@@ -275,7 +341,10 @@ impl TcpEngine {
                     out_mbufs.push(mbuf);
                 }
             }
-            if tcb.has_pending_output() || tcb.has_armed_timer() {
+            if tcb.is_closed() {
+                connections.remove(&tuple);
+                self.pending_accept.remove(&tuple);
+            } else if tcb.has_pending_output() || tcb.has_armed_timer() {
                 active_set.insert(tuple);
             }
         }
@@ -416,10 +485,11 @@ impl TcpEngine {
         remote_ip: [u8; 4],
     ) {
         // A stray RST-worthy segment doesn't own retransmission/ARP
-        // queuing machinery the way a Tcb does; if the peer's MAC isn't
+        // queuing machinery the way a Tcb does; if the next hop's MAC isn't
         // known yet, just drop it -- RSTs are best-effort.
-        let Some(&remote_mac) = self.arp_table.get(&remote_ip) else {
-            self.request_arp(remote_ip);
+        let next_hop = self.config.next_hop(remote_ip);
+        let Some(&remote_mac) = self.arp_table.get(&next_hop) else {
+            self.request_arp(next_hop);
             return;
         };
         // RFC 9293 §3.10.7.1: if the incoming segment has ACK set, the
@@ -494,8 +564,9 @@ fn build_tcp_frame(
     seg: &OutSegment,
     tx_cksum_offload: bool,
 ) -> Option<Mbuf> {
-    let Some(&remote_mac) = arp_table.get(&tuple.remote_ip) else {
-        request_arp(arp_last_request, pending_arp_requests, tuple.remote_ip);
+    let next_hop = config.next_hop(tuple.remote_ip);
+    let Some(&remote_mac) = arp_table.get(&next_hop) else {
+        request_arp(arp_last_request, pending_arp_requests, next_hop);
         return None;
     };
     let hdr = tcb.to_header(seg);
@@ -608,4 +679,56 @@ fn build_arp_frame(
     arp_pkt.write(&mut buf[eth::ETH_HDR_LEN..]);
 
     Some(mbuf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(local: &str, gateway: Option<&str>) -> EngineConfig {
+        EngineConfig::from_cli([0; 6], local, gateway).unwrap()
+    }
+
+    #[test]
+    fn no_gateway_is_always_on_link() {
+        let c = cfg("10.0.1.25/24", None);
+        assert_eq!(c.gateway, None);
+        assert_eq!(c.next_hop([203, 0, 113, 10]), [203, 0, 113, 10]);
+    }
+
+    #[test]
+    fn off_subnet_goes_to_gateway() {
+        let c = cfg("10.0.1.25/24", Some("10.0.1.1"));
+        assert_eq!(c.local_ip, [10, 0, 1, 25]);
+        assert_eq!(c.next_hop([10, 0, 1, 99]), [10, 0, 1, 99]);
+        assert_eq!(c.next_hop([10, 0, 2, 99]), [10, 0, 1, 1]);
+        assert_eq!(c.next_hop([203, 0, 113, 10]), [10, 0, 1, 1]);
+    }
+
+    #[test]
+    fn prefix_edges() {
+        // No prefix with a gateway means /32: everything via the gateway.
+        let c = cfg("10.0.1.25", Some("10.0.1.1"));
+        assert_eq!(c.next_hop([10, 0, 1, 99]), [10, 0, 1, 1]);
+        assert_eq!(c.next_hop([10, 0, 1, 25]), [10, 0, 1, 25]);
+        // /0: everything on-link.
+        let c = cfg("10.0.1.25/0", Some("10.0.1.1"));
+        assert_eq!(c.next_hop([203, 0, 113, 10]), [203, 0, 113, 10]);
+        // Non-octet boundary: 10.0.0.0/20 covers 10.0.0.0-10.0.15.255.
+        let c = cfg("10.0.1.25/20", Some("10.0.0.1"));
+        assert_eq!(c.next_hop([10, 0, 15, 255]), [10, 0, 15, 255]);
+        assert_eq!(c.next_hop([10, 0, 16, 0]), [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn from_cli_rejects_bad_input() {
+        for (local, gw) in [
+            ("10.0.1.25/33", None),
+            ("10.0.1.25/x", None),
+            ("10.0.1", None),
+            ("10.0.1.25/24", Some("gw")),
+        ] {
+            assert!(EngineConfig::from_cli([0; 6], local, gw).is_err(), "{local} {gw:?}");
+        }
+    }
 }

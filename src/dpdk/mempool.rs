@@ -13,6 +13,7 @@ pub const DEFAULT_MBUF_DATA_ROOM_SIZE: u16 = 2048 + 128;
 
 pub struct Mempool {
     pub(super) raw: *mut ffi::rte_mempool,
+    data_room_size: u16,
 }
 
 // The pool is a thread-safe DPDK object (ring_mp_mc by default); the raw
@@ -57,11 +58,20 @@ impl Mempool {
         if raw.is_null() {
             return Err(MempoolCreateError);
         }
-        Ok(Self { raw })
+        Ok(Self {
+            raw,
+            data_room_size,
+        })
     }
 
     pub fn as_raw(&self) -> *mut ffi::rte_mempool {
         self.raw
+    }
+
+    /// Bytes available after the headroom of a freshly reset mbuf.
+    pub fn packet_capacity(&self) -> u16 {
+        self.data_room_size
+            .saturating_sub(ffi::RTE_PKTMBUF_HEADROOM as u16)
     }
 }
 

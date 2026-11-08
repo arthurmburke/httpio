@@ -70,6 +70,7 @@ pub struct Tcb {
     rcv_nxt: Seq,
 
     peer_mss: u16,
+    local_mss: u16,
 
     retransmit: RetransmitQueue,
     rto: RtoEstimator,
@@ -129,6 +130,7 @@ impl Tcb {
             irs: Seq::new(0),
             rcv_nxt: Seq::new(0),
             peer_mss: FALLBACK_PEER_MSS,
+            local_mss: DEFAULT_MSS,
             retransmit: RetransmitQueue::default(),
             rto: RtoEstimator::default(),
             congestion: CongestionControl::new(DEFAULT_MSS),
@@ -164,7 +166,7 @@ impl Tcb {
         let mut tcb = Self::new(tuple, TcpState::SynReceived);
         tcb.irs = peer_iss;
         tcb.rcv_nxt = peer_iss + 1;
-        tcb.peer_mss = peer_mss;
+        tcb.peer_mss = peer_mss.clamp(1, DEFAULT_MSS);
         tcb.snd_nxt = tcb.iss + 1;
         tcb.want_synack = true;
         tcb
@@ -182,6 +184,12 @@ impl Tcb {
 
     pub fn send(&mut self, data: Bytes) {
         self.send_buffer.push(data);
+    }
+
+    /// Bound segmentation by the local link and single-mbuf capacity.
+    /// The engine applies this before the first SYN and every output poll.
+    pub(crate) fn set_local_mss(&mut self, mss: u16) {
+        self.local_mss = mss.min(DEFAULT_MSS);
     }
 
     /// TCP_NODELAY. `true` disables Nagle's algorithm: sub-MSS segments
@@ -209,7 +217,13 @@ impl Tcb {
     }
 
     pub fn recv(&mut self, max_len: usize) -> Bytes {
-        self.recv_buffer.read(max_len)
+        let data = self.recv_buffer.read(max_len);
+        if !data.is_empty() && self.state.can_receive() {
+            // Advertise the newly available space without waiting for
+            // another peer packet (especially when its window is zero).
+            self.ack_pending = true;
+        }
+        data
     }
 
     pub fn readable_len(&self) -> usize {
@@ -304,7 +318,11 @@ impl Tcb {
         }
         self.irs = Seq::new(hdr.seq);
         self.rcv_nxt = self.irs + 1;
-        self.peer_mss = hdr.options.mss.unwrap_or(FALLBACK_PEER_MSS);
+        self.peer_mss = hdr
+            .options
+            .mss
+            .unwrap_or(FALLBACK_PEER_MSS)
+            .clamp(1, DEFAULT_MSS);
         self.congestion = CongestionControl::new(self.peer_mss);
 
         if hdr.has_flag(flags::ACK) {
@@ -327,6 +345,22 @@ impl Tcb {
     }
 
     fn on_segment_general(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
+        // A lost SYN-ACK causes the peer to repeat its original SYN.
+        // Reuse the outstanding SYN-ACK rather than enqueueing another
+        // retransmit entry or resetting an otherwise valid handshake.
+        if self.state == TcpState::SynReceived
+            && hdr.has_flag(flags::SYN)
+            && !hdr.has_flag(flags::ACK | flags::FIN)
+            && Seq::new(hdr.seq) == self.irs
+            && payload.is_empty()
+        {
+            if let Some(seg) = self.retransmit.segments.front_mut() {
+                seg.retransmitted = true;
+                seg.last_sent_at = now;
+                self.retransmit_now = true;
+            }
+            return;
+        }
         // The payload moves into the reassembly buffer below; keep its
         // length for the checks that need it afterward.
         let payload_len = payload.len() as u32;
@@ -497,6 +531,9 @@ impl Tcb {
     /// Drives retransmission timeouts and TIME_WAIT expiry. Call
     /// periodically (e.g. every main-loop iteration).
     pub fn tick(&mut self, now: Instant) {
+        if self.is_closed() {
+            return;
+        }
         if let Some(deadline) = self.time_wait_deadline
             && now >= deadline
         {
@@ -522,7 +559,9 @@ impl Tcb {
             if seg.retransmit_count > MAX_RETRANSMITS {
                 self.want_rst = true;
                 self.state = TcpState::Closed;
-                self.events.push(Event::Closed);
+                // An aborted connection must reach the worker's error
+                // path, including after the handshake has completed.
+                self.events.push(Event::Reset);
                 return;
             }
             self.retransmit_now = true;
@@ -543,11 +582,15 @@ impl Tcb {
             return out;
         }
 
+        if self.is_closed() {
+            return out;
+        }
+
         if self.want_syn {
             self.want_syn = false;
             self.retransmit
                 .push(self.iss, Bytes::new(), true, false, now);
-            out.push(self.make_segment(self.iss, flags::SYN, Bytes::new(), Some(DEFAULT_MSS)));
+            out.push(self.make_segment(self.iss, flags::SYN, Bytes::new(), Some(self.local_mss)));
             return out;
         }
 
@@ -559,7 +602,7 @@ impl Tcb {
                 self.iss,
                 flags::SYN | flags::ACK,
                 Bytes::new(),
-                Some(DEFAULT_MSS),
+                Some(self.local_mss),
             ));
             return out;
         }
@@ -584,7 +627,7 @@ impl Tcb {
                 if !matches!(self.state, TcpState::SynSent) {
                     seg_flags |= flags::ACK;
                 }
-                let mss = seg.syn.then_some(DEFAULT_MSS);
+                let mss = seg.syn.then_some(self.local_mss);
                 out.push(self.make_segment(seq, seg_flags, data, mss));
             }
         }
@@ -631,7 +674,7 @@ impl Tcb {
             if available == 0 || self.send_buffer.is_empty() {
                 break;
             }
-            let mss = self.peer_mss as usize;
+            let mss = self.peer_mss.min(self.local_mss) as usize;
             let chunk_len = (available as usize).min(mss).min(self.send_buffer.len());
             if chunk_len == 0 {
                 break;
@@ -708,7 +751,7 @@ impl Tcb {
         // so don't make a wakeup-hint-driven caller spin on it.
         let sendable_data = self.state.can_send()
             && !self.send_buffer.is_empty()
-            && (self.send_buffer.len() >= self.peer_mss as usize
+            && (self.send_buffer.len() >= self.peer_mss.min(self.local_mss) as usize
                 || self.flush_requested
                 || (!self.corked && self.nodelay)
                 || (!self.corked && self.flight_size() == 0));
@@ -772,6 +815,126 @@ mod tests {
         let _ack = tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::Established);
         tcb
+    }
+
+    #[test]
+    fn segmentation_respects_peer_and_local_limits() {
+        let now = Instant::now();
+        for peer_mss in [0, 536, 1460, 9000, u16::MAX] {
+            for local_mss in [512, 1460] {
+                for passive in [false, true] {
+                    let mut tcb = if passive {
+                        Tcb::new_from_listen(tuple(), Seq::new(1000), peer_mss)
+                    } else {
+                        Tcb::new_active(tuple())
+                    };
+                    tcb.set_local_mss(local_mss);
+                    assert_eq!(tcb.poll_output(now)[0].mss, Some(local_mss));
+                    let mut reply = header(
+                        Seq::new(if passive { 1001 } else { 1000 }),
+                        tcb.snd_nxt,
+                        if passive {
+                            flags::ACK
+                        } else {
+                            flags::SYN | flags::ACK
+                        },
+                        u16::MAX,
+                    );
+                    reply.options.mss = Some(peer_mss);
+                    tcb.on_segment(&reply, Bytes::new(), now);
+                    tcb.poll_output(now);
+                    tcb.set_nodelay(true);
+                    tcb.send(Bytes::from(vec![42; 9000]));
+                    let mut sent = 0;
+                    while sent < 9000 {
+                        let segments = tcb.poll_output(now);
+                        assert!(!segments.is_empty(), "sender stalled at {sent}");
+                        for seg in &segments {
+                            assert!(!seg.payload.is_empty());
+                            assert!(seg.payload.len() <= peer_mss.max(1).min(local_mss) as usize);
+                            sent += seg.payload.len();
+                        }
+                        let ack = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
+                        tcb.on_segment(&ack, Bytes::new(), now);
+                    }
+                    assert_eq!(sent, 9000);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reading_reopens_a_zero_window_without_a_peer_probe() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        for _ in 0..64 {
+            let hdr = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
+            tcb.on_segment(&hdr, Bytes::from(vec![42; 1024]), now);
+            tcb.poll_output(now);
+        }
+        assert_eq!(
+            tcb.make_segment(tcb.snd_nxt, flags::ACK, Bytes::new(), None)
+                .window,
+            0
+        );
+        assert!(!tcb.has_pending_output());
+        assert!(tcb.recv(0).is_empty());
+        assert!(!tcb.has_pending_output());
+        assert_eq!(tcb.recv(1024).len(), 1024);
+        let update = tcb.poll_output(now);
+        assert_eq!(update.len(), 1);
+        assert_eq!(update[0].flags, flags::ACK);
+        assert_eq!(update[0].window, 1024);
+        assert!(update[0].payload.is_empty());
+    }
+
+    #[test]
+    fn repeated_syn_retransmits_synack_and_can_complete_handshake() {
+        let now = Instant::now();
+        let mut tcb = Tcb::new_from_listen(tuple(), Seq::new(1000), 1460);
+        let original = tcb.poll_output(now).remove(0);
+        let mut syn = header(Seq::new(1000), Seq::new(0), flags::SYN, u16::MAX);
+        for extra_flags in [0, flags::ECE | flags::CWR, 0] {
+            syn.flags = flags::SYN | extra_flags;
+            tcb.on_segment(&syn, Bytes::new(), now);
+            assert_eq!(tcb.state, TcpState::SynReceived);
+            let resent = tcb.poll_output(now);
+            assert_eq!(resent.len(), 1);
+            assert_eq!(resent[0].flags, flags::SYN | flags::ACK);
+            assert_eq!(resent[0].seq, original.seq);
+            assert_eq!(resent[0].ack, original.ack);
+            assert_eq!(tcb.retransmit.segments.len(), 1);
+            assert!(tcb.events.is_empty());
+        }
+        let ack = header(Seq::new(1001), tcb.snd_nxt, flags::ACK, u16::MAX);
+        tcb.on_segment(&ack, Bytes::new(), now);
+        assert_eq!(tcb.state, TcpState::Established);
+        assert!(tcb.retransmit.is_empty());
+        assert_eq!(tcb.events, [Event::Established]);
+    }
+
+    #[test]
+    fn retransmission_exhaustion_reports_an_abort() {
+        for established in [false, true] {
+            let mut now = Instant::now();
+            let mut tcb = if established {
+                establish(now)
+            } else {
+                Tcb::new_active(tuple())
+            };
+            tcb.events.clear();
+            if established {
+                tcb.send(Bytes::from_static(b"unacknowledged"));
+            }
+            tcb.poll_output(now);
+            for _ in 0..=MAX_RETRANSMITS {
+                now += super::super::rto::MAX_RTO + Duration::from_secs(1);
+                tcb.tick(now);
+                tcb.poll_output(now);
+            }
+            assert_eq!(tcb.state, TcpState::Closed);
+            assert_eq!(tcb.events, [Event::Reset]);
+        }
     }
 
     #[test]

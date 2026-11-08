@@ -71,9 +71,20 @@ fn build_runtime_on(cpus: Vec<usize>) -> io::Result<tokio::runtime::Runtime> {
 
 /// The set of physical CPUs backing the enabled DPDK lcores.
 fn dpdk_lcore_cpus() -> BTreeSet<usize> {
-    CoreIterator::default()
-        .map(|core| core.id as usize)
-        .collect()
+    let mut cpus = BTreeSet::new();
+    for core in CoreIterator::default() {
+        // EAL permits one logical lcore to run on several physical CPUs.
+        // Both types are the target's cpu_set_t; transmute checks their
+        // sizes at compile time, and libc supplies the CPU_ISSET accessor.
+        let set: libc::cpu_set_t =
+            unsafe { mem::transmute(crate::dpdk::ffi::rte_lcore_cpuset(core.id)) };
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            if unsafe { libc::CPU_ISSET(cpu, &set) } {
+                cpus.insert(cpu);
+            }
+        }
+    }
+    cpus
 }
 
 /// The machine's online CPU ids, assumed numbered `0..n`.

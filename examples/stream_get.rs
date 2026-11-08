@@ -79,6 +79,7 @@ mod dpdk_app {
         let engine = TcpEngine::new(EngineConfig {
             local_mac: mac.addr_bytes,
             local_ip,
+            gateway: None,
         });
         let (worker, worker_join) =
             WorkerHandle::spawn(engine, port, pool, worker_lcore).expect("worker spawn failed");

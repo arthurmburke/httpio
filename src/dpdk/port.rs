@@ -29,6 +29,7 @@ fn check(what: &'static str, rc: i32) -> Result<(), PortError> {
 
 pub struct EthPort {
     port_id: u16,
+    mtu: u32,
     /// The NIC will compute IPv4 + TCP checksums on TX (both offloads were
     /// available and enabled), so the stack writes only the TCP
     /// pseudo-header checksum and leaves the IP checksum zero.
@@ -121,6 +122,7 @@ impl EthPort {
 
         Ok(Self {
             port_id,
+            mtu,
             tx_cksum_offload,
             rx_cksum_offload,
         })
@@ -188,6 +190,10 @@ impl EthPort {
 
     pub fn port_id(&self) -> u16 {
         self.port_id
+    }
+
+    pub fn mtu(&self) -> u32 {
+        self.mtu
     }
 }
 

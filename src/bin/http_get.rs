@@ -2,7 +2,11 @@
 //! status line and headers go to stderr (so the body pipes cleanly).
 //!
 //! Usage:
-//!   http_get <EAL args> -- <LOCAL_IP> <URL> [--ca <PEM>]... [--resolve HOST=IP]...
+//!   http_get <EAL args> -- <LOCAL_IP[/PREFIX]> <URL> [--ca <PEM>]... [--resolve HOST=IP]...
+//!       [--gateway IP]
+//!
+//! `--gateway` sends peers outside LOCAL_IP/PREFIX through that router
+//! (e.g. `10.0.1.25/24 --gateway 10.0.1.1` on an EC2 subnet).
 //!
 //! Example (in the devcontainer, kernel-visible tap interface):
 //!   http_get --no-huge --vdev=net_tap0,iface=dtap0 -- 10.9.0.1 \
@@ -53,7 +57,8 @@ mod dpdk_app {
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
     struct AppArgs {
-        local_ip: [u8; 4],
+        /// Local IP and route; `local_mac` is filled in once the port is up.
+        engine: EngineConfig,
         /// Fetched sequentially with one client, so requests to the same
         /// HTTP/2 origin multiplex over a single pooled connection.
         urls: Vec<String>,
@@ -75,8 +80,8 @@ mod dpdk_app {
             Err(msg) => {
                 eprintln!("error: {msg}");
                 eprintln!(
-                    "usage: http_get <EAL args> -- <LOCAL_IP> <URL>... [--ca <PEM>]... \
-                     [--resolve HOST=IP]... [--cork] [--nagle]"
+                    "usage: http_get <EAL args> -- <LOCAL_IP[/PREFIX]> <URL>... [--ca <PEM>]... \
+                     [--resolve HOST=IP]... [--gateway IP] [--cork] [--nagle]"
                 );
                 return ExitCode::FAILURE;
             }
@@ -119,7 +124,7 @@ mod dpdk_app {
 
         let engine = TcpEngine::new(EngineConfig {
             local_mac: mac.addr_bytes,
-            local_ip: app.local_ip,
+            ..app.engine
         });
 
         let (worker, worker_join) = match WorkerHandle::spawn(engine, port, pool, worker_lcore) {
@@ -229,6 +234,7 @@ mod dpdk_app {
         let mut ca_files = Vec::new();
         let mut resolves = Vec::new();
         let mut tcp_options = TcpOptions::default();
+        let mut gateway = None;
 
         let mut it = args.iter();
         while let Some(arg) = it.next() {
@@ -247,6 +253,9 @@ mod dpdk_app {
                         .map_err(|_| format!("invalid IPv4 address {ip:?}"))?;
                     resolves.push((host.to_string(), ip));
                 }
+                "--gateway" => {
+                    gateway = Some(it.next().ok_or("--gateway requires an IP")?.clone());
+                }
                 // TCP_CORK-style coalescing: hold sub-MSS tails until the
                 // protocol's flush points.
                 "--cork" => tcp_options.cork = true,
@@ -263,17 +272,11 @@ mod dpdk_app {
             return Err("expected at least one URL after LOCAL_IP".into());
         }
         Ok(AppArgs {
-            local_ip: parse_ipv4(local_ip)?,
+            engine: EngineConfig::from_cli([0; 6], local_ip, gateway.as_deref())?,
             urls: urls.to_vec(),
             ca_files,
             resolves,
             tcp_options,
         })
-    }
-
-    fn parse_ipv4(s: &str) -> Result<[u8; 4], String> {
-        s.parse::<std::net::Ipv4Addr>()
-            .map(|ip| ip.octets())
-            .map_err(|_| format!("invalid IPv4 address {s:?}"))
     }
 }

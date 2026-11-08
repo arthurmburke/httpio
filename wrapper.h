@@ -1,6 +1,11 @@
 #ifndef BYPIO_DPDK_WRAPPER_H
 #define BYPIO_DPDK_WRAPPER_H
 
+/* Expose cpu_set_t and rte_lcore_cpuset in both bindgen and C wrappers. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 /* Umbrella header bindgen parses to generate the DPDK FFI. Broadly
  * includes the DPDK subsystems this stack uses; the allowlist in build.rs
  * keeps the generated bindings to the `rte_*` surface. */

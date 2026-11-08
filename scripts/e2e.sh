@@ -7,6 +7,8 @@
 #   - python http.server            :8080  plain HTTP/1.1
 #   - python http.server + ssl      :8443  HTTPS, ALPN http/1.1
 #   - nghttpd                       :9443  HTTPS, ALPN h2
+#   - python http.server            10.8.0.2:8081, off-subnet (on lo), for
+#                                   the --gateway routing checks
 # TLS uses a freshly generated custom CA; the client must be told to
 # trust it via --ca, and resolves the cert's hostname via --resolve.
 #
@@ -32,6 +34,7 @@ cleanup() {
     kill "${SERVER_PIDS[@]}" 2>/dev/null || true
     kill $(jobs -p) 2>/dev/null || true
     ip link del dtap0 2>/dev/null || true
+    ip addr del 10.8.0.2/32 dev lo 2>/dev/null || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -58,6 +61,12 @@ recreate_tap() {
     ip tuntap add dev dtap0 mode tap multi_queue
     ip addr add 10.9.0.2/24 dev dtap0
     ip link set dtap0 up
+    # Off-subnet server address for the routing checks. arp_ignore=1 stops
+    # the kernel answering ARP for it on dtap0 (by default Linux answers for
+    # any local address on any interface). Needs a writable /proc/sys
+    # (privileged container); the routing checks are skipped without it.
+    ip addr replace 10.8.0.2/32 dev lo
+    sysctl -qw net.ipv4.conf.dtap0.arp_ignore=1 2>/dev/null || true
 }
 
 start_servers() {
@@ -78,6 +87,8 @@ httpd.serve_forever()
 PYEOF
     SERVER_PIDS+=($!)
     nghttpd -d "$WORK/docroot" -a 10.9.0.2 9443 "$WORK/server.key" "$WORK/server.pem" &
+    SERVER_PIDS+=($!)
+    (cd "$WORK/docroot" && exec python3 -m http.server --bind 10.8.0.2 --protocol HTTP/1.1 8081) &
     SERVER_PIDS+=($!)
     sleep 1
 }
@@ -123,6 +134,34 @@ check "HTTP/2 over TLS (custom CA)"   "HTTP/2.0 200" https://test.local:9443/hel
 check "HTTP/1.1 TLS corked"         "HTTP/1.1 200" https://test.local:8443/hello.txt "${TLS_ARGS[@]}" --cork
 check "HTTP/1.1 TLS corked + Nagle" "HTTP/1.1 200" https://test.local:8443/hello.txt "${TLS_ARGS[@]}" --cork --nagle
 check "HTTP/1.1 plaintext Nagle"    "HTTP/1.1 200" http://10.9.0.2:8080/hello.txt --nagle
+
+# Gateway routing: 10.8.0.2 is off the 10.9.0.0/24 subnet, reachable only
+# through the kernel (10.9.0.2) acting as the router. With dtap0's
+# arp_ignore=1 (see recreate_tap), a frame only gets there when the stack
+# addresses it to the gateway's MAC.
+fresh_net
+if [ "$(cat /proc/sys/net/ipv4/conf/dtap0/arp_ignore)" = 1 ]; then
+    RUN_ROUTED=("$BIN" -l 0-1 --no-huge --vdev=net_tap0,iface=dtap0 -- 10.9.0.1/24)
+    # Negative first: without --gateway the stack ARPs for 10.8.0.2 itself
+    # and never gets an answer, so the request must time out. (It must run
+    # before any connection to 10.8.0.2: a lingering kernel-side socket would
+    # ARP from 10.8.0.2 and teach the stack its MAC.)
+    if "${RUN_ROUTED[@]}" http://10.8.0.2:8081/hello.txt >/dev/null 2>"$WORK/unrouted_err"; then
+        echo "FAIL no-gateway: off-subnet request unexpectedly succeeded"
+        exit 1
+    fi
+    grep -q "timed out" "$WORK/unrouted_err" \
+        || { echo "FAIL no-gateway: unexpected error:"; cat "$WORK/unrouted_err"; exit 1; }
+    echo "PASS off-subnet peer unreachable without --gateway"
+
+    fresh_net
+    out=$("${RUN_ROUTED[@]}" http://10.8.0.2:8081/hello.txt --gateway 10.9.0.2 2>"$WORK/routed_err") \
+        || { echo "FAIL routed via gateway: client error"; cat "$WORK/routed_err"; exit 1; }
+    grep -q "hello from e2e" <<<"$out" || { echo "FAIL routed via gateway: bad body: $out"; exit 1; }
+    echo "PASS off-subnet peer via --gateway"
+else
+    echo "SKIP gateway routing checks (/proc/sys read-only; run the container with --privileged)"
+fi
 
 # HTTP/2 connection reuse: two requests to the same h2 origin in one
 # process must multiplex over a single pooled TCP connection.
