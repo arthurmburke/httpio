@@ -280,6 +280,7 @@ fn run(
     // rather than on every spin.
     let mut published_opened = 0u64;
 
+    let mut events = Vec::new();
     while !stop.load(Ordering::Acquire) {
         // 1. Register newly opened connections.
         while let Some(nc) = ctrl_rx.pop() {
@@ -324,8 +325,8 @@ fn run(
         }
 
         // 3. Pump the engine: rx burst, state machines, timers, tx burst.
-        let events = engine.poll(&port, &pool, Instant::now());
-        for (tuple, ev) in events {
+        engine.poll_into(&port, &pool, Instant::now(), &mut events);
+        for (tuple, ev) in events.drain(..) {
             let Some(conn) = conns.get_mut(&tuple) else {
                 continue;
             };

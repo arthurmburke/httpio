@@ -12,6 +12,7 @@
 //! server closes it (there is no idle timeout on our side). HTTP/1.1 has
 //! no such multiplexing handle and stays connection-per-request.
 
+use std::borrow::Cow;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -44,8 +45,16 @@ use super::stream::{FlushHandle, TcpOptions, TcpStream};
 /// `https` + ALPN produces an h2 connection), and corked requests never
 /// reach the pool (they force h1), so transport options aren't part of
 /// the key.
-type Origin = (String, u16);
-type H2Pool = Arc<AsyncMutex<HashMap<Origin, http2::SendRequest<Full<Bytes>>>>>;
+// Nested maps permit borrowed host lookups without constructing an origin key.
+type H2Pool = Arc<AsyncMutex<HashMap<String, HashMap<u16, http2::SendRequest<Full<Bytes>>>>>>;
+
+fn normalized_host(host: &str) -> Cow<'_, str> {
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(host)
+    }
+}
 
 pub mod builder {
     use std::net::Ipv4Addr;
@@ -259,8 +268,9 @@ impl Client {
             return Err(HttpError::CorkWithoutFlushHandle);
         }
 
-        let scheme = parts.uri.scheme_str().unwrap_or("http").to_string();
-        let host = parts.uri.host().ok_or(HttpError::MissingHost)?.to_string();
+        let uri = parts.uri.clone();
+        let scheme = uri.scheme_str().unwrap_or("http");
+        let host = normalized_host(uri.host().ok_or(HttpError::MissingHost)?);
         let port = parts
             .uri
             .port_u16()
@@ -273,8 +283,9 @@ impl Client {
                 let tcp = self
                     .dial(&host, port, tcp_options, flush_handle.as_ref())
                     .await?;
-                let server_name =
-                    ServerName::try_from(host.clone()).map_err(|_| HttpError::InvalidHost)?;
+                let server_name = ServerName::try_from(host.as_ref())
+                    .map_err(|_| HttpError::InvalidHost)?
+                    .to_owned();
                 let mut tls = self
                     .tls_h1
                     .connect(server_name, tcp)
@@ -293,8 +304,9 @@ impl Client {
             let tcp = self
                 .dial(&host, port, tcp_options, flush_handle.as_ref())
                 .await?;
-            let server_name =
-                ServerName::try_from(host.clone()).map_err(|_| HttpError::InvalidHost)?;
+            let server_name = ServerName::try_from(host.as_ref())
+                .map_err(|_| HttpError::InvalidHost)?
+                .to_owned();
             let tls = self
                 .tls
                 .connect(server_name, tcp)
@@ -310,7 +322,9 @@ impl Client {
                 self.h2_pool
                     .lock()
                     .await
-                    .insert((host.to_ascii_lowercase(), port), send_request.clone());
+                    .entry(host.into_owned())
+                    .or_default()
+                    .insert(port, send_request.clone());
                 send_h2_on(send_request, parts, body).await
             } else {
                 send_h1(tls, parts, Full::new(body), &host, port, &scheme).await
@@ -348,8 +362,9 @@ impl Client {
             return Err(HttpError::CorkWithoutFlushHandle);
         }
 
-        let scheme = parts.uri.scheme_str().unwrap_or("http").to_string();
-        let host = parts.uri.host().ok_or(HttpError::MissingHost)?.to_string();
+        let uri = parts.uri.clone();
+        let scheme = uri.scheme_str().unwrap_or("http");
+        let host = normalized_host(uri.host().ok_or(HttpError::MissingHost)?);
         let port = parts
             .uri
             .port_u16()
@@ -366,8 +381,9 @@ impl Client {
             .dial(&host, port, tcp_options, flush_handle.as_ref())
             .await?;
         if scheme == "https" {
-            let server_name =
-                ServerName::try_from(host.clone()).map_err(|_| HttpError::InvalidHost)?;
+            let server_name = ServerName::try_from(host.as_ref())
+                .map_err(|_| HttpError::InvalidHost)?
+                .to_owned();
             let mut tls = self
                 .tls_h1
                 .connect(server_name, tcp)
@@ -412,9 +428,10 @@ impl Client {
             cork: false,
         };
 
-        let scheme = parts.uri.scheme_str().unwrap_or("ws").to_ascii_lowercase();
-        let tls = matches!(scheme.as_str(), "wss" | "https");
-        let host = parts.uri.host().ok_or(HttpError::MissingHost)?.to_string();
+        let uri = parts.uri.clone();
+        let scheme = uri.scheme_str().unwrap_or("ws");
+        let tls = scheme.eq_ignore_ascii_case("wss") || scheme.eq_ignore_ascii_case("https");
+        let host = normalized_host(uri.host().ok_or(HttpError::MissingHost)?);
         let default_port = if tls { 443 } else { 80 };
         let port = parts.uri.port_u16().unwrap_or(default_port);
 
@@ -423,8 +440,9 @@ impl Client {
 
         let tcp = self.dial(&host, port, tcp_options, None).await?;
         if tls {
-            let server_name =
-                ServerName::try_from(host.clone()).map_err(|_| HttpError::InvalidHost)?;
+            let server_name = ServerName::try_from(host.as_ref())
+                .map_err(|_| HttpError::InvalidHost)?
+                .to_owned();
             let tls_stream = self
                 .tls_h1
                 .connect(server_name, tcp)
@@ -461,11 +479,14 @@ impl Client {
     /// if the underlying connection is still alive and ready to accept a
     /// new stream; evicts dead entries.
     async fn pooled_h2(&self, host: &str, port: u16) -> Option<http2::SendRequest<Full<Bytes>>> {
-        let key = (host.to_ascii_lowercase(), port);
         let mut pool = self.h2_pool.lock().await;
-        let send_request = pool.get_mut(&key)?;
+        let ports = pool.get_mut(host)?;
+        let send_request = ports.get_mut(&port)?;
         if send_request.is_closed() || send_request.ready().await.is_err() {
-            pool.remove(&key);
+            ports.remove(&port);
+            if ports.is_empty() {
+                pool.remove(host);
+            }
             return None;
         }
         Some(send_request.clone())
@@ -476,7 +497,7 @@ impl Client {
             return Ok(ip);
         }
         self.resolve
-            .get(&host.to_ascii_lowercase())
+            .get(host)
             .copied()
             .ok_or(HttpError::UnresolvedHost)
     }
@@ -524,14 +545,12 @@ fn rewrite_to_origin_form(
     parts.version = Version::HTTP_11;
     if !parts.headers.contains_key(header::HOST) {
         let host_value = if port == default_port {
-            host.to_string()
+            HeaderValue::from_str(host)
         } else {
-            format!("{host}:{port}")
-        };
-        parts.headers.insert(
-            header::HOST,
-            HeaderValue::try_from(host_value).map_err(|_| HttpError::InvalidHost)?,
-        );
+            HeaderValue::try_from(format!("{host}:{port}"))
+        }
+        .map_err(|_| HttpError::InvalidHost)?;
+        parts.headers.insert(header::HOST, host_value);
     }
     Ok(())
 }
@@ -625,4 +644,18 @@ async fn send_h2_on(
         .send_request(request)
         .await
         .map_err(|_| HttpError::Protocol)
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    #[test]
+    fn canonical_hosts_are_borrowed_and_mixed_case_is_normalized() {
+        let host = "example.com";
+        let normalized = normalized_host(host);
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+        assert_eq!(normalized.as_ptr(), host.as_ptr());
+        assert_eq!(normalized_host("ExAmPlE.COM"), "example.com");
+        assert_eq!(normalized_host("127.0.0.1"), "127.0.0.1");
+    }
 }

@@ -1,5 +1,10 @@
 #![cfg(dpdk)]
 
+#[path = "support/allocations.rs"]
+mod allocations;
+#[global_allocator]
+static ALLOCATOR: allocations::CountingAllocator = allocations::CountingAllocator;
+use allocations::count_allocations;
 use bytes::Bytes;
 use httpio::dpdk::{
     EthPort, Mbuf, Mempool, eal,
@@ -93,8 +98,55 @@ fn engine_transmits_window_updates_and_final_reset() {
     .unwrap();
     {
         let pool =
-            Mempool::create("engine-test", 1023, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+            Mempool::create("engine-test", 4095, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
         let port = EthPort::init(0, &pool, 128, 128, 1500, 0).unwrap();
+        // Partial transmission must retain the unsent suffix and free all
+        // received/abandoned buffers, without allocating batch storage.
+        let available = unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) };
+        let mut batch: Vec<_> = (0..2048u16)
+            .map(|id| {
+                let mut packet = Mbuf::alloc(&pool).unwrap();
+                packet.append(2).unwrap().copy_from_slice(&id.to_be_bytes());
+                packet
+            })
+            .collect();
+        let capacity = batch.capacity();
+        let (_, count) = count_allocations(|| port.tx_burst_in_place(&mut batch));
+        assert_eq!(count, 0);
+        assert!(!batch.is_empty(), "expected virtual ring backpressure");
+        let sent = 2048 - batch.len();
+        assert!(sent > 0);
+        assert_eq!(batch.capacity(), capacity);
+        assert_eq!(batch[0].data(), &(sent as u16).to_be_bytes());
+        let (_, count) = count_allocations(|| {
+            let mut received = 0;
+            while received < sent {
+                let packets = port.rx_packets(64);
+                assert!(packets.len() > 0);
+                for packet in packets {
+                    assert_eq!(packet.data(), &(received as u16).to_be_bytes());
+                    received += 1;
+                }
+            }
+        });
+        assert_eq!(count, 0);
+        batch.clear();
+        assert_eq!(
+            unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },
+            available
+        );
+        for _ in 0..4 {
+            batch.push(Mbuf::alloc(&pool).unwrap());
+        }
+        port.tx_burst_in_place(&mut batch);
+        let mut packets = port.rx_packets(64);
+        drop(packets.next());
+        drop(packets); // Drop the unconsumed suffix too.
+        assert_eq!(
+            unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },
+            available
+        );
+
         let mut engine = TcpEngine::new(EngineConfig {
             local_ip: LOCAL_IP,
             local_mac: LOCAL_MAC,
@@ -138,6 +190,20 @@ fn engine_transmits_window_updates_and_final_reset() {
             peer.seq += 1024;
             assert_eq!(ack.ack, peer.seq);
         }
+        // Pure ACKs and rejected payloads must not allocate Bytes owners.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            inject_tcp(&port, &pool, &peer, &[]);
+            let (_, count) = count_allocations(|| engine.poll_into(&port, &pool, now, &mut events));
+            assert_eq!(count, 0, "control packet allocated");
+        }
+        let mut invalid = peer.clone();
+        invalid.seq = peer.seq.wrapping_add(1_000_000);
+        inject_tcp(&port, &pool, &invalid, b"outside receive window");
+        let (_, count) = count_allocations(|| engine.poll_into(&port, &pool, now, &mut events));
+        assert_eq!(count, 0, "rejected payload allocated");
+        output(&port);
+
         // An otherwise idle TCB must be reactivated by an application read.
         assert_eq!(engine.recv(tuple, 1024).len(), 1024);
         engine.poll(&port, &pool, now);

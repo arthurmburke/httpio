@@ -12,7 +12,7 @@ use super::rto::{MAX_RETRANSMITS, RetransmitQueue, RtoEstimator};
 use super::rx_queue::ReassemblyBuffer;
 use super::seq::Seq;
 use super::state::TcpState;
-use super::tx_queue::SendBuffer;
+use super::tx_queue::{Payload, SendBuffer};
 
 pub const DEFAULT_MSS: u16 = 1460;
 /// RFC 9293 §3.7.1: the default MSS to assume for a peer that didn't send
@@ -39,7 +39,7 @@ pub struct OutSegment {
     pub ack: Seq,
     pub flags: u8,
     pub window: u16,
-    pub payload: Bytes,
+    pub payload: Payload,
     pub mss: Option<u16>,
 }
 
@@ -253,6 +253,17 @@ impl Tcb {
     /// [`Mbuf::into_bytes`](crate::dpdk::Mbuf::into_bytes)); if accepted it
     /// moves into the reassembly buffer without being copied.
     pub fn on_segment(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
+        self.on_segment_with(hdr, payload.len(), || payload, now);
+    }
+
+    /// Materialize payload ownership only after TCP accepts the segment.
+    pub(crate) fn on_segment_with(
+        &mut self,
+        hdr: &TcpHeader,
+        payload_len: usize,
+        payload: impl FnOnce() -> Bytes,
+        now: Instant,
+    ) {
         if hdr.has_flag(flags::RST) {
             if self.reset_is_acceptable(hdr) {
                 self.on_reset();
@@ -262,7 +273,7 @@ impl Tcb {
 
         match self.state {
             TcpState::SynSent => self.on_segment_syn_sent(hdr, now),
-            _ => self.on_segment_general(hdr, payload, now),
+            _ => self.on_segment_general(hdr, payload_len as u32, payload, now),
         }
     }
 
@@ -344,7 +355,13 @@ impl Tcb {
         }
     }
 
-    fn on_segment_general(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
+    fn on_segment_general(
+        &mut self,
+        hdr: &TcpHeader,
+        payload_len: u32,
+        payload: impl FnOnce() -> Bytes,
+        now: Instant,
+    ) {
         // A lost SYN-ACK causes the peer to repeat its original SYN.
         // Reuse the outstanding SYN-ACK rather than enqueueing another
         // retransmit entry or resetting an otherwise valid handshake.
@@ -352,7 +369,7 @@ impl Tcb {
             && hdr.has_flag(flags::SYN)
             && !hdr.has_flag(flags::ACK | flags::FIN)
             && Seq::new(hdr.seq) == self.irs
-            && payload.is_empty()
+            && payload_len == 0
         {
             if let Some(seg) = self.retransmit.segments.front_mut() {
                 seg.retransmitted = true;
@@ -361,9 +378,6 @@ impl Tcb {
             }
             return;
         }
-        // The payload moves into the reassembly buffer below; keep its
-        // length for the checks that need it afterward.
-        let payload_len = payload.len() as u32;
         // RFC 9293 §3.10.7.4 step 1: drop segments outside the receive
         // window entirely (for SynReceived/Listen-derived TCBs the window
         // isn't open yet, so any incoming SYN retransmit / stray segment
@@ -402,9 +416,9 @@ impl Tcb {
             return; // RFC 9293 §3.10.7.4 step 5: no ACK -> drop.
         }
 
-        if self.state.can_receive() && !payload.is_empty() {
+        if self.state.can_receive() && payload_len != 0 {
             let seq = Seq::new(hdr.seq);
-            let new_rcv_nxt = self.recv_buffer.insert(seq, payload, self.rcv_nxt);
+            let new_rcv_nxt = self.recv_buffer.insert(seq, payload(), self.rcv_nxt);
             if new_rcv_nxt != self.rcv_nxt {
                 self.rcv_nxt = new_rcv_nxt;
             }
@@ -572,18 +586,25 @@ impl Tcb {
 
     /// Gathers every segment that should go out right now: handshake
     /// control segments, retransmits, new data (bounded by cwnd/rwnd),
-    /// FIN, and standalone ACKs.
+    /// FIN, and standalone ACKs. Use `poll_output_into` to reuse storage.
     pub fn poll_output(&mut self, now: Instant) -> Vec<OutSegment> {
         let mut out = Vec::new();
+        self.poll_output_into(now, &mut out);
+        out
+    }
+
+    /// Writes into reusable caller storage, retaining its capacity.
+    pub fn poll_output_into(&mut self, now: Instant, out: &mut Vec<OutSegment>) {
+        out.clear();
 
         if self.want_rst {
             self.want_rst = false;
             out.push(self.make_segment(self.snd_nxt, flags::RST, Bytes::new(), None));
-            return out;
+            return;
         }
 
         if self.is_closed() {
-            return out;
+            return;
         }
 
         if self.want_syn {
@@ -591,7 +612,7 @@ impl Tcb {
             self.retransmit
                 .push(self.iss, Bytes::new(), true, false, now);
             out.push(self.make_segment(self.iss, flags::SYN, Bytes::new(), Some(self.local_mss)));
-            return out;
+            return;
         }
 
         if self.want_synack {
@@ -604,7 +625,7 @@ impl Tcb {
                 Bytes::new(),
                 Some(self.local_mss),
             ));
-            return out;
+            return;
         }
 
         // Retransmit: `on_rto` (called from `tick`) sets this when the
@@ -633,7 +654,7 @@ impl Tcb {
         }
 
         if self.state.can_send() {
-            self.send_new_data(now, &mut out);
+            self.send_new_data(now, out);
         }
 
         if self.close_requested
@@ -662,8 +683,6 @@ impl Tcb {
             self.ack_pending = false;
             out.push(self.make_segment(self.snd_nxt, flags::ACK, Bytes::new(), None));
         }
-
-        out
     }
 
     fn send_new_data(&mut self, now: Instant, out: &mut Vec<OutSegment>) {
@@ -716,7 +735,13 @@ impl Tcb {
         }
     }
 
-    fn make_segment(&self, seq: Seq, flags: u8, payload: Bytes, mss: Option<u16>) -> OutSegment {
+    fn make_segment(
+        &self,
+        seq: Seq,
+        flags: u8,
+        payload: impl Into<Payload>,
+        mss: Option<u16>,
+    ) -> OutSegment {
         let window = RECV_BUFFER_CAPACITY
             .saturating_sub(self.recv_buffer.readable_len() as u32)
             .min(u16::MAX as u32) as u16;
@@ -725,7 +750,7 @@ impl Tcb {
             ack: self.rcv_nxt,
             flags,
             window,
-            payload,
+            payload: payload.into(),
             mss,
         }
     }

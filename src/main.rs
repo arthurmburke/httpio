@@ -107,10 +107,11 @@ mod dpdk_app {
         // Run-to-completion poll loop, the standard DPDK pattern: no blocking
         // I/O anywhere in this loop. In production this lcore would be
         // isolated/pinned (`-l` EAL arg) so nothing else preempts it.
+        let mut events = Vec::new();
         loop {
             let now = Instant::now();
-            let events = engine.poll(&port, &pool, now);
-            for (tuple, event) in events {
+            engine.poll_into(&port, &pool, now, &mut events);
+            for (tuple, event) in events.drain(..) {
                 println!("{tuple:?}: {event:?}");
             }
 

@@ -150,42 +150,51 @@ impl EthPort {
         Ok(addr)
     }
 
-    /// Polls up to `rx_pkts.len()` received packets into the given buffer,
-    /// returning the mbufs actually received (never blocks).
+    /// Collects up to `max` packets (at most 64) into an owned vector.
+    /// Use `rx_packets` to avoid the collection allocation on hot paths.
     pub fn rx_burst(&self, max: usize) -> Vec<Mbuf> {
-        const MAX_BURST: usize = 64;
-        let n = max.min(MAX_BURST);
-        let mut raw: [*mut ffi::rte_mbuf; MAX_BURST] = [ptr::null_mut(); MAX_BURST];
-        let received =
-            unsafe { ffi::rte_eth_rx_burst(self.port_id, 0, raw.as_mut_ptr(), n as u16) };
-        raw[..received as usize]
-            .iter()
-            .map(|&p| unsafe { Mbuf::from_raw(p) })
-            .collect()
+        self.rx_packets(max).collect()
     }
 
-    /// Hands a batch of mbufs to the NIC for transmission. Ownership of
-    /// each mbuf transfers to the driver, which frees it once sent; any
-    /// mbufs the NIC couldn't queue this call are returned to the caller.
-    pub fn tx_burst(&self, mbufs: Vec<Mbuf>) -> Vec<Mbuf> {
-        let raw_ptrs: Vec<*mut ffi::rte_mbuf> = mbufs.into_iter().map(Mbuf::into_raw).collect();
-        let mut raw_ptrs = raw_ptrs;
-        let sent = unsafe {
-            ffi::rte_eth_tx_burst(
-                self.port_id,
-                0,
-                raw_ptrs.as_mut_ptr(),
-                raw_ptrs.len() as u16,
-            )
-        };
-        // Anything beyond `sent` was not accepted by the driver and is
-        // still owned by us; reclaim those as Mbufs so they get freed (or
-        // can be retried) instead of leaking.
-        raw_ptrs
-            .split_off(sent as usize)
-            .into_iter()
-            .map(|p| unsafe { Mbuf::from_raw(p) })
-            .collect()
+    /// Allocation-free RX batch. Unconsumed packets are freed on drop.
+    pub fn rx_packets(&self, max: usize) -> impl ExactSizeIterator<Item = Mbuf> {
+        let mut packets: [Option<Mbuf>; 64] = std::array::from_fn(|_| None);
+        let mut raw = [ptr::null_mut(); 64];
+        let received =
+            unsafe { ffi::rte_eth_rx_burst(self.port_id, 0, raw.as_mut_ptr(), max.min(64) as u16) }
+                as usize;
+        for i in 0..received {
+            packets[i] = Some(unsafe { Mbuf::from_raw(raw[i]) });
+        }
+        packets.into_iter().take(received).map(Option::unwrap)
+    }
+
+    /// Transmits a batch, returning packets the driver did not accept.
+    pub fn tx_burst(&self, mut mbufs: Vec<Mbuf>) -> Vec<Mbuf> {
+        self.tx_burst_in_place(&mut mbufs);
+        mbufs
+    }
+
+    /// Keeps the caller's allocation; removes only packets owned by the NIC.
+    pub fn tx_burst_in_place(&self, mbufs: &mut Vec<Mbuf>) {
+        let mut accepted = 0;
+        while accepted < mbufs.len() {
+            let n = (mbufs.len() - accepted).min(64);
+            let mut raw = [ptr::null_mut(); 64];
+            for (dst, packet) in raw.iter_mut().zip(&mbufs[accepted..accepted + n]) {
+                *dst = packet.as_raw();
+            }
+            let sent = unsafe { ffi::rte_eth_tx_burst(self.port_id, 0, raw.as_mut_ptr(), n as u16) }
+                as usize;
+            accepted += sent;
+            if sent < n {
+                break;
+            }
+        }
+        for packet in mbufs.drain(..accepted) {
+            // The NIC owns these packets now; do not run Mbuf::drop.
+            std::mem::forget(packet);
+        }
     }
 
     pub fn port_id(&self) -> u16 {

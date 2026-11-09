@@ -351,10 +351,12 @@ fn resolve(content_type: Option<&HeaderValue>) -> Result<ContentType, CodecError
 /// Moves `value` into type `T` when the caller has already verified (via
 /// [`TypeId`]) that its concrete type is `T` -- a safe `Any` downcast.
 fn coerce<T: 'static>(value: impl Any) -> T {
-    match (Box::new(value) as Box<dyn Any>).downcast::<T>() {
-        Ok(boxed) => *boxed,
-        Err(_) => unreachable!("caller verified TypeId equality"),
-    }
+    let mut value = Some(value);
+    (&mut value as &mut dyn Any)
+        .downcast_mut::<Option<T>>()
+        .expect("caller verified TypeId equality")
+        .take()
+        .unwrap()
 }
 
 #[cfg(test)]

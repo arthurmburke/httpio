@@ -336,6 +336,13 @@ impl AsyncWrite for TcpStream {
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
+        // Only this producer can consume free slots. The consumer can
+        // only make more room, so no payload copy is needed on a full ring.
+        if this.cmd_tx.len() == this.cmd_tx.capacity() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
         // One command carries the whole write; the engine's send buffer is
         // unbounded, so backpressure is only the command ring being full.
         match this

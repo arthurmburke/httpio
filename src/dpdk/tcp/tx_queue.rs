@@ -4,12 +4,12 @@
 //!
 //! Data is held as a queue of `Bytes` chunks (one per application write)
 //! rather than a `VecDeque<u8>`, so buffering a write is a move and
-//! forming a segment is usually an O(1) refcounted split rather than a
-//! byte-by-byte copy.
+//! forming a segment retains shared slices rather than copying payloads.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
 
 #[derive(Default)]
 pub struct SendBuffer {
@@ -34,43 +34,97 @@ impl SendBuffer {
         self.len == 0
     }
 
-    /// Removes up to `max_len` bytes from the front of the buffer to form
-    /// the next outgoing segment. The common case (the front chunk alone
-    /// covers the segment) is a zero-copy `Bytes::split_to`; only when a
-    /// segment must span multiple queued writes is a coalescing copy
-    /// taken, which keeps segments packed toward the MSS.
-    pub fn take(&mut self, max_len: usize) -> Bytes {
-        let n = max_len.min(self.len);
-        if n == 0 {
-            return Bytes::new();
-        }
-        self.len -= n;
-
-        // Fast path: the entire segment comes from the front chunk.
-        let front = self.chunks.front_mut().expect("len > 0 implies a chunk");
-        if front.len() > n {
-            return front.split_to(n);
-        }
-        if front.len() == n {
-            return self.chunks.pop_front().unwrap();
-        }
-
-        // Slow path: coalesce successive chunks up to `n` bytes.
-        let mut out = BytesMut::with_capacity(n);
-        while out.len() < n {
-            let need = n - out.len();
-            let chunk = self
-                .chunks
-                .front_mut()
-                .expect("accounting keeps chunks in sync");
-            if chunk.len() <= need {
-                out.extend_from_slice(chunk);
-                self.chunks.pop_front();
+    /// Removes up to max_len bytes as shared slices, without coalescing.
+    /// Common fragment lists fit inline; overflow stores only shared metadata.
+    pub fn take(&mut self, max_len: usize) -> Payload {
+        let mut out = Payload::default();
+        let mut remaining = max_len.min(self.len);
+        let mut overflow = Vec::new();
+        while remaining > 0 {
+            let front = self.chunks.front_mut().unwrap();
+            let n = remaining.min(front.len());
+            let chunk = if n == front.len() {
+                self.chunks.pop_front().unwrap()
             } else {
-                out.extend_from_slice(&chunk[..need]);
-                chunk.advance(need);
+                front.split_to(n)
+            };
+            if out.count < INLINE_FRAGMENTS {
+                out.chunks[out.count] = chunk;
+                out.count += 1;
+            } else {
+                overflow.push(chunk);
             }
+            out.len += n;
+            self.len -= n;
+            remaining -= n;
         }
-        out.freeze()
+        if !overflow.is_empty() {
+            out.overflow = Some(overflow.into());
+        }
+        out
+    }
+}
+
+const INLINE_FRAGMENTS: usize = 8;
+
+/// Shared payload slices retained for transmission and retransmission.
+/// Eight fragments fit inline; unusually fragmented segments share a
+/// metadata allocation without copying payload bytes or shortening packets.
+#[derive(Clone, Debug)]
+pub struct Payload {
+    chunks: [Bytes; INLINE_FRAGMENTS],
+    count: usize,
+    overflow: Option<Arc<[Bytes]>>,
+    len: usize,
+}
+
+impl Default for Payload {
+    fn default() -> Self {
+        Self {
+            chunks: std::array::from_fn(|_| Bytes::new()),
+            count: 0,
+            overflow: None,
+            len: 0,
+        }
+    }
+}
+
+impl From<Bytes> for Payload {
+    fn from(bytes: Bytes) -> Self {
+        let mut out = Self::default();
+        if !bytes.is_empty() {
+            out.len = bytes.len();
+            out.count = 1;
+            out.chunks[0] = bytes;
+        }
+        out
+    }
+}
+
+impl Payload {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn chunks(&self) -> impl Iterator<Item = &Bytes> {
+        self.chunks[..self.count]
+            .iter()
+            .chain(self.overflow.as_deref().unwrap_or(&[]).iter())
+    }
+    pub fn copy_to(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), self.len);
+        let mut offset = 0;
+        for chunk in self.chunks() {
+            out[offset..offset + chunk.len()].copy_from_slice(chunk);
+            offset += chunk.len();
+        }
+    }
+}
+
+impl PartialEq<[u8]> for Payload {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.len == other.len() && self.chunks().flat_map(|b| b.iter()).eq(other.iter())
     }
 }

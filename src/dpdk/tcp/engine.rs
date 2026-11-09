@@ -22,6 +22,7 @@ use crate::dpdk::{EthPort, Mbuf, Mempool};
 use super::seq::Seq;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple, OutSegment, Tcb};
+use super::tx_queue::Payload;
 
 const ARP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_RX_BURST: usize = 64;
@@ -116,6 +117,11 @@ pub struct TcpEngine {
     /// an inbound frame or an app call can make it need work -- and both
     /// re-insert it here (see `mark_active`).
     active: HashSet<FourTuple>,
+    /// Scratch set for both poll phases; empty between polls. Swapping
+    /// with `active` and clearing afterward retains both allocations.
+    processing: HashSet<FourTuple>,
+    tx_batch: Vec<Mbuf>,
+    segments: Vec<OutSegment>,
 
     arp_table: HashMap<[u8; 4], [u8; 6]>,
     arp_last_request: HashMap<[u8; 4], Instant>,
@@ -142,6 +148,9 @@ impl TcpEngine {
             pending_arp_requests: Vec::new(),
             pending_raw_resets: Vec::new(),
             active: HashSet::default(),
+            processing: HashSet::default(),
+            tx_batch: Vec::new(),
+            segments: Vec::new(),
         }
     }
 
@@ -248,14 +257,29 @@ impl TcpEngine {
     /// One iteration of the poll loop: drains received frames, ticks
     /// every connection's timers, and transmits whatever each connection
     /// (or the ARP layer) now has pending. Returns state-change events
-    /// the socket layer may care about.
+    /// the socket layer may care about. This convenience method returns a
+    /// fresh vector; use `poll_into` to retain event storage across polls.
     pub fn poll(
         &mut self,
         port: &EthPort,
         pool: &Mempool,
         now: Instant,
     ) -> Vec<(FourTuple, Event)> {
-        for mbuf in port.rx_burst(MAX_RX_BURST) {
+        let mut events = Vec::new();
+        self.poll_into(port, pool, now, &mut events);
+        events
+    }
+
+    /// Polls with reusable event storage; the worker uses this hot path.
+    pub fn poll_into(
+        &mut self,
+        port: &EthPort,
+        pool: &Mempool,
+        now: Instant,
+        events: &mut Vec<(FourTuple, Event)>,
+    ) {
+        events.clear();
+        for mbuf in port.rx_packets(MAX_RX_BURST) {
             // RX checksum offload: if the NIC checked a checksum and it was
             // wrong, drop the frame; if it verified one as good, skip the
             // corresponding software check. When RX offload is off the
@@ -265,27 +289,20 @@ impl TcpEngine {
             }
             let ip_ok = mbuf.rx_ip_cksum_good();
             let l4_ok = mbuf.rx_l4_cksum_good();
-            // Zero-copy RX: the frame becomes a `Bytes` that owns the mbuf,
-            // so a data segment's payload is delivered to the application as
-            // a refcounted slice of it -- never copied. The mbuf is freed
-            // when the last reference (possibly on the app thread) drops.
-            let frame = mbuf.into_bytes();
-            self.handle_frame(&frame, ip_ok, l4_ok, now);
+            self.handle_frame(mbuf, ip_ok, l4_ok, now);
         }
 
-        let mut events = Vec::new();
-        let mut out_mbufs = Vec::new();
+        let mut out_mbufs = std::mem::take(&mut self.tx_batch);
 
         // Process only the connections that need attention this poll.
-        // `drain` empties the set; each connection re-inserts itself in
-        // phase 2 if it still has pending output or an armed timer, so an
-        // idle connection is dropped from the set and not walked again
-        // until an inbound frame / app call re-adds it.
-        let active: Vec<FourTuple> = self.active.drain().collect();
+        // Swap into retained scratch storage. Both phases visit the same
+        // tuples; phase 2 re-inserts those needing another poll into the
+        // now-empty active set. Neither set's allocation is discarded.
+        std::mem::swap(&mut self.active, &mut self.processing);
 
         // Phase 1: tick timers and drain events. Closed connections remain
         // until phase 2 has serialized any final reset.
-        for &tuple in &active {
+        for &tuple in &self.processing {
             let mut established = false;
             {
                 let Some(tcb) = self.connections.get_mut(&tuple) else {
@@ -325,12 +342,13 @@ impl TcpEngine {
         let arp_last_request = &mut self.arp_last_request;
         let pending_arp_requests = &mut self.pending_arp_requests;
         let active_set = &mut self.active;
-        for &tuple in &active {
+        for &tuple in &self.processing {
             let Some(tcb) = connections.get_mut(&tuple) else {
                 continue;
             };
             tcb.set_local_mss(local_mss);
-            for seg in tcb.poll_output(now) {
+            tcb.poll_output_into(now, &mut self.segments);
+            for seg in self.segments.drain(..) {
                 if let Some(mbuf) = build_tcp_frame(
                     pool,
                     config,
@@ -352,6 +370,8 @@ impl TcpEngine {
                 active_set.insert(tuple);
             }
         }
+        self.processing.clear();
+
         for (dst_mac, dst_ip) in self.pending_arp_replies.drain(..) {
             if let Some(mbuf) = build_arp_frame(
                 pool,
@@ -384,7 +404,7 @@ impl TcpEngine {
                 self.config.local_ip,
                 dst_ip,
                 &hdr,
-                &[],
+                &Payload::default(),
                 tx_offload,
             ) {
                 out_mbufs.push(mbuf);
@@ -392,24 +412,26 @@ impl TcpEngine {
         }
 
         if !out_mbufs.is_empty() {
-            port.tx_burst(out_mbufs);
+            port.tx_burst_in_place(&mut out_mbufs);
         }
-
-        events
+        // Unsent packets are dropped as before, but storage stays warm.
+        out_mbufs.clear();
+        self.tx_batch = out_mbufs;
     }
 
     /// `ip_ok`/`l4_ok` report that the NIC already verified the IPv4 /
     /// TCP checksum on RX, so software verification can be skipped.
-    /// `frame` is the received Ethernet frame as an mbuf-owning `Bytes`
-    /// (see [`Mbuf::into_bytes`]); parsing borrows it as a slice, and only a
-    /// TCP data payload is sliced out of it (by refcount, zero-copy).
-    fn handle_frame(&mut self, frame: &Bytes, ip_ok: bool, l4_ok: bool, now: Instant) {
+    /// Parse the owned mbuf by borrowing it. Only accepted TCP data is
+    /// converted into shared Bytes ownership; control and dropped packets
+    /// return directly to the pool without allocating an owner record.
+    fn handle_frame(&mut self, mbuf: Mbuf, ip_ok: bool, l4_ok: bool, now: Instant) {
+        let frame = mbuf.data();
         let Some(eth_hdr) = eth::EthHeader::parse(frame) else {
             return;
         };
         match eth_hdr.ethertype {
             arp::ETHERTYPE_ARP => self.handle_arp(&frame[eth::ETH_HDR_LEN..]),
-            eth::ETHERTYPE_IPV4 => self.handle_ipv4(frame, ip_ok, l4_ok, now),
+            eth::ETHERTYPE_IPV4 => self.handle_ipv4(mbuf, ip_ok, l4_ok, now),
             _ => {}
         }
     }
@@ -427,8 +449,8 @@ impl TcpEngine {
         }
     }
 
-    fn handle_ipv4(&mut self, frame: &Bytes, ip_ok: bool, l4_ok: bool, now: Instant) {
-        let buf = &frame[eth::ETH_HDR_LEN..];
+    fn handle_ipv4(&mut self, mbuf: Mbuf, ip_ok: bool, l4_ok: bool, now: Instant) {
+        let buf = &mbuf.data()[eth::ETH_HDR_LEN..];
         let Some(ip_hdr) = ipv4::Ipv4Header::parse(buf, !ip_ok) else {
             return;
         };
@@ -455,10 +477,14 @@ impl TcpEngine {
         };
 
         if let Some(tcb) = self.connections.get_mut(&tuple) {
-            // Zero-copy: the payload is a refcounted slice of the mbuf-owning
-            // frame `Bytes` (empty payloads resolve to `Bytes::new()`, which
-            // pins nothing).
-            tcb.on_segment(&tcp_hdr, frame.slice_ref(segment_payload), now);
+            let start = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + hdr_len;
+            let end = eth::ETH_HDR_LEN + total_len;
+            tcb.on_segment_with(
+                &tcp_hdr,
+                segment_payload.len(),
+                || mbuf.into_bytes().slice(start..end),
+                now,
+            );
             // The segment may have produced an ACK/data to send, an event,
             // or a state change -- process it next poll.
             self.mark_active(tuple);
@@ -594,7 +620,7 @@ fn build_ip_tcp_frame(
     local_ip: [u8; 4],
     remote_ip: [u8; 4],
     tcp_hdr: &tcp::TcpHeader,
-    payload: &[u8],
+    payload: &Payload,
     tx_cksum_offload: bool,
 ) -> Option<Mbuf> {
     let tcp_len = tcp_hdr.wire_len();
@@ -626,15 +652,16 @@ fn build_ip_tcp_frame(
 
     let tcp_start = ip_end;
     let tcp_end = tcp_start + tcp_len;
-    buf[tcp_end..tcp_end + payload.len()].copy_from_slice(payload);
+    payload.copy_to(&mut buf[tcp_end..tcp_end + payload.len()]);
     {
         let (ip_and_before, rest) = buf.split_at_mut(tcp_start);
         // With TX checksum offload the NIC fills the IPv4 checksum and
         // completes the TCP checksum; we write only the TCP pseudo-header
         // checksum and a zero IPv4 checksum, and tag the mbuf below.
+        let (tcp_header, wire_payload) = rest.split_at_mut(tcp_len);
         tcp_hdr.write(
-            &mut rest[..tcp_len],
-            payload,
+            tcp_header,
+            wire_payload,
             local_ip,
             remote_ip,
             tx_cksum_offload,

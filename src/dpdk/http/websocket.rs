@@ -82,6 +82,7 @@ pub struct WebSocketClient {
     /// messages plus automatic replies (Pong, Close echo) queued while
     /// reading. Only the front frame may be partly written.
     write_queue: VecDeque<Bytes>,
+    write_buffer: BytesMut,
     /// Bytes of the front frame already written.
     write_pos: usize,
     /// A received message held back until the automatic reply it triggered
@@ -240,6 +241,7 @@ impl WebSocketClient {
             protocol,
             handshake,
             write_queue: VecDeque::new(),
+            write_buffer: BytesMut::new(),
             write_pos: 0,
             ready_message: None,
         }
@@ -405,12 +407,14 @@ impl WebSocketClient {
         Ok(())
     }
 
-    fn encode_frame(&self, opcode: u8, payload: &[u8]) -> Result<Bytes, WebSocketError> {
+    fn encode_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<Bytes, WebSocketError> {
         let mut mask = [0u8; 4];
         self.rng.fill(&mut mask).map_err(|_| WebSocketError::Rng)?;
 
         let n = payload.len();
-        let mut out = BytesMut::with_capacity(14 + n);
+        let mut out = std::mem::take(&mut self.write_buffer);
+        out.clear();
+        out.reserve(14 + n);
 
         // FIN | opcode
         out.put_u8(0x80 | opcode);
@@ -427,12 +431,17 @@ impl WebSocketClient {
 
         out.put_slice(&mask);
 
+        // Initialize the reserved payload once, already masked.
         let start = out.len();
-        out.put_slice(payload);
-
-        for (i, byte) in out[start..].iter_mut().enumerate() {
-            *byte ^= mask[i & 3];
+        for (i, (dst, byte)) in out.spare_capacity_mut()[..n]
+            .iter_mut()
+            .zip(payload)
+            .enumerate()
+        {
+            dst.write(*byte ^ mask[i & 3]);
         }
+        // SAFETY: the loop initialized exactly n bytes of spare capacity.
+        unsafe { out.set_len(start + n) };
 
         Ok(out.freeze())
     }
@@ -441,7 +450,13 @@ impl WebSocketClient {
     fn poll_write_queue(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
         while let Some(frame) = self.write_queue.front() {
             if self.write_pos == frame.len() {
-                self.write_queue.pop_front();
+                let frame = self.write_queue.pop_front().unwrap();
+                if let Ok(mut buffer) = frame.try_into_mut() {
+                    buffer.clear();
+                    if buffer.capacity() > self.write_buffer.capacity() {
+                        self.write_buffer = buffer;
+                    }
+                }
                 self.write_pos = 0;
                 continue;
             }

@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use super::tx_queue::Payload;
 
 use super::seq::Seq;
 
@@ -68,10 +68,10 @@ impl RtoEstimator {
 /// One outstanding (sent, not yet acked) byte range in the retransmit
 /// queue. `data` is kept so the segment can be resent verbatim; it shares
 /// the same underlying buffer as the segment on the wire (a refcounted
-/// `Bytes`), so retaining it for retransmission costs no copy.
+/// payload slices), so retaining it for retransmission costs no data copy.
 pub struct UnackedSegment {
     pub seq: Seq,
-    pub data: Bytes,
+    pub data: Payload,
     pub syn: bool,
     pub fin: bool,
     pub first_sent_at: Instant,
@@ -105,10 +105,10 @@ impl RetransmitQueue {
     /// get retried through the same mechanism as data instead of being
     /// silently dropped if the first transmission is lost (e.g. to an
     /// unresolved ARP entry).
-    pub fn push(&mut self, seq: Seq, data: Bytes, syn: bool, fin: bool, now: Instant) {
+    pub fn push(&mut self, seq: Seq, data: impl Into<Payload>, syn: bool, fin: bool, now: Instant) {
         self.segments.push_back(UnackedSegment {
             seq,
-            data,
+            data: data.into(),
             syn,
             fin,
             first_sent_at: now,
