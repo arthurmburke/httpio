@@ -48,6 +48,16 @@ IPv4 + TCP, no kernel network stack involved.
   corked connection releases its held tail at protocol flush points --
   end of a TLS flight, a complete request, a batch of h2 frames).
   `http_get` exposes these as `--cork` and `--nagle`.
+- **WebSocket clients behind one trait**: `http::websocket::WebSocket` is
+  a `Stream` + `Sink` of `Message`s with a shared
+  `open(client, uri, headers, extensions)`, plus `protocol()` and
+  `handshake()`. Two implementations: the DPDK client
+  (`dpdk::http::websocket::WebSocketClient`, `Client = dpdk::http::client::Client`)
+  and a kernel-socket one built on tokio-tungstenite
+  (`tungstenite::TungsteniteWebSocket`, `Client = TungsteniteClient`), which
+  builds on any host, including macOS. Errors from both map onto the same
+  `WebSocketError` variants, so code generic over `W: WebSocket` runs on
+  either.
 - **Minimal ARP**: request/reply, since without it there's no way to
   address a real Ethernet frame to a peer.
 - **Default route**: `EngineConfig::gateway` sends peers outside the

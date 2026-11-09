@@ -273,6 +273,9 @@ pub enum WebSocketError {
     MalformedClosePayload,
     /// A Close frame's reason string was not valid UTF-8.
     InvalidUtf8CloseReason,
+    /// The underlying WebSocket implementation (e.g. tungstenite) failed in
+    /// a way none of the variants above describes; carries its description.
+    Backend(String),
 }
 
 impl fmt::Display for WebSocketError {
@@ -355,6 +358,9 @@ impl fmt::Display for WebSocketError {
             }
             WebSocketError::InvalidUtf8CloseReason => {
                 f.write_str("a Close frame reason contained invalid UTF-8")
+            }
+            WebSocketError::Backend(reason) => {
+                write!(f, "the WebSocket implementation failed: {reason}")
             }
         }
     }

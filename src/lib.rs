@@ -6,8 +6,11 @@
 pub mod core;
 /// The userspace DPDK TCP/IP stack and the HTTP/WebSocket client built on
 /// it. Gated on the `dpdk` cfg, which `build.rs` sets when libdpdk is found
-/// on the compiling system; without it the crate is just [`core`] and the
-/// transport-agnostic [`http`] traits.
+/// on the compiling system; without it the crate is just [`core`], the
+/// transport-agnostic [`http`] traits, and the [`tungstenite`] backend.
 #[cfg(dpdk)]
 pub mod dpdk;
 pub mod http;
+/// The kernel-socket WebSocket client: tokio-tungstenite behind the
+/// transport-agnostic [`http::websocket::WebSocket`] trait.
+pub mod tungstenite;

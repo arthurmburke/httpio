@@ -21,17 +21,18 @@
 //! offered, so RSV bits or a server-selected protocol fail the handshake.
 
 use std::{
+    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{Sink, Stream, ready};
+use futures::{Sink, SinkExt, Stream, ready};
 use http::{Extensions, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use ring::rand::{SecureRandom, SystemRandom};
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::client::Client;
 use crate::http::errors::{
@@ -43,6 +44,8 @@ use crate::http::errors::{
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Upper bound on a reassembled (fragmented) inbound message.
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+/// Minimum free space offered to each socket read.
+const READ_CHUNK: usize = 8 * 1024;
 
 const OP_CONTINUATION: u8 = 0x0;
 const OP_TEXT: u8 = 0x1;
@@ -75,9 +78,15 @@ pub struct WebSocketClient {
     /// The `101 Switching Protocols` response parts (status, headers,
     /// extensions), kept for callers that need e.g. `Set-Cookie`.
     handshake: http::response::Parts,
-    /// Outgoing frame, already masked and encoded.
-    write_buf: Option<Bytes>,
+    /// Outgoing frames, already masked and encoded, in wire order: Sink
+    /// messages plus automatic replies (Pong, Close echo) queued while
+    /// reading. Only the front frame may be partly written.
+    write_queue: VecDeque<Bytes>,
+    /// Bytes of the front frame already written.
     write_pos: usize,
+    /// A received message held back until the automatic reply it triggered
+    /// has been written and flushed (see [`Self::poll_recv`]).
+    ready_message: Option<Message>,
 }
 
 impl WebSocketClient {
@@ -209,7 +218,19 @@ impl WebSocketClient {
             .await
             .map_err(|_| WebSocketError::UpgradeIncomplete)?;
 
-        Ok(WebSocketClient {
+        Ok(WebSocketClient::from_upgraded(
+            upgraded, rng, protocol, handshake,
+        ))
+    }
+
+    /// Wraps a connection whose opening handshake has been validated.
+    fn from_upgraded(
+        upgraded: Upgraded,
+        rng: SystemRandom,
+        protocol: Option<String>,
+        handshake: http::response::Parts,
+    ) -> Self {
+        WebSocketClient {
             io: TokioIo::new(upgraded),
             rng,
             read_buf: BytesMut::with_capacity(8 * 1024),
@@ -218,9 +239,10 @@ impl WebSocketClient {
             close_received: false,
             protocol,
             handshake,
-            write_buf: None,
+            write_queue: VecDeque::new(),
             write_pos: 0,
-        })
+            ready_message: None,
+        }
     }
 
     /// The subprotocol the server selected from the handshake request's
@@ -238,51 +260,17 @@ impl WebSocketClient {
     /// Receives the next message. `Ok(None)` means the connection ended
     /// cleanly (close handshake completed, or EOF after a close). Inbound
     /// Pings are answered automatically and also returned.
+    ///
+    /// Cancel-safe: all progress (buffered input, a partly written reply)
+    /// is kept on `self`, so dropping a pending `recv` loses nothing.
     pub async fn recv(&mut self) -> Result<Option<Message>, WebSocketError> {
-        loop {
-            if self.close_sent && self.close_received {
-                return Ok(None);
-            }
-            while let Some(frame) = try_parse_frame(&mut self.read_buf)? {
-                if let Some(message) = self.handle_frame(frame).await? {
-                    return Ok(Some(message));
-                }
-            }
-            let n = self
-                .io
-                .read_buf(&mut self.read_buf)
-                .await
-                .map_err(|e| WebSocketError::Io(e.kind()))?;
-            if n == 0 {
-                // EOF. Clean only if the close handshake got at least our
-                // half out (some peers close TCP without echoing Close).
-                if self.close_received || self.close_sent {
-                    return Ok(None);
-                }
-                return Err(WebSocketError::UncleanClose);
-            }
-        }
+        std::future::poll_fn(|cx| self.poll_recv(cx)).await
     }
 
     /// Sends one message (never fragmented on the wire; sizes up to the
-    /// frame maximum go out as a single frame).
+    /// frame maximum go out as a single frame) and flushes it.
     pub async fn send(&mut self, message: Message) -> Result<(), WebSocketError> {
-        if self.close_sent {
-            return Err(WebSocketError::SendAfterClose);
-        }
-        match message {
-            Message::Text(text) => self.write_frame(OP_TEXT, text.as_bytes()).await,
-            Message::Binary(data) => self.write_frame(OP_BINARY, &data).await,
-            Message::Ping(data) => {
-                check_control_len(&data)?;
-                self.write_frame(OP_PING, &data).await
-            }
-            Message::Pong(data) => {
-                check_control_len(&data)?;
-                self.write_frame(OP_PONG, &data).await
-            }
-            Message::Close(frame) => self.close(frame).await,
-        }
+        SinkExt::send(self, message).await
     }
 
     /// Starts (or completes) the closing handshake. After this, `send`
@@ -292,20 +280,65 @@ impl WebSocketClient {
         if self.close_sent {
             return Ok(());
         }
-        let mut payload = BytesMut::new();
-        if let Some(frame) = frame {
-            payload.put_u16(frame.code);
-            payload.put_slice(frame.reason.as_bytes());
-            check_control_len(&payload)?;
+        SinkExt::send(self, Message::Close(frame)).await
+    }
+
+    /// The receive state machine behind [`Self::recv`] and `poll_next`.
+    ///
+    /// A frame that needs an automatic reply (Ping, peer-initiated Close)
+    /// queues the reply, and the message is held in `ready_message` until
+    /// the reply has been written and flushed -- the same ordering the
+    /// reply had when it was written inline, but resumable: a `Pending`
+    /// part-way through the reply leaves it at the head of the queue to be
+    /// finished on the next poll, instead of being dropped with a future.
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Message>, WebSocketError>> {
+        loop {
+            if self.ready_message.is_some() || (self.close_sent && self.close_received) {
+                ready!(self.poll_flush_writes(cx))?;
+                // `None` here is the end of a completed close handshake.
+                return Poll::Ready(Ok(self.ready_message.take()));
+            }
+
+            if let Some(frame) = try_parse_frame(&mut self.read_buf)? {
+                let queued = self.write_queue.len();
+                match self.handle_frame(frame)? {
+                    Some(message) if self.write_queue.len() > queued => {
+                        self.ready_message = Some(message);
+                    }
+                    Some(message) => return Poll::Ready(Ok(Some(message))),
+                    None => {}
+                }
+                continue;
+            }
+
+            if ready!(self.poll_fill_read_buf(cx))? == 0 {
+                // EOF. Clean only if the close handshake got at least our
+                // half out (some peers close TCP without echoing Close).
+                if self.close_received || self.close_sent {
+                    return Poll::Ready(Ok(None));
+                }
+                return Poll::Ready(Err(WebSocketError::UncleanClose));
+            }
         }
-        // Mark before writing so a transport error can't leave us able to
-        // "close" twice.
-        self.close_sent = true;
-        self.write_frame(OP_CLOSE, &payload).await
+    }
+
+    /// Reads more inbound bytes onto the end of `read_buf`; `Ok(0)` at EOF.
+    fn poll_fill_read_buf(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, WebSocketError>> {
+        self.read_buf.reserve(READ_CHUNK);
+        let n = {
+            let mut buf = ReadBuf::uninit(self.read_buf.spare_capacity_mut());
+            ready!(Pin::new(&mut self.io).poll_read(cx, &mut buf))
+                .map_err(|e| WebSocketError::Io(e.kind()))?;
+            buf.filled().len()
+        };
+        // SAFETY: `poll_read` initialized the first `n` spare bytes.
+        unsafe { self.read_buf.set_len(self.read_buf.len() + n) };
+        Poll::Ready(Ok(n))
     }
 
     /// Applies one parsed frame; returns a `Message` when one is complete.
-    async fn handle_frame(&mut self, frame: RawFrame) -> Result<Option<Message>, WebSocketError> {
+    /// Automatic replies are queued, not written; the caller drives them.
+    fn handle_frame(&mut self, frame: RawFrame) -> Result<Option<Message>, WebSocketError> {
         match frame.opcode {
             OP_TEXT | OP_BINARY => {
                 if self.fragment.is_some() {
@@ -336,7 +369,7 @@ impl WebSocketClient {
                 // Auto-pong with the same payload (RFC 6455 §5.5.3),
                 // unless we've already sent our Close.
                 if !self.close_sent {
-                    self.write_frame(OP_PONG, &frame.payload).await?;
+                    self.queue_frame(OP_PONG, &frame.payload)?;
                 }
                 Ok(Some(Message::Ping(frame.payload)))
             }
@@ -356,7 +389,7 @@ impl WebSocketClient {
                         Bytes::new()
                     };
                     self.close_sent = true;
-                    self.write_frame(OP_CLOSE, &echo).await?;
+                    self.queue_frame(OP_CLOSE, &echo)?;
                 }
                 Ok(Some(Message::Close(close_frame)))
             }
@@ -364,18 +397,11 @@ impl WebSocketClient {
         }
     }
 
-    /// Writes one masked frame (client frames must be masked, RFC 6455
-    /// §5.3) and flushes.
-    async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WebSocketError> {
-        let out = self.encode_frame(opcode, payload)?;
-        self.io
-            .write_all(&out)
-            .await
-            .map_err(|e| WebSocketError::Io(e.kind()))?;
-        self.io
-            .flush()
-            .await
-            .map_err(|e| WebSocketError::Io(e.kind()))?;
+    /// Encodes one masked frame (client frames must be masked, RFC 6455
+    /// §5.3) onto the end of the outgoing queue.
+    fn queue_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WebSocketError> {
+        let frame = self.encode_frame(opcode, payload)?;
+        self.write_queue.push_back(frame);
         Ok(())
     }
 
@@ -411,68 +437,65 @@ impl WebSocketClient {
         Ok(out.freeze())
     }
 
-    fn stage_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WebSocketError> {
-        assert!(
-            self.write_buf.is_none(),
-            "stage_frame called before poll_ready"
-        );
-
-        let frame = self.encode_frame(opcode, payload)?;
-        self.write_buf = Some(frame);
-        self.write_pos = 0;
-
-        Ok(())
-    }
-
-    fn poll_write_pending(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
-        loop {
-            let Some(frame) = self.write_buf.as_ref() else {
-                return Poll::Ready(Ok(()));
-            };
-
+    /// Writes the queued frames out, whole and in order (no flush).
+    fn poll_write_queue(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
+        while let Some(frame) = self.write_queue.front() {
             if self.write_pos == frame.len() {
-                self.write_buf = None;
+                self.write_queue.pop_front();
                 self.write_pos = 0;
                 continue;
             }
-
-            let remaining = &frame[self.write_pos..];
-
-            let n = match Pin::new(&mut self.io).poll_write(cx, remaining) {
-                Poll::Pending => return Poll::Pending,
-
-                Poll::Ready(Ok(0)) => {
+            let n = match ready!(Pin::new(&mut self.io).poll_write(cx, &frame[self.write_pos..])) {
+                Ok(0) => {
                     return Poll::Ready(Err(WebSocketError::Io(std::io::ErrorKind::WriteZero)));
                 }
-
-                Poll::Ready(Ok(n)) => n,
-
-                Poll::Ready(Err(e)) => {
-                    return Poll::Ready(Err(WebSocketError::Io(e.kind())));
-                }
+                Ok(n) => n,
+                Err(e) => return Poll::Ready(Err(WebSocketError::Io(e.kind()))),
             };
-
             self.write_pos += n;
         }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Writes every queued frame, then flushes the transport.
+    fn poll_flush_writes(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
+        ready!(self.poll_write_queue(cx))?;
+        Pin::new(&mut self.io)
+            .poll_flush(cx)
+            .map_err(|e| WebSocketError::Io(e.kind()))
+    }
+}
+
+/// The transport-agnostic face of this client: `open` takes the DPDK HTTP
+/// [`Client`], and a `TcpOptions` extension with `cork: true` is rejected
+/// (`nodelay` is honored), exactly as [`WebSocketClient::open`].
+impl crate::http::websocket::WebSocket for WebSocketClient {
+    type Client = Client;
+
+    fn open(
+        client: &Client,
+        uri: Uri,
+        headers: HeaderMap<HeaderValue>,
+        extensions: Extensions,
+    ) -> impl Future<Output = Result<Self, WebSocketError>> + Send {
+        // Inherent methods take precedence, so this is the inherent `open`.
+        WebSocketClient::open(client, uri, headers, extensions)
+    }
+
+    fn protocol(&self) -> Option<&str> {
+        WebSocketClient::protocol(self)
+    }
+
+    fn handshake(&self) -> &http::response::Parts {
+        WebSocketClient::handshake(self)
     }
 }
 
 impl Stream for WebSocketClient {
     type Item = Result<Message, WebSocketError>;
 
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        use futures::FutureExt;
-        let fut = self.recv().boxed();
-        futures::pin_mut!(fut);
-        match fut.poll_unpin(cx) {
-            std::task::Poll::Ready(Ok(Some(msg))) => std::task::Poll::Ready(Some(Ok(msg))),
-            std::task::Poll::Ready(Ok(None)) => std::task::Poll::Ready(None),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().poll_recv(cx).map(Result::transpose)
     }
 }
 
@@ -481,97 +504,56 @@ impl Sink<Message> for WebSocketClient {
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-
         if this.close_sent {
             return Poll::Ready(Err(WebSocketError::SendAfterClose));
         }
-
-        // One-frame buffer: the previous frame must be
-        // fully written before we accept another.
-        this.poll_write_pending(cx)
+        // One-frame buffer: everything queued before (including automatic
+        // replies) must be written before another message is accepted.
+        this.poll_write_queue(cx)
     }
 
     fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
         let this = self.get_mut();
-
         if this.close_sent {
             return Err(WebSocketError::SendAfterClose);
         }
-
         match message {
-            Message::Text(text) => {
-                this.stage_frame(OP_TEXT, text.as_bytes())?;
-            }
-
-            Message::Binary(data) => {
-                this.stage_frame(OP_BINARY, &data)?;
-            }
-
+            Message::Text(text) => this.queue_frame(OP_TEXT, text.as_bytes()),
+            Message::Binary(data) => this.queue_frame(OP_BINARY, &data),
             Message::Ping(data) => {
                 check_control_len(&data)?;
-                this.stage_frame(OP_PING, &data)?;
+                this.queue_frame(OP_PING, &data)
             }
-
             Message::Pong(data) => {
                 check_control_len(&data)?;
-                this.stage_frame(OP_PONG, &data)?;
+                this.queue_frame(OP_PONG, &data)
             }
-
             Message::Close(frame) => {
                 let mut payload = BytesMut::new();
-
                 if let Some(frame) = frame {
                     payload.put_u16(frame.code);
                     payload.put_slice(frame.reason.as_bytes());
                 }
-
                 check_control_len(&payload)?;
-
-                this.stage_frame(OP_CLOSE, &payload)?;
-
-                // No further messages may be enqueued.
+                // No further messages may be enqueued, even if encoding
+                // fails below.
                 this.close_sent = true;
+                this.queue_frame(OP_CLOSE, &payload)
             }
         }
-
-        Ok(())
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let this = self.get_mut();
-
-        // Finish writing the encoded frame.
-        ready!(this.poll_write_pending(cx))?;
-
-        // Flush the underlying transport.
-        match Pin::new(&mut this.io).poll_flush(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(WebSocketError::Io(e.kind()))),
-        }
+        self.get_mut().poll_flush_writes(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-
-        // Finish any previously queued message.
-        ready!(this.poll_write_pending(cx))?;
-
         if !this.close_sent {
-            // Queue a WebSocket Close frame.
-            this.stage_frame(OP_CLOSE, &[])?;
             this.close_sent = true;
+            this.queue_frame(OP_CLOSE, &[])?;
         }
-
-        // Write the Close frame.
-        ready!(this.poll_write_pending(cx))?;
-
-        // Make sure it reaches the transport.
-        match Pin::new(&mut this.io).poll_flush(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(WebSocketError::Io(e.kind()))),
-        }
+        this.poll_flush_writes(cx)
     }
 }
 
@@ -813,5 +795,184 @@ mod tests {
             .unwrap();
         assert_eq!(frame.code, 1000);
         assert_eq!(frame.reason, "bye");
+    }
+
+    use std::time::Duration;
+
+    use futures::{SinkExt, StreamExt};
+    use http_body_util::Empty;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, SimplexStream, WriteHalf, simplex};
+
+    /// The raw server end of a [`pair`]: what the client wrote, and where
+    /// to write server frames.
+    struct Server {
+        from_client: ReadHalf<SimplexStream>,
+        to_client: WriteHalf<SimplexStream>,
+    }
+
+    impl Server {
+        /// Reads one masked client frame (payload < 126 bytes) and returns
+        /// (opcode, unmasked payload).
+        async fn read_frame(&mut self) -> (u8, Vec<u8>) {
+            let mut head = [0u8; 6];
+            self.from_client.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[0] & 0x80, 0x80, "FIN set");
+            assert_eq!(head[1] & 0x80, 0x80, "client frames are masked");
+            let len = (head[1] & 0x7F) as usize;
+            assert!(len < 126);
+            let mut payload = vec![0u8; len];
+            self.from_client.read_exact(&mut payload).await.unwrap();
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= head[2 + (i & 3)];
+            }
+            (head[0] & 0x0F, payload)
+        }
+    }
+
+    /// A client over in-memory pipes, upgraded through a real hyper
+    /// HTTP/1.1 exchange so `io` is the same `Upgraded` that `open` yields.
+    /// The client-to-server pipe holds only `write_capacity` bytes, so
+    /// larger client frames are written in pieces.
+    async fn pair(write_capacity: usize) -> (WebSocketClient, Server) {
+        let (from_client, client_tx) = simplex(write_capacity);
+        let (client_rx, to_client) = simplex(64 * 1024);
+        let mut server = Server {
+            from_client,
+            to_client,
+        };
+
+        let io = TokioIo::new(tokio::io::join(client_rx, client_tx));
+        let (mut sender, conn) = hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(io)
+            .await
+            .unwrap();
+        tokio::spawn(conn.with_upgrades());
+
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "test")
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .body(Empty::new())
+            .unwrap();
+        let accept = async {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(server.from_client.read_u8().await.unwrap());
+            }
+            server
+                .to_client
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(sender.send_request(request), accept);
+        let mut response = response.unwrap();
+        let upgraded = hyper::upgrade::on(&mut response).await.unwrap();
+        let (handshake, _) = response.into_parts();
+        let ws = WebSocketClient::from_upgraded(upgraded, SystemRandom::new(), None, handshake);
+        (ws, server)
+    }
+
+    /// Bounds a step that would hang on a regression.
+    async fn within<F: Future>(fut: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .expect("timed out")
+    }
+
+    /// A `poll_next` that returns Pending part-way through writing the
+    /// automatic Pong must finish that Pong on the next poll -- not drop
+    /// it (corrupting the stream) and not lose the Ping.
+    #[tokio::test]
+    async fn interrupted_auto_pong_is_finished_on_next_poll() {
+        // The 106-byte Pong can't fit in the 32-byte pipe in one go.
+        let (mut ws, mut server) = pair(32).await;
+        let ping = [0x5Au8; 100];
+        let mut frames = vec![0x89, 100];
+        frames.extend_from_slice(&ping);
+        frames.extend_from_slice(&[0x81, 5]);
+        frames.extend_from_slice(b"after");
+        server.to_client.write_all(&frames).await.unwrap();
+
+        // First poll: Ping parsed, Pong partly written, then blocked.
+        assert!(futures::poll!(ws.next()).is_pending());
+
+        // The server drains the Pong while the client keeps polling.
+        let (message, (opcode, payload)) =
+            within(async { tokio::join!(ws.next(), server.read_frame()) }).await;
+        assert_eq!(
+            message,
+            Some(Ok(Message::Ping(Bytes::copy_from_slice(&ping))))
+        );
+        assert_eq!(opcode, OP_PONG);
+        assert_eq!(payload, ping);
+
+        assert_eq!(
+            within(ws.next()).await,
+            Some(Ok(Message::Text("after".into())))
+        );
+    }
+
+    /// The same for the Close echo, after which the stream ends.
+    #[tokio::test]
+    async fn interrupted_close_echo_is_finished_on_next_poll() {
+        let (mut ws, mut server) = pair(4).await;
+        // Close 1000 "bye": a 9-byte echo frame (code only, masked).
+        server
+            .to_client
+            .write_all(&[0x88, 5, 0x03, 0xE8, b'b', b'y', b'e'])
+            .await
+            .unwrap();
+        assert!(futures::poll!(ws.next()).is_pending());
+
+        let (message, (opcode, payload)) =
+            within(async { tokio::join!(ws.next(), server.read_frame()) }).await;
+        assert_eq!(
+            message,
+            Some(Ok(Message::Close(Some(CloseFrame {
+                code: 1000,
+                reason: "bye".into()
+            }))))
+        );
+        assert_eq!(opcode, OP_CLOSE);
+        assert_eq!(payload, [0x03, 0xE8]);
+        assert_eq!(within(ws.next()).await, None);
+    }
+
+    /// Sink and Stream share the write path: frames go out whole and in
+    /// order, and `send` after `close` fails.
+    #[tokio::test]
+    async fn sink_frames_go_out_whole_and_in_order() {
+        let (mut ws, mut server) = pair(8).await;
+        let reader = async {
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                got.push(server.read_frame().await);
+            }
+            got
+        };
+        let writer = async {
+            ws.send(Message::Text("one".into())).await.unwrap();
+            ws.send(Message::Binary(Bytes::from_static(&[2; 40])))
+                .await
+                .unwrap();
+            SinkExt::close(&mut ws).await.unwrap();
+        };
+        let ((), got) = within(async { tokio::join!(writer, reader) }).await;
+        assert_eq!(
+            got,
+            vec![
+                (OP_TEXT, b"one".to_vec()),
+                (OP_BINARY, vec![2; 40]),
+                (OP_CLOSE, vec![]),
+            ]
+        );
+        assert_eq!(
+            ws.send(Message::Text("late".into())).await,
+            Err(WebSocketError::SendAfterClose)
+        );
     }
 }

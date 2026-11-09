@@ -16,7 +16,8 @@
       "Bash(docker volume *)",
       "Bash(open -a Docker)",
       "Bash(break)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(grep -rn \"WebSocket\\\\b\\\\|impl.*HttpClient\\\\|websocket::\" src examples tests | grep -v \"^src/http/errors.rs\" ; cat build.rs | head -60; cat .cargo/config.toml; cargo --version; ls ~/.cargo/registry/cache/*/ 2>/dev/null | grep -i tungstenite)"
     ]
   }
 }
