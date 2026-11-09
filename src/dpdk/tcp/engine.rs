@@ -50,7 +50,11 @@ impl EngineConfig {
     /// `ip route add default via`). A gateway with no prefix on `local`
     /// routes every peer through the gateway (prefix 32); a prefix with no
     /// gateway is accepted and ignored.
-    pub fn from_cli(local_mac: [u8; 6], local: &str, gateway: Option<&str>) -> Result<Self, String> {
+    pub fn from_cli(
+        local_mac: [u8; 6],
+        local: &str,
+        gateway: Option<&str>,
+    ) -> Result<Self, String> {
         let (ip, prefix_len) = match local.split_once('/') {
             Some((ip, len)) => {
                 let len: u8 = len
@@ -728,7 +732,10 @@ mod tests {
             ("10.0.1", None),
             ("10.0.1.25/24", Some("gw")),
         ] {
-            assert!(EngineConfig::from_cli([0; 6], local, gw).is_err(), "{local} {gw:?}");
+            assert!(
+                EngineConfig::from_cli([0; 6], local, gw).is_err(),
+                "{local} {gw:?}"
+            );
         }
     }
 }

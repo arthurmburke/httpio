@@ -1,4 +1,7 @@
 use bytes::Bytes;
+use futures::{Sink, Stream};
+
+use crate::http::errors::WebSocketError;
 
 /// A complete WebSocket message (inbound fragmentation already
 /// reassembled).
@@ -17,4 +20,8 @@ pub enum Message {
 pub struct CloseFrame {
     pub code: u16,
     pub reason: String,
+}
+pub trait WebSocket:
+    Stream<Item = Result<Message, WebSocketError>> + Sink<Message, Error = WebSocketError> + Unpin
+{
 }
