@@ -3,6 +3,8 @@
 //! scope -- see the top-level README for what this stack does and doesn't
 //! implement.
 
+use std::net::Ipv4Addr;
+
 use super::checksum;
 
 pub const TCP_HDR_LEN: usize = 20;
@@ -88,8 +90,8 @@ impl TcpHeader {
     /// checksum offload reported GOOD).
     pub fn parse(
         buf: &[u8],
-        src_ip: [u8; 4],
-        dst_ip: [u8; 4],
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
         verify: bool,
     ) -> Option<(Self, usize)> {
         if buf.len() < TCP_HDR_LEN {
@@ -144,8 +146,8 @@ impl TcpHeader {
         &self,
         out: &mut [u8],
         payload: &[u8],
-        src_ip: [u8; 4],
-        dst_ip: [u8; 4],
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
         offload_cksum: bool,
     ) {
         let hdr_len = self.wire_len();
@@ -187,8 +189,8 @@ impl TcpHeader {
 mod tests {
     use super::*;
 
-    const SRC: [u8; 4] = [10, 0, 0, 1];
-    const DST: [u8; 4] = [10, 0, 0, 2];
+    const SRC: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+    const DST: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 
     fn header(mss: Option<u16>) -> TcpHeader {
         TcpHeader {

@@ -4,6 +4,7 @@ use std::ptr;
 
 use super::ffi;
 use super::mbuf::Mbuf;
+use super::net::eth::EthAddr;
 use super::mempool::Mempool;
 
 #[derive(Debug)]
@@ -140,14 +141,14 @@ impl EthPort {
         self.rx_cksum_offload
     }
 
-    pub fn mac_addr(&self) -> Result<ffi::rte_ether_addr, PortError> {
+    pub fn mac_addr(&self) -> Result<EthAddr, PortError> {
         // SAFETY: `rte_ether_addr` is a plain 6-byte struct; zeroed is a
         // valid placeholder that `rte_eth_macaddr_get` overwrites.
         let mut addr: ffi::rte_ether_addr = unsafe { core::mem::zeroed() };
         check("rte_eth_macaddr_get", unsafe {
             ffi::rte_eth_macaddr_get(self.port_id, &mut addr)
         })?;
-        Ok(addr)
+        Ok(EthAddr::new(addr.addr_bytes))
     }
 
     /// Collects up to `max` packets (at most 64) into an owned vector.

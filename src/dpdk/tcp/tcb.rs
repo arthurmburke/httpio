@@ -1,6 +1,7 @@
 //! The Transmission Control Block: all per-connection state, and the RFC
 //! 9293 §3.10 segment-processing state machine.
 
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -27,9 +28,9 @@ pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FourTuple {
-    pub local_ip: [u8; 4],
+    pub local_ip: Ipv4Addr,
     pub local_port: u16,
-    pub remote_ip: [u8; 4],
+    pub remote_ip: Ipv4Addr,
     pub remote_port: u16,
 }
 
@@ -949,9 +950,9 @@ mod tests {
 
     fn tuple() -> FourTuple {
         FourTuple {
-            local_ip: [10, 0, 0, 1],
+            local_ip: Ipv4Addr::new(10, 0, 0, 1),
             local_port: 49152,
-            remote_ip: [10, 0, 0, 2],
+            remote_ip: Ipv4Addr::new(10, 0, 0, 2),
             remote_port: 80,
         }
     }

@@ -5,6 +5,8 @@
 //! takes `&mut TcpEngine` explicitly rather than hiding it behind
 //! `Rc<RefCell<_>>`.
 
+use std::net::Ipv4Addr;
+
 use bytes::Bytes;
 
 use super::engine::TcpEngine;
@@ -20,7 +22,7 @@ impl TcpSocket {
     /// port and retry.
     pub fn connect(
         engine: &mut TcpEngine,
-        remote_ip: [u8; 4],
+        remote_ip: Ipv4Addr,
         remote_port: u16,
         local_port: u16,
     ) -> Option<Self> {

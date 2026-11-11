@@ -55,8 +55,7 @@ mod dpdk_app {
         };
         let local_ip = local_ip
             .parse::<std::net::Ipv4Addr>()
-            .expect("invalid local IP")
-            .octets();
+            .expect("invalid local IP");
 
         let eal_args: Vec<&str> = eal_args.iter().map(String::as_str).collect();
         dpdk::eal::init(&eal_args).expect("EAL initialization failed");
@@ -77,7 +76,7 @@ mod dpdk_app {
         let mac = port.mac_addr().expect("failed to read MAC address");
 
         let engine = TcpEngine::new(EngineConfig {
-            local_mac: mac.addr_bytes,
+            local_mac: mac,
             local_ip,
             gateway: None,
         });

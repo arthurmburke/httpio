@@ -9,19 +9,20 @@ use bytes::Bytes;
 use httpio::dpdk::{
     EthPort, Mbuf, Mempool, eal,
     mempool::DEFAULT_MBUF_DATA_ROOM_SIZE,
-    net::{arp, eth, ipv4, tcp},
+    net::{arp, eth, eth::EthAddr, ipv4, tcp},
     tcp::{
         engine::{EngineConfig, TcpEngine},
         rto::{MAX_RETRANSMITS, MAX_RTO},
         tcb::Event,
     },
 };
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
-const LOCAL_IP: [u8; 4] = [10, 0, 0, 1];
-const PEER_IP: [u8; 4] = [10, 0, 0, 2];
-const LOCAL_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
-const PEER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
+const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+const LOCAL_MAC: EthAddr = EthAddr::new([2, 0, 0, 0, 0, 1]);
+const PEER_MAC: EthAddr = EthAddr::new([2, 0, 0, 0, 0, 2]);
 
 fn ethernet_packet(pool: &Mempool, kind: u16, size: usize) -> Mbuf {
     let mut packet = Mbuf::alloc(pool).unwrap();
@@ -154,16 +155,19 @@ fn engine_transmits_window_updates_and_final_reset() {
         });
         let mut now = Instant::now();
         // Learn the peer's MAC before the active open.
-        let mut packet = ethernet_packet(&pool, arp::ETHERTYPE_ARP, arp::ARP_HDR_LEN);
-        arp::ArpPacket {
-            operation: arp::OP_REPLY,
-            sender_mac: PEER_MAC,
-            sender_ip: PEER_IP,
-            target_mac: LOCAL_MAC,
-            target_ip: LOCAL_IP,
-        }
-        .write(&mut packet.data_mut()[eth::ETH_HDR_LEN..]);
-        assert!(port.tx_burst(vec![packet]).is_empty());
+        let arp_reply = || {
+            let mut packet = ethernet_packet(&pool, arp::ETHERTYPE_ARP, arp::ARP_HDR_LEN);
+            arp::ArpPacket {
+                operation: arp::OP_REPLY,
+                sender_mac: PEER_MAC,
+                sender_ip: PEER_IP,
+                target_mac: LOCAL_MAC,
+                target_ip: LOCAL_IP,
+            }
+            .write(&mut packet.data_mut()[eth::ETH_HDR_LEN..]);
+            assert!(port.tx_burst(vec![packet]).is_empty());
+        };
+        arp_reply();
         engine.poll(&port, &pool, now);
         let tuple = engine.connect(PEER_IP, 80, 1234).unwrap();
         engine.poll(&port, &pool, now);
@@ -219,6 +223,9 @@ fn engine_transmits_window_updates_and_final_reset() {
         let mut aborted = false;
         for _ in 0..=MAX_RETRANSMITS {
             now += MAX_RTO + Duration::from_secs(1);
+            // Each step outlives the ARP entry; the peer still answers ARP
+            // (it only ignores TCP), so the next hop stays resolvable.
+            arp_reply();
             aborted |= engine
                 .poll(&port, &pool, now)
                 .contains(&(tuple, Event::Reset));

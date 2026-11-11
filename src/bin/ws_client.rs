@@ -41,6 +41,7 @@ mod dpdk_app {
     use httpio::dpdk::http::client::builder::Builder;
     use httpio::dpdk::http::websocket::WebSocketClient;
     use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+    use httpio::dpdk::net::eth::EthAddr;
     use httpio::dpdk::tcp::engine::{EngineConfig, TcpEngine};
     use httpio::dpdk::tcp::worker::WorkerHandle;
     use httpio::dpdk::{self, EthPort, Mempool};
@@ -116,7 +117,7 @@ mod dpdk_app {
         let mac = port.mac_addr().expect("failed to read MAC address");
 
         let engine = TcpEngine::new(EngineConfig {
-            local_mac: mac.addr_bytes,
+            local_mac: mac,
             ..app.engine
         });
 
@@ -269,7 +270,7 @@ mod dpdk_app {
             return Err("expected positional arguments: LOCAL_IP URL".into());
         };
         Ok(AppArgs {
-            engine: EngineConfig::from_cli([0; 6], local_ip, gateway.as_deref())?,
+            engine: EngineConfig::from_cli(EthAddr::ZERO, local_ip, gateway.as_deref())?,
             url: url.clone(),
             ca_files,
             resolves,

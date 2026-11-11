@@ -42,6 +42,7 @@ mod dpdk_app {
     use httpio::dpdk::http::client::builder::Builder;
     use httpio::dpdk::http::stream::{FlushHandle, TcpOptions};
     use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+    use httpio::dpdk::net::eth::EthAddr;
     use httpio::dpdk::tcp::engine::EngineConfig;
     use httpio::dpdk::tcp::engine::TcpEngine;
     use httpio::dpdk::tcp::worker::WorkerHandle;
@@ -123,7 +124,7 @@ mod dpdk_app {
         let mac = port.mac_addr().expect("failed to read MAC address");
 
         let engine = TcpEngine::new(EngineConfig {
-            local_mac: mac.addr_bytes,
+            local_mac: mac,
             ..app.engine
         });
 
@@ -272,7 +273,7 @@ mod dpdk_app {
             return Err("expected at least one URL after LOCAL_IP".into());
         }
         Ok(AppArgs {
-            engine: EngineConfig::from_cli([0; 6], local_ip, gateway.as_deref())?,
+            engine: EngineConfig::from_cli(EthAddr::ZERO, local_ip, gateway.as_deref())?,
             urls: urls.to_vec(),
             ca_files,
             resolves,

@@ -50,19 +50,19 @@ mod dpdk {
     use httpio::dpdk::{
         EthPort, Mbuf, Mempool, eal, ffi,
         mempool::DEFAULT_MBUF_DATA_ROOM_SIZE,
-        net::{arp, eth, ipv4, tcp},
+        net::{arp, eth, eth::EthAddr, ipv4, tcp},
         tcp::{
             engine::{EngineConfig, TcpEngine},
             tcb::{Event, FourTuple},
         },
     };
     use serde::Serialize;
-    use std::{hint::black_box, time::Instant};
+    use std::{hint::black_box, net::Ipv4Addr, time::Instant};
 
-    const LOCAL_IP: [u8; 4] = [10, 0, 0, 1];
-    const PEER_IP: [u8; 4] = [10, 0, 0, 2];
-    const LOCAL_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
-    const PEER_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
+    const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+    const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const LOCAL_MAC: EthAddr = EthAddr::new([2, 0, 0, 0, 0, 1]);
+    const PEER_MAC: EthAddr = EthAddr::new([2, 0, 0, 0, 0, 2]);
     static DATA: [u8; 1024] = [42; 1024];
 
     struct Fixture {

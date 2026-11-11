@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io;
+use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -128,7 +129,7 @@ impl TcpStream {
     /// away before the handshake finished.
     pub async fn connect(
         worker: &WorkerHandle,
-        remote_ip: [u8; 4],
+        remote_ip: Ipv4Addr,
         remote_port: u16,
         local_port: u16,
         options: TcpOptions,

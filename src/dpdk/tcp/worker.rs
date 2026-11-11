@@ -20,6 +20,7 @@
 //! endpoints are `Send`, so a fresh pair is created on the app thread and
 //! one half of each is shipped to the worker inside the control message.
 
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -97,7 +98,7 @@ pub enum Inbound {
 /// The control message that registers a new connection with the worker,
 /// carrying the worker-side halves of its ring pair.
 struct NewConn {
-    remote_ip: [u8; 4],
+    remote_ip: Ipv4Addr,
     remote_port: u16,
     local_port: u16,
     nodelay: bool,
@@ -236,7 +237,7 @@ impl WorkerHandle {
     /// with connection opens) after a bounded number of retries.
     pub fn open(
         &self,
-        remote_ip: [u8; 4],
+        remote_ip: Ipv4Addr,
         remote_port: u16,
         local_port: u16,
         nodelay: bool,
@@ -436,9 +437,9 @@ mod tests {
             let (inbound_tx, _inbound_rx) = spsc::channel::<Inbound, IN_CAP>();
             let mut conn = WorkerConn {
                 tuple: FourTuple {
-                    local_ip: [10, 0, 0, 1],
+                    local_ip: Ipv4Addr::new(10, 0, 0, 1),
                     local_port: 1234,
-                    remote_ip: [10, 0, 0, 2],
+                    remote_ip: Ipv4Addr::new(10, 0, 0, 2),
                     remote_port: 80,
                 },
                 cmd_rx,

@@ -33,6 +33,8 @@ mod dpdk_app {
     use std::env;
     use std::time::Instant;
 
+    use std::net::Ipv4Addr;
+
     use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
     use httpio::dpdk::tcp::engine::{EngineConfig, TcpEngine};
     use httpio::dpdk::tcp::socket::TcpSocket;
@@ -63,7 +65,7 @@ mod dpdk_app {
         let local_ip = app_args
             .first()
             .map(|s| parse_ipv4(s))
-            .unwrap_or([192, 168, 1, 10]);
+            .unwrap_or(Ipv4Addr::new(192, 168, 1, 10));
         let listen_port: u16 = app_args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7);
 
         let pool = Mempool::create(
@@ -81,22 +83,10 @@ mod dpdk_app {
             .expect("failed to initialize ethdev port");
         let mac = port.mac_addr().expect("failed to read MAC address");
 
-        println!(
-            "port {PORT_ID}: mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, local ip {}.{}.{}.{}, listening on :{listen_port}",
-            mac.addr_bytes[0],
-            mac.addr_bytes[1],
-            mac.addr_bytes[2],
-            mac.addr_bytes[3],
-            mac.addr_bytes[4],
-            mac.addr_bytes[5],
-            local_ip[0],
-            local_ip[1],
-            local_ip[2],
-            local_ip[3],
-        );
+        println!("port {PORT_ID}: mac {mac}, local ip {local_ip}, listening on :{listen_port}");
 
         let mut engine = TcpEngine::new(EngineConfig {
-            local_mac: mac.addr_bytes,
+            local_mac: mac,
             local_ip,
             gateway: None,
         });
@@ -146,11 +136,12 @@ mod dpdk_app {
         }
     }
 
-    fn parse_ipv4(s: &str) -> [u8; 4] {
+    /// Lenient like the original: a malformed octet reads as 0.
+    fn parse_ipv4(s: &str) -> Ipv4Addr {
         let mut octets = [0u8; 4];
         for (i, part) in s.split('.').enumerate().take(4) {
             octets[i] = part.parse().unwrap_or(0);
         }
-        octets
+        Ipv4Addr::from(octets)
     }
 }

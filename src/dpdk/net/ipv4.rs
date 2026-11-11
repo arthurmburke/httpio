@@ -1,5 +1,7 @@
 //! IPv4 header parsing/serialization (no options: fixed 20-byte header).
 
+use std::net::Ipv4Addr;
+
 use super::checksum;
 
 pub const IPV4_HDR_LEN: usize = 20;
@@ -13,8 +15,8 @@ pub struct Ipv4Header {
     pub flags_fragment_offset: u16,
     pub ttl: u8,
     pub protocol: u8,
-    pub src: [u8; 4],
-    pub dst: [u8; 4],
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
 }
 
 impl Ipv4Header {
@@ -47,8 +49,8 @@ impl Ipv4Header {
             flags_fragment_offset: u16::from_be_bytes([buf[6], buf[7]]),
             ttl: buf[8],
             protocol: buf[9],
-            src: buf[12..16].try_into().unwrap(),
-            dst: buf[16..20].try_into().unwrap(),
+            src: Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]),
+            dst: Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]),
         })
     }
 
@@ -65,8 +67,8 @@ impl Ipv4Header {
         out[8] = self.ttl;
         out[9] = self.protocol;
         out[10..12].copy_from_slice(&[0, 0]); // checksum placeholder / offload zero
-        out[12..16].copy_from_slice(&self.src);
-        out[16..20].copy_from_slice(&self.dst);
+        out[12..16].copy_from_slice(&self.src.octets());
+        out[16..20].copy_from_slice(&self.dst.octets());
         if !offload_cksum {
             let csum = checksum::checksum(&out[..IPV4_HDR_LEN]);
             out[10..12].copy_from_slice(&csum.to_be_bytes());

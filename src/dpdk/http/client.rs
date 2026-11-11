@@ -518,7 +518,7 @@ impl Client {
             let local_port = self.alloc_ephemeral_port();
             match TcpStream::connect(
                 &self.worker,
-                ip.octets(),
+                ip,
                 port,
                 local_port,
                 options,
