@@ -15,13 +15,16 @@ use super::tcb::FourTuple;
 pub struct TcpSocket(pub FourTuple);
 
 impl TcpSocket {
+    /// Starts an active open. Returns `None` if the 4-tuple is already
+    /// tracked by the engine (live or in TIME_WAIT); pick another local
+    /// port and retry.
     pub fn connect(
         engine: &mut TcpEngine,
         remote_ip: [u8; 4],
         remote_port: u16,
         local_port: u16,
-    ) -> Self {
-        Self(engine.connect(remote_ip, remote_port, local_port))
+    ) -> Option<Self> {
+        engine.connect(remote_ip, remote_port, local_port).map(Self)
     }
 
     /// Pops the next fully-established connection accepted on `port`, if

@@ -87,7 +87,7 @@ mod dpdk {
                 local_mac: LOCAL_MAC,
                 gateway: None,
             });
-            let tuple = engine.connect(PEER_IP, 80, 1234);
+            let tuple = engine.connect(PEER_IP, 80, 1234).unwrap();
             let mut f = Self {
                 engine,
                 port,

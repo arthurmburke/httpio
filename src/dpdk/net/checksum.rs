@@ -20,11 +20,18 @@ pub fn sum16(data: &[u8], seed: u32) -> u32 {
 
 /// Folds a 32-bit accumulated sum down to a 16-bit one's-complement
 /// checksum ready to place in the wire header.
-pub fn fold(mut sum: u32) -> u16 {
+pub fn fold(sum: u32) -> u16 {
+    !fold_raw(sum)
+}
+
+/// Folds carries of a 32-bit accumulated sum into 16 bits WITHOUT taking
+/// the one's complement. This is the value DPDK's TX L4 checksum offload
+/// expects pre-filled in the checksum field (see `rte_ipv4_phdr_cksum`).
+pub fn fold_raw(mut sum: u32) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
-    !(sum as u16)
+    sum as u16
 }
 
 /// Internet checksum over a single contiguous buffer (e.g. an IPv4 header

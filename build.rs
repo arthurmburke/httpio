@@ -28,7 +28,18 @@ fn main() {
     // cargo:rustc-link-lib/search lines for every DPDK library). If it isn't
     // installed, build the rest of the crate without the DPDK stack rather
     // than failing.
-    let Ok(dpdk) = pkg_config::Config::new().statik(false).probe("libdpdk") else {
+    //
+    // `cargo_metadata(false)`: the link lines are emitted by hand at the end
+    // of this script, *after* the static-inline wrapper archive. The linker
+    // resolves left to right under `--as-needed`, so a DPDK shared library
+    // listed before the archive is dropped unless Rust code happens to
+    // reference it directly -- leaving the wrappers' own references
+    // (`per_lcore__lcore_id`, `rte_mempool_ops_table`, ...) undefined.
+    let Ok(dpdk) = pkg_config::Config::new()
+        .statik(false)
+        .cargo_metadata(false)
+        .probe("libdpdk")
+    else {
         println!(
             "cargo::warning=libdpdk not found via pkg-config; building without the DPDK stack \
              (core + http traits only). Install the DPDK dev packages (e.g. \
@@ -40,10 +51,6 @@ fn main() {
 
     // libdpdk is present: turn on the DPDK stack.
     println!("cargo::rustc-cfg=dpdk");
-
-    // numa/pthread aren't always pulled in transitively by libdpdk.pc.
-    println!("cargo:rustc-link-lib=numa");
-    println!("cargo:rustc-link-lib=pthread");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let static_fns_c = out_dir.join("dpdk_static_fns.c");
@@ -109,4 +116,19 @@ fn main() {
         .flag_if_supported("-Wno-duplicate-decl-specifier")
         .flag_if_supported("-Wno-implicit-function-declaration")
         .compile("dpdk_static_fns");
+
+    // DPDK's libraries, after the wrapper archive that depends on them (see
+    // the probe above for why the order matters).
+    for path in &dpdk.link_paths {
+        println!("cargo:rustc-link-search=native={}", path.display());
+    }
+    for args in &dpdk.ld_args {
+        println!("cargo:rustc-link-arg=-Wl,{}", args.join(","));
+    }
+    for lib in &dpdk.libs {
+        println!("cargo:rustc-link-lib={lib}");
+    }
+    // numa/pthread aren't always pulled in transitively by libdpdk.pc.
+    println!("cargo:rustc-link-lib=numa");
+    println!("cargo:rustc-link-lib=pthread");
 }

@@ -165,7 +165,7 @@ fn engine_transmits_window_updates_and_final_reset() {
         .write(&mut packet.data_mut()[eth::ETH_HDR_LEN..]);
         assert!(port.tx_burst(vec![packet]).is_empty());
         engine.poll(&port, &pool, now);
-        let tuple = engine.connect(PEER_IP, 80, 1234);
+        let tuple = engine.connect(PEER_IP, 80, 1234).unwrap();
         engine.poll(&port, &pool, now);
         let syn = output(&port).remove(0);
         let mut peer = tcp::TcpHeader {

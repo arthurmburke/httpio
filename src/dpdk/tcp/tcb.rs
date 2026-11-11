@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::dpdk::net::tcp::{TcpHeader, TcpOptions, flags};
 
 use super::congestion::CongestionControl;
-use super::rto::{MAX_RETRANSMITS, RetransmitQueue, RtoEstimator};
+use super::rto::{MAX_RETRANSMITS, MAX_RTO, RetransmitQueue, RtoEstimator};
 use super::rx_queue::ReassemblyBuffer;
 use super::seq::Seq;
 use super::state::TcpState;
@@ -86,6 +86,22 @@ pub struct Tcb {
     want_rst: bool,
     close_requested: bool,
     retransmit_now: bool,
+    /// SEG.ACK of an unacceptable handshake ACK: RFC 9293 §3.10.7.3 /
+    /// §3.10.7.4 require the answering RST to use it as its sequence number
+    /// (`<SEQ=SEG.ACK><CTL=RST>`). `None` means the RST uses `snd_nxt`.
+    rst_seq: Option<Seq>,
+
+    /// Zero-window probe timer (RFC 9293 §3.8.6.1): armed while data is
+    /// buffered, nothing is in flight, and the peer's window is zero.
+    persist_deadline: Option<Instant>,
+    /// Interval to use for the next persist arming; doubles per probe up to
+    /// `MAX_RTO` and resets once the window opens or the buffer empties.
+    persist_backoff: Option<Duration>,
+    /// The persist timer fired: the next output poll sends a 1-byte probe.
+    persist_probe_now: bool,
+    /// A window probe is unacknowledged. A peer that answers it (even with
+    /// a zero window) is alive, so such answers reset its retransmit count.
+    probe_outstanding: bool,
 
     /// TCP_NODELAY: when set, Nagle's algorithm (RFC 9293 §3.7.4) is
     /// disabled and sub-MSS segments are sent immediately instead of
@@ -144,6 +160,11 @@ impl Tcb {
             want_rst: false,
             close_requested: false,
             retransmit_now: false,
+            rst_seq: None,
+            persist_deadline: None,
+            persist_backoff: None,
+            persist_probe_now: false,
+            probe_outstanding: false,
             nodelay: false,
             corked: false,
             flush_requested: false,
@@ -167,6 +188,7 @@ impl Tcb {
         tcb.irs = peer_iss;
         tcb.rcv_nxt = peer_iss + 1;
         tcb.peer_mss = peer_mss.clamp(1, DEFAULT_MSS);
+        tcb.congestion = CongestionControl::new(tcb.peer_mss);
         tcb.snd_nxt = tcb.iss + 1;
         tcb.want_synack = true;
         tcb
@@ -321,6 +343,7 @@ impl Tcb {
             let ack = Seq::new(hdr.ack);
             if ack.leq(self.iss) || ack.gt(self.snd_nxt) {
                 self.want_rst = true;
+                self.rst_seq = Some(ack);
                 return;
             }
         }
@@ -394,6 +417,14 @@ impl Tcb {
             let overlaps_window = seq.lt(window_end) && (seq + seg_len.max(1)).gt(self.rcv_nxt);
             if !overlaps_window {
                 self.ack_pending = true; // stray segment: re-ACK our state
+                // RFC 9293 §3.10.7.4 (TIME-WAIT): a retransmitted FIN means
+                // our ACK was lost; re-ACK it and restart the 2MSL timer.
+                if self.state == TcpState::TimeWait
+                    && hdr.has_flag(flags::FIN)
+                    && seq + payload_len + 1 == self.rcv_nxt
+                {
+                    self.time_wait_deadline = Some(now + TIME_WAIT_DURATION);
+                }
                 return;
             }
         }
@@ -402,6 +433,7 @@ impl Tcb {
             // RFC 9293 §3.10.7.4 step 4: SYN in the window after the
             // connection is synchronized is an error -> reset.
             self.want_rst = true;
+            self.rst_seq = None;
             self.state = TcpState::Closed;
             self.events.push(Event::Reset);
             return;
@@ -417,16 +449,35 @@ impl Tcb {
         }
 
         if self.state.can_receive() && payload_len != 0 {
+            // Enforce the advertised window [rcv_nxt, rcv_nxt + rcv_wnd):
+            // in-order and out-of-order data alike is truncated at the right
+            // edge, and a segment wholly beyond it (or any data while the
+            // window is zero) is dropped. A truncated segment's FIN is not
+            // consumed because `on_fin` compares against the original length.
             let seq = Seq::new(hdr.seq);
-            let new_rcv_nxt = self.recv_buffer.insert(seq, payload(), self.rcv_nxt);
-            if new_rcv_nxt != self.rcv_nxt {
-                self.rcv_nxt = new_rcv_nxt;
+            let rcv_wnd =
+                RECV_BUFFER_CAPACITY.saturating_sub(self.recv_buffer.readable_len() as u32);
+            let right_edge = self.rcv_nxt + rcv_wnd;
+            let keep = if seq.geq(right_edge) {
+                0
+            } else {
+                payload_len.min(right_edge.distance(seq) as u32)
+            };
+            if keep != 0 {
+                let mut data = payload();
+                if (keep as usize) < data.len() {
+                    data.truncate(keep as usize);
+                }
+                let new_rcv_nxt = self.recv_buffer.insert(seq, data, self.rcv_nxt);
+                if new_rcv_nxt != self.rcv_nxt {
+                    self.rcv_nxt = new_rcv_nxt;
+                }
             }
             self.ack_pending = true;
         }
 
         if hdr.has_flag(flags::FIN) && self.state.is_synchronized() {
-            self.on_fin(hdr, payload_len);
+            self.on_fin(hdr, payload_len, now);
         }
     }
 
@@ -437,6 +488,7 @@ impl Tcb {
             TcpState::SynReceived => {
                 if ack.leq(self.snd_una) || ack.gt(self.snd_nxt) {
                     self.want_rst = true;
+                    self.rst_seq = Some(ack);
                     return;
                 }
                 self.snd_una = ack;
@@ -471,7 +523,18 @@ impl Tcb {
             if let Some(rtt) = self.retransmit.ack_up_to(self.snd_una, now) {
                 self.rto.sample(rtt);
             }
+            let was_in_recovery = self.congestion.in_fast_recovery();
             self.congestion.on_new_ack(newly_acked, ack.0);
+            if was_in_recovery && self.congestion.in_fast_recovery() {
+                // Partial ACK (RFC 6582 §3.2): the next unacked segment was
+                // lost too; retransmit it now instead of waiting for an RTO.
+                // Karn: the retransmission makes its eventual ACK ambiguous.
+                if let Some(seg) = self.retransmit.segments.front_mut() {
+                    seg.retransmitted = true;
+                    seg.last_sent_at = now;
+                    self.retransmit_now = true;
+                }
+            }
             self.update_send_window(hdr, ack);
         } else if ack == self.snd_una {
             // RFC 5681 §2: a duplicate ACK carries no data and doesn't
@@ -480,6 +543,7 @@ impl Tcb {
             let is_dup_candidate =
                 payload_len == 0 && !hdr.has_flag(flags::SYN) && !hdr.has_flag(flags::FIN);
             if is_dup_candidate
+                && !self.probe_outstanding
                 && self.flight_size() > 0
                 && self.congestion.on_duplicate_ack(self.snd_nxt.0)
             {
@@ -493,6 +557,19 @@ impl Tcb {
                 self.retransmit_now = true;
             }
             self.update_send_window(hdr, ack);
+        }
+
+        if self.probe_outstanding {
+            if self.flight_size() == 0 || self.snd_wnd > 0 {
+                self.probe_outstanding = false;
+            } else if hdr.window == 0
+                && let Some(seg) = self.retransmit.segments.front_mut()
+            {
+                // The peer answered the probe (still advertising zero):
+                // it is alive, so keep probing indefinitely rather than
+                // counting this toward retransmission exhaustion.
+                seg.retransmit_count = 0;
+            }
         }
 
         match self.state {
@@ -516,7 +593,7 @@ impl Tcb {
         }
     }
 
-    fn on_fin(&mut self, hdr: &TcpHeader, payload_len: u32) {
+    fn on_fin(&mut self, hdr: &TcpHeader, payload_len: u32, now: Instant) {
         // The FIN consumes the sequence number immediately after any data
         // carried in the same segment. Only advance for an in-order FIN;
         // an out-of-order one is simply not acked yet, and the peer will
@@ -533,7 +610,7 @@ impl Tcb {
             TcpState::Established => TcpState::CloseWait,
             TcpState::FinWait1 => TcpState::Closing,
             TcpState::FinWait2 => {
-                self.time_wait_deadline = Some(Instant::now() + TIME_WAIT_DURATION);
+                self.time_wait_deadline = Some(now + TIME_WAIT_DURATION);
                 TcpState::TimeWait
             }
             other => other,
@@ -547,6 +624,13 @@ impl Tcb {
     pub fn tick(&mut self, now: Instant) {
         if self.is_closed() {
             return;
+        }
+        self.update_persist(now);
+        if let Some(deadline) = self.persist_deadline
+            && now >= deadline
+        {
+            self.persist_deadline = None;
+            self.persist_probe_now = true;
         }
         if let Some(deadline) = self.time_wait_deadline
             && now >= deadline
@@ -563,6 +647,35 @@ impl Tcb {
         }
     }
 
+    /// RFC 9293 §3.8.6.1: data is buffered, nothing is in flight to elicit
+    /// an ACK, and the peer's window is zero, so only a probe can learn
+    /// that the window reopened.
+    fn persist_needed(&self) -> bool {
+        self.state.can_send()
+            && !self.send_buffer.is_empty()
+            && self.snd_wnd == 0
+            && self.flight_size() == 0
+    }
+
+    /// Arms or disarms the persist timer to match `persist_needed`. The
+    /// backoff survives while a probe is in flight and is reset once the
+    /// window opens or the buffer empties.
+    fn update_persist(&mut self, now: Instant) {
+        if self.persist_needed() {
+            if self.persist_deadline.is_none() && !self.persist_probe_now {
+                let interval = self.persist_backoff.unwrap_or_else(|| self.rto.rto());
+                self.persist_deadline = Some(now + interval);
+                self.persist_backoff = Some((interval * 2).min(MAX_RTO));
+            }
+        } else {
+            self.persist_deadline = None;
+            self.persist_probe_now = false;
+            if self.snd_wnd > 0 || self.send_buffer.is_empty() {
+                self.persist_backoff = None;
+            }
+        }
+    }
+
     fn on_rto(&mut self, now: Instant) {
         self.congestion.on_rto_timeout(self.flight_size());
         self.rto.backoff();
@@ -572,6 +685,7 @@ impl Tcb {
             seg.last_sent_at = now;
             if seg.retransmit_count > MAX_RETRANSMITS {
                 self.want_rst = true;
+                self.rst_seq = None;
                 self.state = TcpState::Closed;
                 // An aborted connection must reach the worker's error
                 // path, including after the handshake has completed.
@@ -599,7 +713,8 @@ impl Tcb {
 
         if self.want_rst {
             self.want_rst = false;
-            out.push(self.make_segment(self.snd_nxt, flags::RST, Bytes::new(), None));
+            let seq = self.rst_seq.take().unwrap_or(self.snd_nxt);
+            out.push(self.make_segment(seq, flags::RST, Bytes::new(), None));
             return;
         }
 
@@ -686,6 +801,21 @@ impl Tcb {
     }
 
     fn send_new_data(&mut self, now: Instant, out: &mut Vec<OutSegment>) {
+        // Zero-window probe: one byte as an ordinary data segment, so the
+        // retransmit queue and ACK processing handle it like any other.
+        if self.persist_probe_now {
+            self.persist_probe_now = false;
+            if self.persist_needed() {
+                let data = self.send_buffer.take(1);
+                let seq = self.snd_nxt;
+                self.snd_nxt = self.snd_nxt + data.len() as u32;
+                self.retransmit.push(seq, data.clone(), false, false, now);
+                self.probe_outstanding = true;
+                out.push(self.make_segment(seq, flags::ACK | flags::PSH, data, None));
+                self.ack_pending = false;
+            }
+        }
+
         loop {
             let usable_window = self.snd_wnd.min(self.congestion.cwnd());
             let flight = self.flight_size();
@@ -733,6 +863,8 @@ impl Tcb {
         if self.send_buffer.is_empty() {
             self.flush_requested = false;
         }
+
+        self.update_persist(now);
     }
 
     fn make_segment(
@@ -774,8 +906,11 @@ impl Tcb {
         // A corked tail (or a Nagle-held one waiting on an ACK) is not
         // "pending" -- nothing will go out until flush()/an ACK arrives,
         // so don't make a wakeup-hint-driven caller spin on it.
+        // Likewise data blocked only by a zero send window: the persist
+        // timer (see `has_armed_timer`) drives the probe, not a busy poll.
         let sendable_data = self.state.can_send()
             && !self.send_buffer.is_empty()
+            && self.snd_wnd > 0
             && (self.send_buffer.len() >= self.peer_mss.min(self.local_mss) as usize
                 || self.flush_requested
                 || (!self.corked && self.nodelay)
@@ -785,24 +920,31 @@ impl Tcb {
             || self.want_rst
             || self.ack_pending
             || self.retransmit_now
+            || self.persist_probe_now
             || sendable_data
             // A FIN still waiting to be sent (close requested, buffer
             // drained, not yet sent).
             || (self.close_requested && !self.fin_sent && self.send_buffer.is_empty())
     }
 
-    /// Whether a retransmission or TIME_WAIT timer is armed, i.e. the
+    /// Whether a retransmission, persist or TIME_WAIT timer is armed, i.e. the
     /// connection needs `tick`ing on future polls even with no pending
     /// output. Together with `has_pending_output`, this is what keeps a
     /// connection in the engine's active set; a connection with neither is
     /// fully idle and can be skipped until an inbound frame or app call.
     pub fn has_armed_timer(&self) -> bool {
-        !self.retransmit.is_empty() || self.time_wait_deadline.is_some()
+        !self.retransmit.is_empty()
+            || self.time_wait_deadline.is_some()
+            // Reported as soon as the persist condition holds (before the
+            // deadline is armed by the next tick/poll) so the engine ticks it.
+            || self.persist_deadline.is_some()
+            || self.persist_needed()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::rto::MAX_RTO;
     use super::*;
 
     fn tuple() -> FourTuple {
@@ -1010,5 +1152,198 @@ mod tests {
                 .iter()
                 .any(|seg| seg.payload == b"payload"[..])
         );
+    }
+
+    #[test]
+    fn zero_window_persist_timer_probes_and_resumes() {
+        let mut now = Instant::now();
+        let mut tcb = establish(now);
+        let zero = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, 0);
+        tcb.on_segment(&zero, Bytes::new(), now);
+        tcb.poll_output(now);
+        tcb.send(Bytes::from_static(b"0123456789"));
+        assert!(tcb.poll_output(now).is_empty());
+        assert!(!tcb.has_pending_output());
+        assert!(tcb.has_armed_timer());
+
+        // Probe once the persist deadline passes.
+        now += Duration::from_secs(2);
+        tcb.tick(now);
+        let probe = tcb.poll_output(now);
+        assert_eq!(probe.len(), 1);
+        assert!(probe[0].payload == b"0"[..]);
+        assert_eq!(tcb.flight_size(), 1);
+
+        // The peer keeps answering with a zero window (not acking the
+        // byte): it is alive, so the connection must survive far more than
+        // MAX_RETRANSMITS probe retransmissions.
+        for _ in 0..(MAX_RETRANSMITS * 2) {
+            now += MAX_RTO + Duration::from_secs(1);
+            tcb.tick(now);
+            tcb.poll_output(now);
+            let ans = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, 0);
+            tcb.on_segment(&ans, Bytes::new(), now);
+        }
+        assert_eq!(tcb.state, TcpState::Established);
+        assert!(tcb.events.iter().all(|e| *e != Event::Reset));
+
+        // Window opens: the probe is acked and the rest flows.
+        let open = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, 1000);
+        tcb.on_segment(&open, Bytes::new(), now);
+        let rest = tcb.poll_output(now);
+        assert_eq!(rest.len(), 1);
+        assert!(rest[0].payload == b"123456789"[..]);
+        assert!(tcb.persist_deadline.is_none());
+    }
+
+    #[test]
+    fn data_beyond_a_full_receive_window_is_not_buffered() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        for _ in 0..64 {
+            let hdr = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
+            tcb.on_segment(&hdr, Bytes::from(vec![1; 1024]), now);
+            tcb.poll_output(now);
+        }
+        let rcv_nxt = tcb.rcv_nxt;
+        let hdr = header(rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
+        tcb.on_segment(&hdr, Bytes::from(vec![2; 100]), now);
+        assert_eq!(tcb.readable_len(), 64 * 1024);
+        assert_eq!(tcb.rcv_nxt, rcv_nxt);
+        assert!(tcb.ack_pending);
+        // Out-of-order data beyond the right edge is dropped too.
+        let hdr = header(rcv_nxt + 10, tcb.snd_una, flags::ACK, u16::MAX);
+        tcb.on_segment(&hdr, Bytes::from(vec![2; 100]), now);
+        assert!(!tcb.recv_buffer.has_out_of_order());
+    }
+
+    #[test]
+    fn segment_straddling_the_window_edge_is_truncated_without_its_fin() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        for _ in 0..63 {
+            let hdr = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
+            tcb.on_segment(&hdr, Bytes::from(vec![1; 1024]), now);
+        }
+        let rcv_nxt = tcb.rcv_nxt;
+        let hdr = header(rcv_nxt, tcb.snd_una, flags::ACK | flags::FIN, u16::MAX);
+        tcb.on_segment(&hdr, Bytes::from(vec![2; 1500]), now);
+        assert_eq!(tcb.readable_len(), 64 * 1024);
+        assert_eq!(tcb.rcv_nxt, rcv_nxt + 1024);
+        assert_eq!(tcb.state, TcpState::Established);
+        assert!(!tcb.events.contains(&Event::PeerClosed));
+    }
+
+    #[test]
+    fn syn_sent_bad_ack_reset_uses_the_offending_ack_as_sequence() {
+        let now = Instant::now();
+        let mut tcb = Tcb::new_active(tuple());
+        tcb.poll_output(now);
+        let bad_ack = tcb.snd_nxt + 5;
+        let hdr = header(Seq::new(1000), bad_ack, flags::SYN | flags::ACK, 100);
+        tcb.on_segment(&hdr, Bytes::new(), now);
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].flags, flags::RST);
+        assert_eq!(out[0].seq, bad_ack);
+    }
+
+    #[test]
+    fn syn_received_bad_ack_reset_uses_the_offending_ack_as_sequence() {
+        let now = Instant::now();
+        let mut tcb = Tcb::new_from_listen(tuple(), Seq::new(1000), 1460);
+        tcb.poll_output(now);
+        let bad_ack = tcb.snd_nxt + 10;
+        let hdr = header(Seq::new(1001), bad_ack, flags::ACK, 100);
+        tcb.on_segment(&hdr, Bytes::new(), now);
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].flags, flags::RST);
+        assert_eq!(out[0].seq, bad_ack);
+        // Other resets still use snd_nxt.
+        let mut est = establish(now);
+        let syn = header(est.rcv_nxt, est.snd_una, flags::SYN | flags::ACK, 100);
+        est.on_segment(&syn, Bytes::new(), now);
+        let out = est.poll_output(now);
+        assert_eq!(out[0].flags, flags::RST);
+        assert_eq!(out[0].seq, est.snd_nxt);
+    }
+
+    fn into_time_wait(now: Instant) -> Tcb {
+        let mut tcb = establish(now);
+        tcb.close();
+        tcb.poll_output(now);
+        assert_eq!(tcb.state, TcpState::FinWait1);
+        let ack = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
+        tcb.on_segment(&ack, Bytes::new(), now);
+        assert_eq!(tcb.state, TcpState::FinWait2);
+        let fin = header(tcb.rcv_nxt, tcb.snd_nxt, flags::FIN | flags::ACK, u16::MAX);
+        tcb.on_segment(&fin, Bytes::new(), now);
+        assert_eq!(tcb.state, TcpState::TimeWait);
+        tcb
+    }
+
+    #[test]
+    fn time_wait_expires_relative_to_the_supplied_clock() {
+        let t = Instant::now();
+        let mut tcb = into_time_wait(t);
+        tcb.tick(t + TIME_WAIT_DURATION - Duration::from_millis(1));
+        assert_eq!(tcb.state, TcpState::TimeWait);
+        tcb.tick(t + TIME_WAIT_DURATION);
+        assert_eq!(tcb.state, TcpState::Closed);
+    }
+
+    #[test]
+    fn retransmitted_fin_in_time_wait_is_reacked_and_restarts_the_timer() {
+        let t = Instant::now();
+        let mut tcb = into_time_wait(t);
+        tcb.poll_output(t);
+        let t2 = t + Duration::from_secs(10);
+        let fin = header(
+            tcb.rcv_nxt - 1,
+            tcb.snd_nxt,
+            flags::FIN | flags::ACK,
+            u16::MAX,
+        );
+        tcb.on_segment(&fin, Bytes::new(), t2);
+        let out = tcb.poll_output(t2);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].flags, flags::ACK);
+        tcb.tick(t + TIME_WAIT_DURATION + Duration::from_secs(1));
+        assert_eq!(tcb.state, TcpState::TimeWait);
+        tcb.tick(t2 + TIME_WAIT_DURATION);
+        assert_eq!(tcb.state, TcpState::Closed);
+    }
+
+    #[test]
+    fn partial_ack_in_fast_recovery_retransmits_the_next_segment() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.set_nodelay(true);
+        for chunk in [&b"aaaa"[..], b"bbbb", b"cccc", b"dddd"] {
+            tcb.send(Bytes::copy_from_slice(chunk));
+            assert_eq!(tcb.poll_output(now).len(), 1);
+        }
+        let dup = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
+        for _ in 0..3 {
+            tcb.on_segment(&dup, Bytes::new(), now);
+        }
+        assert!(tcb.congestion.in_fast_recovery());
+        let first = tcb.poll_output(now);
+        assert!(first.iter().any(|s| s.payload == b"aaaa"[..]));
+
+        // Ack only "aaaa": a partial ack, "bbbb" is lost as well.
+        let partial = header(tcb.rcv_nxt, tcb.snd_una + 4, flags::ACK, u16::MAX);
+        tcb.on_segment(&partial, Bytes::new(), now);
+        assert!(tcb.congestion.in_fast_recovery());
+        assert!(tcb.retransmit_now);
+        let second = tcb.poll_output(now);
+        assert!(second.iter().any(|s| s.payload == b"bbbb"[..]));
+    }
+
+    #[test]
+    fn passive_open_sizes_congestion_window_from_the_peer_mss() {
+        let tcb = Tcb::new_from_listen(tuple(), Seq::new(1000), 536);
+        assert_eq!(tcb.congestion.cwnd(), 2 * 536);
     }
 }

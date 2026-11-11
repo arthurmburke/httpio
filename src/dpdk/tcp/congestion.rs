@@ -29,7 +29,7 @@ impl CongestionControl {
             // RFC 5681 §3.1 initial window (conservative IW = 2*MSS here;
             // real stacks vary the initial window with MSS, capped ~4
             // segments).
-            cwnd: 2 * mss,
+            cwnd: mss.saturating_mul(2),
             ssthresh: u32::MAX,
             phase: Phase::SlowStart,
             dup_ack_count: 0,
@@ -46,7 +46,7 @@ impl CongestionControl {
         self.dup_ack_count = 0;
         match self.phase {
             Phase::SlowStart => {
-                self.cwnd += newly_acked.min(self.mss);
+                self.cwnd = self.cwnd.saturating_add(newly_acked.min(self.mss));
                 if self.cwnd >= self.ssthresh {
                     self.phase = Phase::CongestionAvoidance;
                 }
@@ -55,7 +55,7 @@ impl CongestionControl {
                 // Additive increase: +MSS per RTT, approximated as
                 // +MSS*MSS/cwnd per ACK.
                 let inc = ((self.mss as u64 * self.mss as u64) / self.cwnd as u64).max(1) as u32;
-                self.cwnd += inc;
+                self.cwnd = self.cwnd.saturating_add(inc);
             }
             Phase::FastRecovery { recovery_point } => {
                 if snd_una_after.wrapping_sub(recovery_point) as i32 >= 0 {
@@ -82,13 +82,13 @@ impl CongestionControl {
             // Already in recovery: RFC 5681's "artificial inflation" --
             // each further dup ack means another segment left the
             // network, so cwnd can grow by one MSS.
-            self.cwnd += self.mss;
+            self.cwnd = self.cwnd.saturating_add(self.mss);
             return false;
         }
         self.dup_ack_count += 1;
         if self.dup_ack_count == 3 {
-            self.ssthresh = (self.cwnd / 2).max(2 * self.mss);
-            self.cwnd = self.ssthresh + 3 * self.mss;
+            self.ssthresh = (self.cwnd / 2).max(self.mss.saturating_mul(2));
+            self.cwnd = self.ssthresh.saturating_add(self.mss.saturating_mul(3));
             self.phase = Phase::FastRecovery { recovery_point };
             true
         } else {
@@ -100,7 +100,7 @@ impl CongestionControl {
     /// 6298 §5): a timeout is a stronger loss signal than dup ACKs, so
     /// congestion control resets to slow start regardless of phase.
     pub fn on_rto_timeout(&mut self, flight_size: u32) {
-        self.ssthresh = (flight_size / 2).max(2 * self.mss);
+        self.ssthresh = (flight_size / 2).max(self.mss.saturating_mul(2));
         self.cwnd = self.mss;
         self.phase = Phase::SlowStart;
         self.dup_ack_count = 0;
@@ -108,5 +108,68 @@ impl CongestionControl {
 
     pub fn in_fast_recovery(&self) -> bool {
         matches!(self.phase, Phase::FastRecovery { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_start_saturates() {
+        let mut cc = CongestionControl::new(1460);
+        cc.cwnd = u32::MAX - 10;
+        cc.on_new_ack(1460, 1000);
+        assert_eq!(cc.cwnd(), u32::MAX);
+        cc.on_new_ack(1460, 2000);
+        assert_eq!(cc.cwnd(), u32::MAX);
+    }
+
+    #[test]
+    fn congestion_avoidance_saturates() {
+        let mut cc = CongestionControl::new(1460);
+        cc.phase = Phase::CongestionAvoidance;
+        cc.cwnd = u32::MAX;
+        cc.on_new_ack(1460, 1000);
+        assert_eq!(cc.cwnd(), u32::MAX);
+        cc.cwnd = u32::MAX - 1;
+        cc.on_new_ack(1460, 2000);
+        assert_eq!(cc.cwnd(), u32::MAX);
+    }
+
+    #[test]
+    fn fast_recovery_saturates() {
+        let mut cc = CongestionControl::new(1460);
+        cc.cwnd = u32::MAX;
+        assert!(!cc.on_duplicate_ack(500));
+        assert!(!cc.on_duplicate_ack(500));
+        assert!(cc.on_duplicate_ack(500));
+        assert!(cc.in_fast_recovery());
+        assert_eq!(cc.ssthresh, u32::MAX / 2);
+        cc.cwnd = u32::MAX - 5;
+        assert!(!cc.on_duplicate_ack(500));
+        assert_eq!(cc.cwnd(), u32::MAX);
+        // Exiting recovery is fine too.
+        cc.on_new_ack(1460, 600);
+        assert_eq!(cc.cwnd(), u32::MAX / 2);
+    }
+
+    #[test]
+    fn ssthresh_plus_inflation_saturates() {
+        let mut cc = CongestionControl::new(1460);
+        cc.cwnd = u32::MAX;
+        cc.ssthresh = u32::MAX;
+        for _ in 0..3 {
+            cc.on_duplicate_ack(0);
+        }
+        // ssthresh = MAX/2, + 3*mss: no overflow.
+        assert_eq!(cc.cwnd(), u32::MAX / 2 + 3 * 1460);
+    }
+
+    #[test]
+    fn rto_resets() {
+        let mut cc = CongestionControl::new(1460);
+        cc.on_rto_timeout(u32::MAX);
+        assert_eq!(cc.cwnd(), 1460);
     }
 }

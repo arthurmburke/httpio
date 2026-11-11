@@ -116,11 +116,16 @@ pub struct TcpStream {
     got_eof: bool,
     /// Connection was reset; surface as an error on the next empty read.
     got_reset: bool,
+    /// The worker refused the open: the 4-tuple is already in use.
+    addr_in_use: bool,
 }
 
 impl TcpStream {
     /// Opens a connection via the worker and resolves once the handshake
-    /// completes (or errors with `ConnectionRefused` on RST/timeout).
+    /// completes. Errors: `ConnectionRefused` on RST/timeout, `AddrInUse` if
+    /// the worker refused the 4-tuple because it is already in use (retry
+    /// with another local port), and `ConnectionAborted` if the worker went
+    /// away before the handshake finished.
     pub async fn connect(
         worker: &WorkerHandle,
         remote_ip: [u8; 4],
@@ -146,6 +151,7 @@ impl TcpStream {
             read_queue: VecDeque::new(),
             got_eof: false,
             got_reset: false,
+            addr_in_use: false,
         };
         poll_fn(|cx| stream.poll_established(cx)).await?;
         Ok(stream)
@@ -229,6 +235,12 @@ impl TcpStream {
 
     fn poll_established(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.drain_inbound();
+        if self.addr_in_use {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "local address (4-tuple) already in use",
+            )));
+        }
         if self.got_reset {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
@@ -241,6 +253,13 @@ impl TcpStream {
         // consumed in drain_inbound; track readiness via a dedicated flag.
         if self.established {
             Poll::Ready(Ok(()))
+        } else if self.got_eof {
+            // The worker dropped its sender without ever sending
+            // `Established` or a failure: it stopped or reaped us.
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "worker went away before the handshake completed",
+            )))
         } else {
             cx.waker().wake_by_ref();
             Poll::Pending
@@ -249,6 +268,13 @@ impl TcpStream {
 
     /// Drains all currently-available inbound messages into local state.
     fn drain_inbound(&mut self) {
+        // Sample closed-ness *before* draining: the worker pushes its last
+        // messages and only then drops its sender, so if the ring is closed
+        // now, everything it will ever send is already visible to the pops
+        // below. (Sampling after the drain could latch EOF while messages
+        // pushed in between are still queued.) `is_closed()` is true when
+        // either end is dropped; from the receiver that means the sender.
+        let sender_gone = self.inbound_rx.is_closed();
         while let Some(msg) = self.inbound_rx.pop() {
             match msg {
                 Inbound::Established => self.established = true,
@@ -262,11 +288,17 @@ impl TcpStream {
                     self.got_reset = true;
                     self.got_eof = true;
                 }
+                Inbound::AddrInUse => {
+                    self.addr_in_use = true;
+                    self.got_eof = true;
+                }
             }
         }
         // If the worker dropped its inbound sender (connection reaped),
-        // treat as EOF so a stuck reader unblocks.
-        if self.inbound_rx.is_closed() {
+        // treat as EOF so a stuck reader unblocks -- but only because the
+        // ring was already closed before the drain above, so it is now
+        // known to be empty.
+        if sender_gone {
             self.got_eof = true;
         }
     }

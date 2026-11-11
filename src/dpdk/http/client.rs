@@ -48,6 +48,54 @@ use super::stream::{FlushHandle, TcpOptions, TcpStream};
 // Nested maps permit borrowed host lookups without constructing an origin key.
 type H2Pool = Arc<AsyncMutex<HashMap<String, HashMap<u16, http2::SendRequest<Full<Bytes>>>>>>;
 
+/// First port of the ephemeral range handed out by the client.
+const EPHEMERAL_FIRST: u16 = 49152;
+/// Last (inclusive) port of the ephemeral range.
+const EPHEMERAL_LAST: u16 = 65535;
+/// How many fresh local ports `dial` tries when the worker reports the
+/// 4-tuple already in use, before giving up with `Connect(AddrInUse)`.
+const DIAL_PORT_ATTEMPTS: usize = 64;
+
+/// Atomically takes the next port from `cursor`, wrapping from
+/// `EPHEMERAL_LAST` back to `EPHEMERAL_FIRST`. A cursor value outside the
+/// range is treated as `EPHEMERAL_FIRST`. Because the successor is computed
+/// inside one `fetch_update`, concurrent callers never receive the same
+/// port from a single pass over the range.
+fn next_ephemeral_port(cursor: &AtomicU16) -> u16 {
+    let in_range = |p: u16| {
+        if (EPHEMERAL_FIRST..=EPHEMERAL_LAST).contains(&p) {
+            p
+        } else {
+            EPHEMERAL_FIRST
+        }
+    };
+    let prev = cursor
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            let port = in_range(cur);
+            Some(if port == EPHEMERAL_LAST {
+                EPHEMERAL_FIRST
+            } else {
+                port + 1
+            })
+        })
+        .expect("closure always returns Some");
+    in_range(prev)
+}
+
+/// Classifies a request URI scheme (ASCII case-insensitive) for
+/// `http`/`https` requests: `Ok(true)` for TLS (`https`), `Ok(false)` for
+/// plain `http`, and `UnsupportedScheme` for anything else. An absent
+/// scheme is treated as `http`. (`http::Uri` already lowercases `http` and
+/// `https`, but this does not rely on that.)
+fn http_scheme_is_tls(scheme: Option<&str>) -> Result<bool, HttpError> {
+    match scheme {
+        None => Ok(false),
+        Some(s) if s.eq_ignore_ascii_case("https") => Ok(true),
+        Some(s) if s.eq_ignore_ascii_case("http") => Ok(false),
+        Some(_) => Err(HttpError::UnsupportedScheme),
+    }
+}
+
 fn normalized_host(host: &str) -> Cow<'_, str> {
     if host.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Owned(host.to_ascii_lowercase())
@@ -269,14 +317,14 @@ impl Client {
         }
 
         let uri = parts.uri.clone();
-        let scheme = uri.scheme_str().unwrap_or("http");
+        let is_https = http_scheme_is_tls(uri.scheme_str())?;
         let host = normalized_host(uri.host().ok_or(HttpError::MissingHost)?);
         let port = parts
             .uri
             .port_u16()
-            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+            .unwrap_or(if is_https { 443 } else { 80 });
 
-        if scheme == "https" {
+        if is_https {
             // Corked requests can't share a multiplexed h2 connection, so
             // they always take the h1 path (h1-only ALPN, no pooling).
             if tcp_options.cork {
@@ -293,7 +341,7 @@ impl Client {
                     .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
                 // Cork only now that the TLS handshake has completed.
                 tls.get_mut().0.request_cork();
-                return send_h1(tls, parts, Full::new(body), &host, port, &scheme).await;
+                return send_h1(tls, parts, Full::new(body), &host, port, is_https).await;
             }
 
             // Fast path: multiplex onto an existing h2 connection.
@@ -327,7 +375,7 @@ impl Client {
                     .insert(port, send_request.clone());
                 send_h2_on(send_request, parts, body).await
             } else {
-                send_h1(tls, parts, Full::new(body), &host, port, &scheme).await
+                send_h1(tls, parts, Full::new(body), &host, port, is_https).await
             }
         } else {
             let tcp = self
@@ -337,7 +385,7 @@ impl Client {
             if tcp_options.cork {
                 tcp.request_cork();
             }
-            send_h1(tcp, parts, Full::new(body), &host, port, &scheme).await
+            send_h1(tcp, parts, Full::new(body), &host, port, is_https).await
         }
     }
 
@@ -363,12 +411,12 @@ impl Client {
         }
 
         let uri = parts.uri.clone();
-        let scheme = uri.scheme_str().unwrap_or("http");
+        let is_https = http_scheme_is_tls(uri.scheme_str())?;
         let host = normalized_host(uri.host().ok_or(HttpError::MissingHost)?);
         let port = parts
             .uri
             .port_u16()
-            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+            .unwrap_or(if is_https { 443 } else { 80 });
 
         // Each chunk becomes one hyper data frame, by move -- no copy here.
         // A producer `Err` becomes a hyper body error, aborting the request.
@@ -380,7 +428,7 @@ impl Client {
         let tcp = self
             .dial(&host, port, tcp_options, flush_handle.as_ref())
             .await?;
-        if scheme == "https" {
+        if is_https {
             let server_name = ServerName::try_from(host.as_ref())
                 .map_err(|_| HttpError::InvalidHost)?
                 .to_owned();
@@ -393,13 +441,13 @@ impl Client {
                 // Cork only now that the TLS handshake has completed.
                 tls.get_mut().0.request_cork();
             }
-            send_h1(tls, parts, body, &host, port, &scheme).await
+            send_h1(tls, parts, body, &host, port, is_https).await
         } else {
             // Plain HTTP has no handshake, so cork right away.
             if tcp_options.cork {
                 tcp.request_cork();
             }
-            send_h1(tcp, parts, body, &host, port, &scheme).await
+            send_h1(tcp, parts, body, &host, port, is_https).await
         }
     }
 
@@ -462,17 +510,28 @@ impl Client {
         flush_handle: Option<&FlushHandle>,
     ) -> Result<TcpStream, HttpError> {
         let ip = self.resolve_ip(host)?;
-        let local_port = self.alloc_ephemeral_port();
-        TcpStream::connect(
-            &self.worker,
-            ip.octets(),
-            port,
-            local_port,
-            options,
-            flush_handle,
-        )
-        .await
-        .map_err(|e| HttpError::Connect(e.kind()))
+        // The cursor doesn't know which ports are still in use (live or
+        // TIME_WAIT), so the worker may refuse a 4-tuple with `AddrInUse`;
+        // retry with a fresh port a bounded number of times.
+        let mut last = std::io::ErrorKind::AddrInUse;
+        for _ in 0..DIAL_PORT_ATTEMPTS {
+            let local_port = self.alloc_ephemeral_port();
+            match TcpStream::connect(
+                &self.worker,
+                ip.octets(),
+                port,
+                local_port,
+                options,
+                flush_handle,
+            )
+            .await
+            {
+                Ok(stream) => return Ok(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => last = e.kind(),
+                Err(e) => return Err(HttpError::Connect(e.kind())),
+            }
+        }
+        Err(HttpError::Connect(last))
     }
 
     /// Checks out a clone of the pooled h2 `SendRequest` for this origin
@@ -503,15 +562,7 @@ impl Client {
     }
 
     fn alloc_ephemeral_port(&self) -> u16 {
-        loop {
-            let port = self.next_port.fetch_add(1, Ordering::Relaxed);
-            if (49152..=65535).contains(&port) {
-                return port;
-            }
-            // Wrapped past 65535: reset the cursor into the ephemeral
-            // range and retry.
-            self.next_port.store(49152, Ordering::Relaxed);
-        }
+        next_ephemeral_port(&self.next_port)
     }
 }
 
@@ -561,7 +612,7 @@ async fn send_h1<T, B>(
     body: B,
     host: &str,
     port: u16,
-    scheme: &str,
+    is_https: bool,
 ) -> Result<Response<Incoming>, HttpError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -578,7 +629,7 @@ where
         let _ = conn.await;
     });
 
-    let default_port = if scheme == "https" { 443 } else { 80 };
+    let default_port = if is_https { 443 } else { 80 };
     rewrite_to_origin_form(&mut parts, host, port, default_port)?;
     let request = Request::from_parts(parts, body);
 
@@ -649,6 +700,74 @@ async fn send_h2_on(
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    #[test]
+    fn scheme_classification_is_case_insensitive_and_strict() {
+        assert_eq!(http_scheme_is_tls(Some("https")), Ok(true));
+        assert_eq!(http_scheme_is_tls(Some("HTTPS")), Ok(true));
+        assert_eq!(http_scheme_is_tls(Some("HtTp")), Ok(false));
+        assert_eq!(http_scheme_is_tls(Some("http")), Ok(false));
+        assert_eq!(http_scheme_is_tls(None), Ok(false));
+        for bad in ["ftp", "ws", "wss", "httpss", ""] {
+            assert_eq!(
+                http_scheme_is_tls(Some(bad)),
+                Err(HttpError::UnsupportedScheme)
+            );
+        }
+        // End to end through http::Uri.
+        let uri: Uri = "HTTPS://example.com/".parse().unwrap();
+        assert_eq!(http_scheme_is_tls(uri.scheme_str()), Ok(true));
+        let uri: Uri = "ftp://example.com/".parse().unwrap();
+        assert_eq!(
+            http_scheme_is_tls(uri.scheme_str()),
+            Err(HttpError::UnsupportedScheme)
+        );
+    }
+
+    #[test]
+    fn ephemeral_cursor_wraps_within_range() {
+        let cursor = AtomicU16::new(EPHEMERAL_LAST - 1);
+        assert_eq!(next_ephemeral_port(&cursor), EPHEMERAL_LAST - 1);
+        assert_eq!(next_ephemeral_port(&cursor), EPHEMERAL_LAST);
+        assert_eq!(next_ephemeral_port(&cursor), EPHEMERAL_FIRST);
+        assert_eq!(next_ephemeral_port(&cursor), EPHEMERAL_FIRST + 1);
+        // An out-of-range cursor (e.g. a stale seed) restarts at the base.
+        let cursor = AtomicU16::new(100);
+        assert_eq!(next_ephemeral_port(&cursor), EPHEMERAL_FIRST);
+        assert_eq!(next_ephemeral_port(&cursor), EPHEMERAL_FIRST + 1);
+        let cursor = AtomicU16::new(0);
+        assert_eq!(next_ephemeral_port(&cursor), EPHEMERAL_FIRST);
+    }
+
+    #[test]
+    fn ephemeral_cursor_is_unique_across_threads_through_the_wrap() {
+        const RANGE: usize = (EPHEMERAL_LAST - EPHEMERAL_FIRST) as usize + 1;
+        const THREADS: usize = 8;
+        let cursor = Arc::new(AtomicU16::new(EPHEMERAL_LAST - 100));
+        // Exactly one full pass over the range, split across threads: every
+        // port must be handed out exactly once.
+        let per = RANGE / THREADS;
+        assert_eq!(per * THREADS, RANGE);
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let cursor = cursor.clone();
+                std::thread::spawn(move || {
+                    (0..per)
+                        .map(|_| next_ephemeral_port(&cursor))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut seen = vec![false; 65536];
+        for h in handles {
+            for p in h.join().unwrap() {
+                assert!((EPHEMERAL_FIRST..=EPHEMERAL_LAST).contains(&p));
+                assert!(!seen[p as usize], "port {p} handed out twice");
+                seen[p as usize] = true;
+            }
+        }
+    }
+
     #[test]
     fn canonical_hosts_are_borrowed_and_mixed_case_is_normalized() {
         let host = "example.com";

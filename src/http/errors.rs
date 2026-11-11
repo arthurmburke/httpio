@@ -42,6 +42,10 @@ pub enum HttpError {
     /// where it is forbidden: a held tail would stall the interactive
     /// protocol the upgrade hands the connection over to.
     CorkOnUpgrade,
+    /// The request URI's scheme is not one this client speaks (`http` or
+    /// `https`; WebSocket upgrades use `ws`/`wss`). Rather than guessing,
+    /// the request is rejected without connecting.
+    UnsupportedScheme,
     /// The host could not be resolved to an address. This stack has no DNS,
     /// so use an IP-literal URL or map the name to an address with the
     /// client builder's `resolve`.
@@ -111,6 +115,9 @@ impl fmt::Display for HttpError {
             ),
             HttpError::CorkOnUpgrade => {
                 f.write_str("corking is not allowed on protocol-upgrade (WebSocket) connections")
+            }
+            HttpError::UnsupportedScheme => {
+                f.write_str("the request URI scheme is not supported; only http and https are")
             }
             HttpError::UnresolvedHost => f.write_str(
                 "cannot resolve the host: this stack has no DNS -- use an IP-literal URL or map \

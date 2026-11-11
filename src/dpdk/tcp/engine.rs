@@ -166,17 +166,36 @@ impl TcpEngine {
         self.accept_queues.entry(port).or_default();
     }
 
-    pub fn connect(&mut self, remote_ip: [u8; 4], remote_port: u16, local_port: u16) -> FourTuple {
+    /// The local IPv4 address every connection of this engine uses.
+    pub fn local_ip(&self) -> [u8; 4] {
+        self.config.local_ip
+    }
+
+    /// Starts an active open. Returns `None` -- without touching any
+    /// existing connection or bumping `connections_opened` -- if the
+    /// 4-tuple is already tracked (live, or still draining in TIME_WAIT);
+    /// the caller should retry with a different local port.
+    pub fn connect(
+        &mut self,
+        remote_ip: [u8; 4],
+        remote_port: u16,
+        local_port: u16,
+    ) -> Option<FourTuple> {
         let tuple = FourTuple {
             local_ip: self.config.local_ip,
             local_port,
             remote_ip,
             remote_port,
         };
-        self.connections.insert(tuple, Tcb::new_active(tuple));
+        match self.connections.entry(tuple) {
+            std::collections::hash_map::Entry::Occupied(_) => return None,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(Tcb::new_active(tuple));
+            }
+        }
         self.connections_opened += 1;
         self.mark_active(tuple); // has a SYN to send
-        tuple
+        Some(tuple)
     }
 
     /// Total active opens since the engine was created (never decremented;
@@ -718,6 +737,29 @@ mod tests {
 
     fn cfg(local: &str, gateway: Option<&str>) -> EngineConfig {
         EngineConfig::from_cli([0; 6], local, gateway).unwrap()
+    }
+
+    #[test]
+    fn connect_refuses_a_tuple_that_is_already_tracked() {
+        let mut engine = TcpEngine::new(EngineConfig {
+            local_ip: [10, 0, 1, 25],
+            local_mac: [0; 6],
+            gateway: None,
+        });
+        let peer = [10, 0, 1, 99];
+        let tuple = engine.connect(peer, 80, 50000).expect("first connect");
+        assert_eq!(engine.connections_opened(), 1);
+        assert!(engine.state(tuple).is_some());
+
+        // Same 4-tuple again: refused, existing connection untouched.
+        assert_eq!(engine.connect(peer, 80, 50000), None);
+        assert_eq!(engine.connections_opened(), 1);
+        assert_eq!(engine.state(tuple), Some(TcpState::SynSent));
+
+        // A different local port or remote port is a distinct tuple.
+        assert!(engine.connect(peer, 80, 50001).is_some());
+        assert!(engine.connect(peer, 81, 50000).is_some());
+        assert_eq!(engine.connections_opened(), 3);
     }
 
     #[test]

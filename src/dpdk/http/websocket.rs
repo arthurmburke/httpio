@@ -114,8 +114,10 @@ impl WebSocketClient {
         mut headers: HeaderMap<HeaderValue>,
         extensions: Extensions,
     ) -> Result<Self, WebSocketError> {
+        // `http::Uri` only lowercases `http`/`https`, so `WSS://` keeps its
+        // case; compare ASCII-case-insensitively.
         match uri.scheme_str() {
-            Some("ws" | "wss") => {}
+            Some(s) if s.eq_ignore_ascii_case("ws") || s.eq_ignore_ascii_case("wss") => {}
             _ => return Err(WebSocketError::UnsupportedScheme),
         }
 

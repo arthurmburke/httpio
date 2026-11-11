@@ -172,12 +172,100 @@ impl TcpHeader {
             (hdr_len + payload.len()) as u16,
         );
         let csum = if offload_cksum {
-            // The NIC adds the checksum over the segment; the field carries
-            // the pseudo-header checksum only.
-            checksum::fold(pseudo)
+            // DPDK TX L4 offload contract (`rte_ipv4_phdr_cksum`): the field
+            // carries the folded, NOT complemented, pseudo-header sum; the
+            // NIC sums the segment on top of it and complements.
+            checksum::fold_raw(pseudo)
         } else {
             checksum::fold(checksum::sum16(payload, checksum::sum16(out, pseudo)))
         };
         out[16..18].copy_from_slice(&csum.to_be_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: [u8; 4] = [10, 0, 0, 1];
+    const DST: [u8; 4] = [10, 0, 0, 2];
+
+    fn header(mss: Option<u16>) -> TcpHeader {
+        TcpHeader {
+            src_port: 12345,
+            dst_port: 80,
+            seq: 0xdead_beef,
+            ack: 0x0102_0304,
+            flags: 0x18,
+            window: 0xffff,
+            urgent_pointer: 0,
+            options: TcpOptions { mss },
+        }
+    }
+
+    fn build(h: &TcpHeader, payload: &[u8], offload: bool) -> Vec<u8> {
+        let mut hdr = vec![0u8; h.wire_len()];
+        h.write(&mut hdr, payload, SRC, DST, offload);
+        let mut seg = hdr;
+        seg.extend_from_slice(payload);
+        seg
+    }
+
+    fn payloads() -> Vec<Vec<u8>> {
+        vec![
+            vec![],
+            (0..64u8)
+                .map(|i| i.wrapping_mul(37).wrapping_add(200))
+                .collect(),
+            (0..65u8)
+                .map(|i| i.wrapping_mul(91).wrapping_add(255))
+                .collect(),
+            vec![0xff; 1461],
+        ]
+    }
+
+    #[test]
+    fn software_checksum_verifies() {
+        for mss in [None, Some(1460)] {
+            for p in payloads() {
+                let seg = build(&header(mss), &p, false);
+                assert!(TcpHeader::parse(&seg, SRC, DST, true).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn offload_checksum_completed_by_nic_verifies() {
+        for mss in [None, Some(1460)] {
+            for p in payloads() {
+                let h = header(mss);
+                let mut seg = build(&h, &p, true);
+                // Not valid before the NIC completes it (unless degenerate).
+                let seed = u16::from_be_bytes([seg[16], seg[17]]) as u32;
+                // Simulate NIC: zero field, sum segment on top of seed, complement.
+                seg[16] = 0;
+                seg[17] = 0;
+                let csum = checksum::fold(checksum::sum16(&seg, seed));
+                seg[16..18].copy_from_slice(&csum.to_be_bytes());
+                assert!(
+                    TcpHeader::parse(&seg, SRC, DST, true).is_some(),
+                    "mss={:?} payload_len={}",
+                    mss,
+                    p.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offload_field_is_uncomplemented_pseudo_sum() {
+        let h = header(None);
+        let p = [1u8, 2, 3];
+        let seg = build(&h, &p, true);
+        let pseudo = checksum::ipv4_pseudo_header_sum(SRC, DST, super::super::ipv4::PROTO_TCP, 23);
+        assert_eq!(
+            u16::from_be_bytes([seg[16], seg[17]]),
+            checksum::fold_raw(pseudo)
+        );
     }
 }

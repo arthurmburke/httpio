@@ -45,6 +45,8 @@ const CMD_CAP: usize = 1024;
 const IN_CAP: usize = 1024;
 /// Bytes pulled from the engine per connection per iteration.
 const RECV_CHUNK: usize = 64 * 1024;
+/// How long to wait for a peer FIN before reaping a connection whose app-side handle is gone.
+const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // Per-connection rings stay SPSC: exactly one thread owns each end (the
 // thread driving that connection's `TcpStream`, and the worker lcore).
@@ -85,6 +87,11 @@ pub enum Inbound {
     Eof,
     /// Connection was reset.
     Reset,
+    /// The active open was refused locally because its 4-tuple is already
+    /// in use (a live or TIME_WAIT connection). Terminal; the caller should
+    /// retry with a different local port. The existing connection is
+    /// unaffected.
+    AddrInUse,
 }
 
 /// The control message that registers a new connection with the worker,
@@ -117,6 +124,8 @@ struct WorkerConn {
     end_sent: bool,
     /// We've asked the engine to close (half-close), so don't repeat it.
     closing: bool,
+    /// Deadline after which we reap the connection if the peer has not sent a FIN.
+    deadline: Option<Instant>,
 }
 
 impl WorkerConn {
@@ -284,7 +293,26 @@ fn run(
     while !stop.load(Ordering::Acquire) {
         // 1. Register newly opened connections.
         while let Some(nc) = ctrl_rx.pop() {
-            let tuple = engine.connect(nc.remote_ip, nc.remote_port, nc.local_port);
+            let candidate = FourTuple {
+                local_ip: engine.local_ip(),
+                local_port: nc.local_port,
+                remote_ip: nc.remote_ip,
+                remote_port: nc.remote_port,
+            };
+            // Never clobber a live connection: refuse if either the worker
+            // or the engine already tracks this 4-tuple. The new conn's
+            // rings are dropped after the notification; the existing
+            // connection is left untouched.
+            let tuple = if conns.contains_key(&candidate) {
+                None
+            } else {
+                engine.connect(nc.remote_ip, nc.remote_port, nc.local_port)
+            };
+            let Some(tuple) = tuple else {
+                // The ring is brand new (empty), so this push cannot fail.
+                let _ = nc.inbound_tx.push(Inbound::AddrInUse);
+                continue;
+            };
             engine.set_nodelay(tuple, nc.nodelay);
             conns.insert(
                 tuple,
@@ -298,6 +326,7 @@ fn run(
                     terminal: None,
                     end_sent: false,
                     closing: false,
+                    deadline: None,
                 },
             );
             // A connection was just opened; publish the new count (only
@@ -382,10 +411,14 @@ fn run(
             if app_gone {
                 if !conn.closing {
                     engine.close(conn.tuple);
+                    // Set the deadline for the connection to be reaped if the peer does not send a FIN.
+                    conn.deadline = Some(Instant::now() + REAP_TIMEOUT);
                 }
                 // Keep it only until the engine no longer tracks it, so a
                 // trailing FIN/ACK still gets sent.
-                return matches!(engine.state(conn.tuple), Some(s) if s != TcpState::Closed);
+                return matches!(engine.state(conn.tuple), Some(s) if s != TcpState::Closed) ||
+                    // If the engine has closed it, but the peer hasn't sent a FIN, we wait for the deadline to expire before reaping.
+                    conn.deadline.map_or(false, |deadline| Instant::now() < deadline);
             }
             true
         });
@@ -416,6 +449,7 @@ mod tests {
                 terminal: None,
                 end_sent: false,
                 closing: false,
+                deadline: None,
             };
             conn.on_event(Event::Reset);
             if established {
