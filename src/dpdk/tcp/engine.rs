@@ -31,6 +31,11 @@ use super::tx_queue::Payload;
 const MAX_RX_BURST: usize = 64;
 const MAX_PENDING_TX: usize = 256;
 const ARP_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the port may refuse the packet at the head of the transmit
+/// queue before the engine gives up on that packet. Far longer than a
+/// full transmit ring takes to drain, and shorter than the minimum
+/// retransmission timeout.
+const TX_STALL_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct PendingTcp {
     tuple: FourTuple,
@@ -189,6 +194,10 @@ pub struct TcpEngine {
     processing: HashSet<FourTuple>,
     tx_batch: Vec<Mbuf>,
     tx_owners: Vec<Option<(FourTuple, Seq)>>,
+    /// When the port first refused the packet now at the head of
+    /// `tx_batch`; `None` while the port is accepting packets.
+    tx_stalled_since: Option<Instant>,
+    tx_dropped: u64,
     pending_tx: VecDeque<PendingTcp>,
     updated: Vec<FourTuple>,
     segments: Vec<OutSegment>,
@@ -220,6 +229,8 @@ impl TcpEngine {
             processing: HashSet::default(),
             tx_batch: Vec::new(),
             tx_owners: Vec::new(),
+            tx_stalled_since: None,
+            tx_dropped: 0,
             pending_tx: VecDeque::new(),
             updated: Vec::new(),
             segments: Vec::new(),
@@ -324,12 +335,12 @@ impl TcpEngine {
     }
 
     pub fn recv(&mut self, tuple: FourTuple, max_len: usize) -> Bytes {
-        let data = self
-            .connections
-            .get_mut(&tuple)
-            .map(|c| c.tcb.recv(max_len))
-            .unwrap_or_default();
-        if !data.is_empty() {
+        let Some(conn) = self.connections.get_mut(&tuple) else {
+            return Bytes::new();
+        };
+        let data = conn.tcb.recv(max_len);
+        // Reading only needs a poll when it produced a window update.
+        if !data.is_empty() && conn.tcb.has_pending_output() {
             self.mark_active(tuple);
         }
         data
@@ -512,13 +523,12 @@ impl TcpEngine {
             conn.tcb
                 .set_tx_payload_limit(port.offloads().tso_max_payload);
             conn.tcb
-                .poll_output_limited(now, &mut self.segments, room.min(32));
+                .poll_output_queued(now, &mut self.segments, room.min(32));
             // A connection that closed is dropped below, so whatever it
             // just produced (a final reset) goes out unowned.
             let owned = !conn.tcb.is_closed();
             for seg in self.segments.drain(..) {
                 if owned {
-                    conn.tcb.mark_transmit_pending(seg.seq);
                     conn.queued_tx += 1;
                 }
                 self.pending_tx.push_back(PendingTcp {
@@ -641,6 +651,13 @@ impl TcpEngine {
         self.processing.clear();
     }
 
+    /// Packets discarded because the port refused them for longer than
+    /// [`TX_STALL_TIMEOUT`]. Non-zero means the port stopped accepting
+    /// packets for a while or rejects a kind of packet the engine builds.
+    pub fn tx_dropped(&self) -> u64 {
+        self.tx_dropped
+    }
+
     /// Packets retained locally awaiting pool space or NIC acceptance.
     pub fn pending_tx_len(&self) -> usize {
         self.tx_batch.len() + self.pending_tx.len()
@@ -681,15 +698,45 @@ impl TcpEngine {
         port.tx_burst_in_place(&mut self.tx_batch);
         let sent = before - self.tx_batch.len();
         for owner in self.tx_owners.drain(..sent).flatten() {
-            let (tuple, seq) = owner;
-            // An owned packet's connection is still tracked: `abort`
-            // discards a connection's queued packets along with it.
-            if let Some(conn) = self.connections.get_mut(&tuple) {
-                conn.tcb.mark_transmitted(seq, now);
-                conn.queued_tx = conn.queued_tx.saturating_sub(1);
-            }
+            Self::transmitted(&mut self.connections, owner, now);
         }
         // The unaccepted suffix and its ownership metadata remain for retry.
+        if sent > 0 || self.tx_batch.is_empty() {
+            self.tx_stalled_since = None;
+            return;
+        }
+        // A full transmit ring clears within a few polls. A port that keeps
+        // refusing the same head packet either cannot send at all or
+        // rejects that packet in particular (a driver that will not take
+        // its offload request, say), and retrying would block every
+        // connection behind it forever. Treat the packet as lost on the
+        // wire instead: free it and start its retransmission timer, so TCP
+        // resends it or, failing that, resets the connection and reports
+        // the error. Dropping continues one packet per poll until the port
+        // accepts something again.
+        let since = *self.tx_stalled_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= TX_STALL_TIMEOUT {
+            drop(self.tx_batch.remove(0));
+            self.tx_dropped += 1;
+            if let Some(owner) = self.tx_owners.remove(0) {
+                Self::transmitted(&mut self.connections, owner, now);
+            }
+        }
+    }
+
+    /// A queued packet left the engine, accepted by the port or given up
+    /// on: either way its retransmission timer runs from now.
+    fn transmitted(
+        connections: &mut HashMap<FourTuple, Conn>,
+        (tuple, seq): (FourTuple, Seq),
+        now: Instant,
+    ) {
+        // An owned packet's connection is still tracked: `abort`
+        // discards a connection's queued packets along with it.
+        if let Some(conn) = connections.get_mut(&tuple) {
+            conn.tcb.mark_transmitted(seq, now);
+            conn.queued_tx = conn.queued_tx.saturating_sub(1);
+        }
     }
 
     /// `ip_ok`/`l4_ok` report that the NIC already verified the IPv4 /
@@ -926,7 +973,10 @@ fn build_ip_tcp_frame_external(
 
     // External attachment is all-or-nothing: unsupported memory or too many
     // DMA ranges uses the established copying path instead of stalling TX.
-    if !payload.is_empty() && external_segment_count(payload, max_segments).is_some() {
+    if max_segments > 1
+        && !payload.is_empty()
+        && external_segment_count(payload, max_segments).is_some()
+    {
         let mut head = Mbuf::alloc(pool)?;
         let header_len = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + tcp_len;
         let buf = head.append(header_len as u16)?;

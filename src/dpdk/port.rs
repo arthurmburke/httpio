@@ -105,7 +105,17 @@ impl EthPort {
         if multi {
             tx_en |= ffi::RTE_ETH_TX_OFFLOAD_MULTI_SEGS as u64;
         }
+        // `net_tap` advertises TSO but segments in software, slower than the
+        // stack's own segmentation, and it rejects a TSO packet unless MSS
+        // plus all headers, Ethernet included, fits the MTU. A full-MSS
+        // packet is 14 bytes over and is refused on every retry, stalling
+        // the connection. Leave TSO off for it.
+        // SAFETY: `driver_name` is null or a NUL-terminated string owned by
+        // the driver for the life of the process.
+        let software_tso = !info.driver_name.is_null()
+            && unsafe { std::ffi::CStr::from_ptr(info.driver_name) }.to_bytes() == b"net_tap";
         let tso = multi
+            && !software_tso
             && (info.tx_desc_lim.nb_mtu_seg_max == 0 || info.tx_desc_lim.nb_mtu_seg_max >= 2)
             && tx_cksum_offload
             && info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_TCP_TSO as u64 != 0;

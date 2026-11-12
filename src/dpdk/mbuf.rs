@@ -68,7 +68,7 @@ impl Mbuf {
     /// DMA-contiguous prefix of EAL-managed memory, capped by mbuf buf_len.
     /// Ordinary Rust heap memory is deliberately not treated as DMA mapped.
     pub(crate) fn dma_prefix(data: &[u8]) -> Option<(usize, u64)> {
-        if data.is_empty() {
+        if data.is_empty() || !eal_memory_span().contains(&(data.as_ptr() as usize)) {
             return None;
         }
         unsafe {
@@ -413,6 +413,40 @@ impl Mbuf {
                 (l2_len as u64 & 0x7f) | ((l3_len as u64 & 0x1ff) << 7);
         }
     }
+}
+
+/// Address span covering every EAL memory segment list, read once.
+///
+/// `rte_mem_virt2memseg` walks the segment lists on every call, which is
+/// wasted work for the common transmit payload: ordinary heap memory that
+/// is in none of them. The lists' address ranges are reserved when EAL
+/// starts, so one span check rejects heap pointers without the walk.
+/// Memory registered with EAL later falls outside the span and is copied
+/// instead of attached, which is slower but correct.
+fn eal_memory_span() -> &'static std::ops::Range<usize> {
+    static SPAN: std::sync::OnceLock<std::ops::Range<usize>> = std::sync::OnceLock::new();
+    unsafe extern "C" fn widen(
+        list: *const ffi::rte_memseg_list,
+        arg: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        // SAFETY: EAL passes a live list, and `arg` is the `Range` below.
+        unsafe {
+            let span = &mut *arg.cast::<std::ops::Range<usize>>();
+            let start = (*list).__bindgen_anon_1.base_va as usize;
+            let end = start.saturating_add((*list).len);
+            if start != 0 {
+                span.start = span.start.min(start);
+                span.end = span.end.max(end);
+            }
+        }
+        0
+    }
+    SPAN.get_or_init(|| {
+        let mut span = usize::MAX..0;
+        // SAFETY: the walk holds EAL's memory lock and only reads.
+        unsafe { ffi::rte_memseg_list_walk(Some(widen), (&raw mut span).cast()) };
+        span
+    })
 }
 
 /// The view [`Mbuf::into_bytes`] hands to `Bytes::from_owner`: the packet

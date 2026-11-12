@@ -88,6 +88,13 @@ BENCH_WORKLOADS=latency "$E2E" kernel 10.10.0.3 kernel-tokio-spinserver
 
 # The kernel must not also own 10.10.0.1, or it would answer for it.
 ip addr del 10.10.0.1/24 dev vc
+# Nor may it route what the DPDK port receives. With the address gone the
+# kernel treats every frame for 10.10.0.1 as transit traffic: conntrack, a
+# route lookup, and a forward out of the container's own NIC, all charged
+# to the server's CPU. Packet sockets see a frame before tc ingress does,
+# so dropping there leaves the DPDK port's view untouched.
+tc qdisc add dev vc ingress
+tc filter add dev vc ingress matchall action drop
 AFP=(-l 0-1 --no-huge --log-level=error --vdev=net_af_packet0,iface=vc --)
 TAP=(-l 0-1 --no-huge --log-level=error --vdev=net_tap0,iface=dtap0 --)
 

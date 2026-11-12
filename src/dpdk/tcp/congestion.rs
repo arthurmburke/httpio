@@ -26,10 +26,9 @@ impl CongestionControl {
         let mss = mss as u32;
         Self {
             mss,
-            // RFC 5681 §3.1 initial window (conservative IW = 2*MSS here;
-            // real stacks vary the initial window with MSS, capped ~4
-            // segments).
-            cwnd: mss.saturating_mul(2),
+            // RFC 6928 initial window: ten segments, bounded in bytes for
+            // large MSS values. This is what Linux uses.
+            cwnd: (10 * mss).min((2 * mss).max(14_600)),
             ssthresh: u32::MAX,
             phase: Phase::SlowStart,
             dup_ack_count: 0,
@@ -46,7 +45,10 @@ impl CongestionControl {
         self.dup_ack_count = 0;
         match self.phase {
             Phase::SlowStart => {
-                self.cwnd = self.cwnd.saturating_add(newly_acked.min(self.mss));
+                // RFC 3465 byte counting with L = 2: a receiver that ACKs
+                // every other segment (or a whole burst at once) still
+                // lets the window double each round trip.
+                self.cwnd = self.cwnd.saturating_add(newly_acked.min(2 * self.mss));
                 if self.cwnd >= self.ssthresh {
                     self.phase = Phase::CongestionAvoidance;
                 }

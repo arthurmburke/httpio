@@ -259,6 +259,15 @@ mod dpdk_parts {
         }
     }
 
+    /// The peer's SYN-ACK. It must announce an MSS: without one the stack
+    /// assumes 536 bytes and every "1460 B segment" below would really be
+    /// three smaller ones.
+    fn peer_synack(seq: u32, ack: u32) -> tcp::TcpHeader {
+        let mut header = peer_header(seq, ack, tcp::flags::SYN | tcp::flags::ACK);
+        header.options.mss = Some(MSS as u16);
+        header
+    }
+
     fn wire_formats() {
         for size in [64usize, MSS] {
             let data = vec![0xa5u8; size];
@@ -393,7 +402,7 @@ mod dpdk_parts {
         tcb.set_nodelay(true);
         let syn = tcb.poll_output(now).remove(0);
         let ours = syn.seq.0.wrapping_add(1);
-        let synack = peer_header(1000, ours, tcp::flags::SYN | tcp::flags::ACK);
+        let synack = peer_synack(1000, ours);
         tcb.on_segment(&synack, Bytes::new(), now);
         tcb.poll_output(now);
         (tcb, 1001, ours)
@@ -549,12 +558,7 @@ mod dpdk_parts {
             let syn = drain(&port).expect("no SYN");
             let mut ours = syn.seq.wrapping_add(1);
             let mut peer_seq = 1000u32;
-            inject(
-                &port,
-                &pool,
-                &peer_header(peer_seq, ours, tcp::flags::SYN | tcp::flags::ACK),
-                &[],
-            );
+            inject(&port, &pool, &peer_synack(peer_seq, ours), &[]);
             peer_seq += 1;
             engine.poll_into(&port, &pool, now, &mut events);
             drain(&port);
@@ -567,12 +571,7 @@ mod dpdk_parts {
                 MSS,
                 || {
                     // A stale segment: built and looped, then dropped unread.
-                    inject(
-                        &port,
-                        &pool,
-                        &peer_header(0, 0, tcp::flags::RST),
-                        &payload,
-                    );
+                    inject(&port, &pool, &peer_header(0, 0, tcp::flags::RST), &payload);
                     drain(&port);
                 },
             );

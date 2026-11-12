@@ -16,6 +16,7 @@
 #include <rte_launch.h>
 #include <rte_errno.h>
 #include <rte_memory.h>
+#include <rte_eal_memconfig.h>
 #include <rte_malloc.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>

@@ -391,9 +391,14 @@ impl AsyncRead for TcpStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Copy as much queued data as fits.
+        // Copy as much queued data as fits, staging further chunks as each
+        // one is consumed: a chunk is one received segment, and a caller
+        // with a large buffer should not need a poll per segment.
         let mut wrote = false;
         while buf.remaining() > 0 {
+            if this.read_queue.is_empty() && wrote {
+                this.drain_inbound();
+            }
             let Some(front) = this.read_queue.front_mut() else {
                 break;
             };

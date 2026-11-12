@@ -100,6 +100,13 @@ impl UnackedSegment {
 #[derive(Default)]
 pub struct RetransmitQueue {
     payload_bytes: usize,
+    /// New segments start out waiting for the port to accept them; see
+    /// [`RetransmitQueue::hold_until_transmitted`].
+    hold: bool,
+    /// How many segments at the back of the queue are still waiting.
+    /// They are confirmed oldest first, so the next confirmation is
+    /// normally for the first of them and needs no search.
+    untransmitted: usize,
     pub segments: std::collections::VecDeque<UnackedSegment>,
 }
 
@@ -113,6 +120,7 @@ impl RetransmitQueue {
     pub fn push(&mut self, seq: Seq, data: impl Into<Payload>, syn: bool, fin: bool, now: Instant) {
         let data = data.into();
         self.payload_bytes += data.len();
+        self.untransmitted += usize::from(self.hold);
         self.segments.push_back(UnackedSegment {
             seq,
             data,
@@ -122,8 +130,58 @@ impl RetransmitQueue {
             last_sent_at: now,
             retransmitted: false,
             retransmit_count: 0,
-            pending_transmit: false,
+            pending_transmit: self.hold,
         });
+    }
+
+    /// Chooses whether segments queued from now on wait for
+    /// [`RetransmitQueue::mark_transmitted`] before their retransmission
+    /// timer runs. A caller that queues output locally ahead of the port
+    /// holds them, so local backpressure is not mistaken for loss.
+    pub fn hold_until_transmitted(&mut self, hold: bool) {
+        self.hold = hold;
+    }
+
+    /// The oldest segment is about to be resent: under a hold its timer
+    /// waits for the port again.
+    pub fn front_resent(&mut self) {
+        if self.hold
+            && let Some(front) = self.segments.front_mut()
+        {
+            front.pending_transmit = true;
+        }
+    }
+
+    /// The port accepted the segment starting at `seq`: its timer runs
+    /// from `now`. Unknown sequence numbers (pure ACKs, segments already
+    /// acknowledged) are ignored.
+    pub fn mark_transmitted(&mut self, seq: Seq, now: Instant) {
+        let len = self.segments.len();
+        let oldest_waiting = len - self.untransmitted.min(len);
+        // A resent segment is the front; anything else is normally the
+        // oldest segment still waiting. Fall back to a search otherwise.
+        let index = if self.segments.front().is_some_and(|s| s.seq == seq) {
+            0
+        } else if self
+            .segments
+            .get(oldest_waiting)
+            .is_some_and(|s| s.seq == seq)
+        {
+            oldest_waiting
+        } else if let Ok(index) = self.segments.binary_search_by_key(&seq, |s| s.seq) {
+            index
+        } else {
+            return;
+        };
+        let seg = &mut self.segments[index];
+        if seg.pending_transmit && index == oldest_waiting {
+            self.untransmitted = self.untransmitted.saturating_sub(1);
+        }
+        seg.pending_transmit = false;
+        seg.last_sent_at = now;
+        if !seg.retransmitted {
+            seg.first_sent_at = now;
+        }
     }
 
     /// Drops fully-acked segments given the peer's cumulative ACK
@@ -152,6 +210,7 @@ impl RetransmitQueue {
                 break;
             }
         }
+        self.untransmitted = self.untransmitted.min(self.segments.len());
         sample
     }
 

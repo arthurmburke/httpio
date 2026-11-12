@@ -8,6 +8,7 @@
 //! on separate lines (avoiding false sharing).
 
 use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -25,7 +26,9 @@ struct SpscRing<T, const N: usize> {
     _pad0: [u8; 56], // pad to 64-byte cache line
     tail: AtomicUsize,
     _pad1: [u8; 56], // pad to 64-byte cache line
-    buffer: [UnsafeCell<Option<T>>; N],
+    /// Slots in `tail..head` (wrapping) hold a value; the rest are
+    /// uninitialised, so creating a ring never touches the slot memory.
+    buffer: [UnsafeCell<MaybeUninit<T>>; N],
     flags: AtomicU8,
 }
 
@@ -49,8 +52,31 @@ impl<T, const N: usize> SpscRing<T, N> {
             _pad0: [0u8; 56],
             tail: AtomicUsize::new(0),
             _pad1: [0u8; 56],
-            buffer: core::array::from_fn(|_| UnsafeCell::new(None)),
+            buffer: core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
             flags: AtomicU8::new(OPEN),
+        }
+    }
+
+    /// Allocates an empty ring directly on the heap. Unlike
+    /// `Arc::new(Self::new())` this neither builds the ring on the stack
+    /// nor writes its slots, so the cost does not grow with `N`; rings are
+    /// created per connection, on the connect path.
+    fn new_shared() -> Arc<Self> {
+        assert!(N > 0 && N.is_power_of_two(), "N must be a power of 2");
+        let mut ring = Arc::<Self>::new_uninit();
+        let raw = Arc::get_mut(&mut ring)
+            .expect("freshly allocated")
+            .as_mut_ptr();
+        // SAFETY: `raw` points to a writable, properly aligned allocation.
+        // Every field except `buffer` is written here, and `buffer` is an
+        // array of `MaybeUninit`, which is valid uninitialised.
+        unsafe {
+            (&raw mut (*raw).head).write(AtomicUsize::new(0));
+            (&raw mut (*raw)._pad0).write([0; 56]);
+            (&raw mut (*raw).tail).write(AtomicUsize::new(0));
+            (&raw mut (*raw)._pad1).write([0; 56]);
+            (&raw mut (*raw).flags).write(AtomicU8::new(OPEN));
+            ring.assume_init()
         }
     }
 
@@ -66,8 +92,10 @@ impl<T, const N: usize> SpscRing<T, N> {
             return Err(item);
         }
 
+        // SAFETY: only the producer writes slot `head`, and the slot is
+        // empty: the consumer has already moved past it.
         unsafe {
-            *self.buffer[head].get() = Some(item);
+            (*self.buffer[head].get()).write(item);
         }
         self.head.store(next_head, Ordering::Release);
         Ok(())
@@ -84,9 +112,11 @@ impl<T, const N: usize> SpscRing<T, N> {
             return None;
         }
 
-        let item = unsafe { (*self.buffer[tail].get()).take() };
+        // SAFETY: `tail != head`, so the producer initialised this slot
+        // and published it; advancing `tail` below gives up our claim.
+        let item = unsafe { (*self.buffer[tail].get()).assume_init_read() };
         self.tail.store((tail + 1) & (N - 1), Ordering::Release);
-        item
+        Some(item)
     }
 
     /// Returns the number of items currently in the ring.
@@ -108,6 +138,13 @@ impl<T, const N: usize> SpscRing<T, N> {
     #[inline(always)]
     fn capacity(&self) -> usize {
         N - 1
+    }
+}
+
+impl<T, const N: usize> Drop for SpscRing<T, N> {
+    fn drop(&mut self) {
+        // Slots are `MaybeUninit`, so queued items must be dropped by hand.
+        while self.pop().is_some() {}
     }
 }
 
@@ -179,7 +216,7 @@ impl<T, const N: usize> SpscTx<T, N> {
 /// The Tx handle should be used by the producer thread, and the Rx handle should be used by the consumer thread.
 /// The channel is closed when either handle is dropped; the other handle can check for closure with `is_closed()`.
 pub fn channel<T, const N: usize>() -> (SpscTx<T, N>, SpscRx<T, N>) {
-    let ring = Arc::new(SpscRing::new());
+    let ring = SpscRing::new_shared();
     (SpscTx { ring: ring.clone() }, SpscRx { ring })
 }
 

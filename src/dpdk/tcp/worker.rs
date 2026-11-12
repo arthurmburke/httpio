@@ -712,7 +712,10 @@ fn run(
         }
 
         // 3. Pump the engine: rx burst, state machines, timers, tx burst.
-        engine.poll_into(&port, &pool, Instant::now(), &mut events);
+        // One clock read per iteration serves the engine and the reaping
+        // below; an iteration is far shorter than any deadline it checks.
+        let now = Instant::now();
+        engine.poll_into(&port, &pool, now, &mut events);
         work.extend(engine.updated_connections().iter().copied());
         for (tuple, ev) in events.drain(..) {
             work.insert(tuple);
@@ -753,7 +756,6 @@ fn run(
         // 5. Reap connections whose app-side handle is gone. Close the
         //    engine side (idempotent) and drop the worker state; the
         //    engine finishes any TIME_WAIT on its own.
-        let now = Instant::now();
         for tuple in work.drain() {
             let Some(conn) = conns.get_mut(&tuple) else {
                 continue;

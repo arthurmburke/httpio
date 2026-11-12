@@ -1,6 +1,7 @@
 //! The Transmission Control Block: all per-connection state, and the RFC
 //! 9293 §3.10 segment-processing state machine.
 
+use std::cell::Cell;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -140,6 +141,10 @@ pub struct Tcb {
     recv_buffer: ReassemblyBuffer,
 
     ack_pending: bool,
+    /// Right edge of the receive window last advertised to the peer.
+    /// Written when a segment is built, read to decide whether a read by
+    /// the application opened enough window to be worth announcing.
+    rcv_advertised: Cell<Seq>,
     retransmit_now: bool,
     /// SYN / SYN-ACK waiting to be emitted.
     handshake_out: Option<HandshakeOut>,
@@ -205,6 +210,7 @@ impl Tcb {
             send_buffer: SendBuffer::default(),
             recv_buffer: ReassemblyBuffer::default(),
             ack_pending: false,
+            rcv_advertised: Cell::new(Seq::new(0)),
             retransmit_now: false,
             handshake_out: None,
             reset_out: None,
@@ -316,9 +322,17 @@ impl Tcb {
     pub fn recv(&mut self, max_len: usize) -> Bytes {
         let data = self.recv_buffer.read(max_len);
         if !data.is_empty() && self.state.can_receive() {
-            // Advertise the newly available space without waiting for
-            // another peer packet (especially when its window is zero).
-            self.ack_pending = true;
+            // Announce newly freed space without waiting for another peer
+            // packet, but only when the peer needs it: its window is shut,
+            // or it holds at most half the buffer and the read doubled
+            // what it may send. Otherwise every read costs a pure ACK that
+            // the next data ACK would have carried anyway.
+            let capacity = self.receive_capacity();
+            let free = capacity.saturating_sub(self.recv_buffer.readable_len() as u32);
+            let advertised = self.rcv_advertised.get().distance(self.rcv_nxt).max(0) as u32;
+            if advertised == 0 || (advertised <= capacity / 2 && free >= 2 * advertised) {
+                self.ack_pending = true;
+            }
         }
         data
     }
@@ -327,8 +341,9 @@ impl Tcb {
         self.recv_buffer.readable_len()
     }
 
-    /// Application-initiated close: RFC 9293 §3.10.4. The FIN is deferred
-    /// until any buffered data has actually been sent.
+    /// Application-initiated close: RFC 9293 §3.10.4. The FIN follows the
+    /// last buffered byte onto the wire; it does not wait for that data
+    /// to be acknowledged.
     pub fn close(&mut self) {
         if self.local_close == LocalClose::Open {
             self.local_close = LocalClose::Requested;
@@ -594,12 +609,6 @@ impl Tcb {
                 self.events.push(Event::Established);
                 return;
             }
-            TcpState::LastAck => {
-                if ack.geq(self.snd_nxt) {
-                    self.fin_acked();
-                }
-                return;
-            }
             _ => {}
         }
 
@@ -665,7 +674,14 @@ impl Tcb {
             }
         }
 
-        if matches!(self.state, TcpState::FinWait1 | TcpState::Closing) && ack.geq(self.snd_nxt) {
+        // Data can still be outstanding ahead of our FIN, so every closing
+        // state takes the ordinary ACK processing above and finishes only
+        // once the FIN itself is covered.
+        if matches!(
+            self.state,
+            TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck
+        ) && ack.geq(self.snd_nxt)
+        {
             self.fin_acked();
         }
     }
@@ -799,41 +815,31 @@ impl Tcb {
 
     /// Writes into reusable caller storage, retaining its capacity.
     pub fn poll_output_into(&mut self, now: Instant, out: &mut Vec<OutSegment>) {
+        self.retransmit.hold_until_transmitted(false);
         self.poll_output_limited(now, out, usize::MAX);
     }
 
-    pub(crate) fn mark_transmit_pending(&mut self, seq: Seq) {
-        if let Ok(index) = self
-            .retransmit
-            .segments
-            .binary_search_by_key(&seq, |s| s.seq)
-        {
-            let seg = &mut self.retransmit.segments[index];
-            seg.pending_transmit = true;
-        }
-    }
-
+    /// The port accepted the segment starting at `seq`, which
+    /// [`Tcb::poll_output_queued`] produced: its retransmission timer
+    /// starts now.
     pub(crate) fn mark_transmitted(&mut self, seq: Seq, now: Instant) {
-        if let Ok(index) = self
-            .retransmit
-            .segments
-            .binary_search_by_key(&seq, |s| s.seq)
-        {
-            let seg = &mut self.retransmit.segments[index];
-            seg.pending_transmit = false;
-            seg.last_sent_at = now;
-            if !seg.retransmitted {
-                seg.first_sent_at = now;
-            }
-        }
+        self.retransmit.mark_transmitted(seq, now);
     }
 
-    pub(crate) fn poll_output_limited(
+    /// Like [`Tcb::poll_output_into`], for a caller that queues the
+    /// segments ahead of the port: at most `limit` segments, and each
+    /// one's retransmission timer waits for [`Tcb::mark_transmitted`].
+    pub(crate) fn poll_output_queued(
         &mut self,
         now: Instant,
         out: &mut Vec<OutSegment>,
         limit: usize,
     ) {
+        self.retransmit.hold_until_transmitted(true);
+        self.poll_output_limited(now, out, limit);
+    }
+
+    fn poll_output_limited(&mut self, now: Instant, out: &mut Vec<OutSegment>, limit: usize) {
         out.clear();
         if limit == 0 {
             return;
@@ -890,6 +896,7 @@ impl Tcb {
                 }
                 let mss = seg.syn.then_some(self.local_mss);
                 out.push(self.make_segment(seq, seg_flags, data, mss));
+                self.retransmit.front_resent();
             }
         }
 
@@ -897,9 +904,12 @@ impl Tcb {
             self.send_new_data(now, out, limit);
         }
 
+        // The FIN goes out as soon as the last buffered byte has been
+        // segmented, right behind it, rather than a round trip later once
+        // that data is acknowledged. It queues behind the data for
+        // retransmission and takes the sequence number after it.
         if self.local_close == LocalClose::Requested
             && self.send_buffer.is_empty()
-            && self.retransmit.is_empty()
             && self.state.can_send()
         {
             self.local_close = LocalClose::FinQueued;
@@ -1007,6 +1017,8 @@ impl Tcb {
             0
         };
         let window = (free >> scale).min(u16::MAX as u32) as u16;
+        self.rcv_advertised
+            .set(self.rcv_nxt + (u32::from(window) << scale));
         OutSegment {
             seq,
             ack: self.rcv_nxt,
@@ -1071,8 +1083,7 @@ impl Tcb {
             || self.local_close == LocalClose::FinQueued
             || (self.local_close == LocalClose::Requested
                 && self.state.can_send()
-                && self.send_buffer.is_empty()
-                && self.retransmit.is_empty())
+                && self.send_buffer.is_empty())
     }
 
     /// Earliest armed timer. Locally queued transmissions have no RTO
@@ -1391,8 +1402,8 @@ mod tests {
         let now = Instant::now();
         let mut tcb = establish(now);
         tcb.send(Bytes::from_static(b"payload"));
-        let output = tcb.poll_output(now);
-        tcb.mark_transmit_pending(output[0].seq);
+        let mut output = Vec::new();
+        tcb.poll_output_queued(now, &mut output, usize::MAX);
         let later = now + Duration::from_secs(60);
         tcb.tick(later);
         assert!(!tcb.retransmit_now);
@@ -1428,22 +1439,71 @@ mod tests {
         assert!(!tcb.has_pending_output());
         assert!(tcb.next_deadline().is_some());
 
+        // Data blocked behind the congestion window holds the FIN back:
+        // it may only follow the last byte.
+        tcb.close();
+        assert!(!tcb.has_pending_output());
+        assert_eq!(tcb.state, TcpState::Established);
+    }
+
+    #[test]
+    fn fin_follows_unacknowledged_data_and_is_retransmitted_after_it() {
+        let now = Instant::now();
         let mut tcb = establish(now);
         tcb.send(Bytes::from_static(b"payload"));
         let packet = tcb.poll_output(now).remove(0);
+        let data_end = packet.seq + packet.payload.len() as u32;
         tcb.close();
-        assert!(
-            !tcb.has_pending_output(),
-            "close must wait for outstanding bytes"
-        );
-        let ack = header(
-            tcb.rcv_nxt,
-            packet.seq + packet.payload.len() as u32,
-            flags::ACK,
-            u16::MAX,
-        );
+        assert!(tcb.has_pending_output(), "FIN must not wait for the ACK");
+        let fin = tcb.poll_output(now).remove(0);
+        assert_eq!(fin.flags, flags::FIN | flags::ACK);
+        assert_eq!(fin.seq, data_end);
+        assert_eq!(tcb.state, TcpState::FinWait1);
+
+        // An ACK for the data alone leaves the FIN outstanding.
+        let ack = header(tcb.rcv_nxt, data_end, flags::ACK, u16::MAX);
         tcb.on_segment(&ack, Bytes::new(), now);
-        assert!(tcb.has_pending_output(), "ACK must unblock FIN");
+        assert_eq!(tcb.state, TcpState::FinWait1);
+        assert_eq!(tcb.retransmit.segments.len(), 1);
+
+        // The lost FIN is what the retransmission timer resends.
+        let later = now + tcb.rto.rto();
+        tcb.tick(later);
+        let resent = tcb.poll_output(later).remove(0);
+        assert_eq!(resent.flags, flags::FIN | flags::ACK);
+        assert_eq!(resent.seq, data_end);
+
+        let ack = header(tcb.rcv_nxt, data_end + 1, flags::ACK, u16::MAX);
+        tcb.on_segment(&ack, Bytes::new(), later);
+        assert_eq!(tcb.state, TcpState::FinWait2);
+    }
+
+    #[test]
+    fn passive_close_acknowledges_data_sent_ahead_of_its_fin() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        let peer_fin = header(tcb.rcv_nxt, tcb.snd_una, flags::FIN | flags::ACK, u16::MAX);
+        tcb.on_segment(&peer_fin, Bytes::new(), now);
+        tcb.poll_output(now);
+        tcb.send(Bytes::from_static(b"payload"));
+        tcb.close();
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].flags, flags::FIN | flags::ACK);
+        assert_eq!(tcb.state, TcpState::LastAck);
+        let data_end = out[0].seq + out[0].payload.len() as u32;
+
+        // The data ACK must be consumed in LAST-ACK, or a lost FIN could
+        // never reach the front of the retransmission queue.
+        let ack = header(tcb.rcv_nxt, data_end, flags::ACK, u16::MAX);
+        tcb.on_segment(&ack, Bytes::new(), now);
+        assert_eq!(tcb.state, TcpState::LastAck);
+        assert_eq!(tcb.snd_una, data_end);
+        assert_eq!(tcb.retransmit.segments.len(), 1);
+
+        let ack = header(tcb.rcv_nxt, data_end + 1, flags::ACK, u16::MAX);
+        tcb.on_segment(&ack, Bytes::new(), now);
+        assert!(tcb.is_closed());
     }
 
     #[test]
@@ -1693,6 +1753,6 @@ mod tests {
     #[test]
     fn passive_open_sizes_congestion_window_from_the_peer_mss() {
         let tcb = Tcb::new_from_listen(tuple(), Seq::new(1000), 536);
-        assert_eq!(tcb.congestion.cwnd(), 2 * 536);
+        assert_eq!(tcb.congestion.cwnd(), 10 * 536);
     }
 }

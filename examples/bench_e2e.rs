@@ -21,6 +21,8 @@
 //! sleeping in `read()`, which takes the server's wake-up out of every
 //! round trip. `BENCH_WORKLOADS=latency` skips the bulk transfers and
 //! `BENCH_WORKLOADS=short` runs only the short fresh-connection uploads.
+//! `BENCH_WORKLOADS=bulk` runs only the bulk transfers, and `BENCH_BULK_MB`
+//! sets their size (default 64).
 //!
 //! Output is one tab-separated row per measurement:
 //! `label  workload  metric  value`. See `scripts/bench.sh` for the wiring.
@@ -36,7 +38,15 @@ const SINK_PORT: u16 = 7002;
 const SOURCE_PORT: u16 = 7003;
 
 const CONNECTS: usize = 300;
-const BULK_BYTES: u64 = 64 * 1024 * 1024;
+/// Bytes per bulk transfer: 64 MB, or `BENCH_BULK_MB` megabytes.
+fn bulk_bytes() -> u64 {
+    std::env::var("BENCH_BULK_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(64)
+        * 1024
+        * 1024
+}
 const CHUNK: usize = 64 * 1024;
 /// (payload bytes, round trips)
 const RTT_CASES: [(usize, usize); 3] = [(64, 20_000), (1400, 20_000), (16 * 1024, 5_000)];
@@ -51,7 +61,10 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("server") => server(ip(&args[2]), args.get(3).is_some_and(|a| a == "spin")),
         Some("kernel") => {
-            let label = args.get(3).cloned().unwrap_or_else(|| "kernel-tokio".into());
+            let label = args
+                .get(3)
+                .cloned()
+                .unwrap_or_else(|| "kernel-tokio".into());
             kernel_tokio(ip(&args[2]), &label);
         }
         Some("blocking") => {
@@ -232,12 +245,16 @@ where
     if std::env::var("BENCH_WORKLOADS").is_ok_and(|v| v == "short") {
         return short_transfers(label, &mut connect).await;
     }
+    let bulk_only = std::env::var("BENCH_WORKLOADS").is_ok_and(|v| v == "bulk");
     for (size, rounds) in RTT_CASES {
+        if bulk_only {
+            break;
+        }
         rtt_async(label, &format!("rtt_{size}B"), &mut connect, size, rounds).await?;
     }
 
     // Small-message throughput with a window of requests in flight.
-    {
+    if !bulk_only {
         let mut stream = connect(ECHO_PORT).await?;
         let msg = [0xa5u8; 64];
         let batch = vec![0xa5u8; msg.len() * PIPELINE_DEPTH];
@@ -260,11 +277,12 @@ where
     }
 
     if bulk_enabled() {
+        let bulk_bytes = bulk_bytes();
         // Bulk upload: the server acknowledges the byte count after our FIN.
         let mut stream = connect(SINK_PORT).await?;
         let buf = vec![0x5au8; CHUNK];
         let start = Instant::now();
-        let mut left = BULK_BYTES;
+        let mut left = bulk_bytes;
         while left > 0 {
             let n = left.min(CHUNK as u64) as usize;
             stream.write_all(&buf[..n]).await?;
@@ -273,24 +291,27 @@ where
         stream.shutdown().await?;
         let mut total = [0u8; 8];
         stream.read_exact(&mut total).await?;
-        assert_eq!(u64::from_be_bytes(total), BULK_BYTES, "upload truncated");
-        report_throughput(label, "upload", BULK_BYTES, start.elapsed());
+        assert_eq!(u64::from_be_bytes(total), bulk_bytes, "upload truncated");
+        report_throughput(label, "upload", bulk_bytes, start.elapsed());
 
         // Bulk download.
         let mut stream = connect(SOURCE_PORT).await?;
         let mut buf = vec![0u8; CHUNK];
         let start = Instant::now();
-        stream.write_all(&BULK_BYTES.to_be_bytes()).await?;
+        stream.write_all(&bulk_bytes.to_be_bytes()).await?;
         let mut got = 0u64;
-        while got < BULK_BYTES {
+        while got < bulk_bytes {
             let n = stream.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
             got += n as u64;
         }
-        assert_eq!(got, BULK_BYTES, "download truncated");
-        report_throughput(label, "download", BULK_BYTES, start.elapsed());
+        assert_eq!(got, bulk_bytes, "download truncated");
+        report_throughput(label, "download", bulk_bytes, start.elapsed());
+    }
+    if bulk_only {
+        return Ok(());
     }
 
     // Connection setup: handshake to first usable stream. Each connection
@@ -331,7 +352,11 @@ where
         assert_eq!(u64::from_be_bytes(total), SHORT_BYTES as u64);
         samples.push(start.elapsed());
     }
-    report_latency(label, "fresh_conn_upload_128KB_first20", samples[..20].to_vec());
+    report_latency(
+        label,
+        "fresh_conn_upload_128KB_first20",
+        samples[..20].to_vec(),
+    );
     report_latency(label, "fresh_conn_upload_128KB", samples);
     Ok(())
 }
@@ -429,10 +454,7 @@ mod dpdk_mode {
         let app = &args[split + 1..];
         let local_ip: Ipv4Addr = app[0].parse().expect("bad local IP");
         let server: Ipv4Addr = app[1].parse().expect("bad server IP");
-        let label = app
-            .get(2)
-            .cloned()
-            .unwrap_or_else(|| default_label.into());
+        let label = app.get(2).cloned().unwrap_or_else(|| default_label.into());
         dpdk::eal::init(&eal_args).expect("EAL initialization failed");
         (local_ip, server, label)
     }
@@ -556,7 +578,12 @@ mod dpdk_mode {
                 }
                 samples.push(start.elapsed());
             }
-            super::row(&label, "tcp_rst_rtt", "rx_polls", polls as f64 / ROUNDS as f64);
+            super::row(
+                &label,
+                "tcp_rst_rtt",
+                "rx_polls",
+                polls as f64 / ROUNDS as f64,
+            );
             super::row(
                 &label,
                 "tcp_rst_rtt",

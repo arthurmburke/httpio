@@ -84,17 +84,40 @@ impl SendBuffer {
     }
 }
 
-const INLINE_FRAGMENTS: usize = 8;
+const INLINE_FRAGMENTS: usize = 2;
 
 /// Shared payload slices retained for transmission and retransmission.
-/// Eight fragments fit inline; unusually fragmented segments share a
-/// metadata allocation without copying payload bytes or shortening packets.
-#[derive(Clone, Debug)]
+/// Two fragments fit inline, which covers a segment cut from one write or
+/// straddling two; more fragmented segments share a metadata allocation
+/// without copying payload bytes or shortening packets. The inline count
+/// is kept small because every segment's `Payload` is moved several times
+/// on its way to the port and cloned into the retransmission queue.
+#[derive(Debug)]
 pub struct Payload {
     chunks: [Bytes; INLINE_FRAGMENTS],
     count: usize,
     overflow: Option<Arc<[Bytes]>>,
     len: usize,
+}
+
+impl Clone for Payload {
+    /// Clones only the fragments in use. Every segment is cloned once into
+    /// the retransmission queue, and the derived impl would make an
+    /// indirect call for each of the unused inline slots too.
+    fn clone(&self) -> Self {
+        Self {
+            chunks: std::array::from_fn(|i| {
+                if i < self.count {
+                    self.chunks[i].clone()
+                } else {
+                    Bytes::new()
+                }
+            }),
+            count: self.count,
+            overflow: self.overflow.clone(),
+            len: self.len,
+        }
+    }
 }
 
 impl Default for Payload {
