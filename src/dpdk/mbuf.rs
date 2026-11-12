@@ -22,6 +22,26 @@ pub struct Mbuf {
 // safe to move between threads.
 unsafe impl Send for Mbuf {}
 
+// A separate pool mbuf holds the shared owner record until the final external
+// reference drops, including any indirect clones made by a driver.
+#[repr(C)]
+struct ExternalOwner {
+    shared: ffi::rte_mbuf_ext_shared_info,
+    bytes: Bytes,
+    record_mbuf: *mut ffi::rte_mbuf,
+}
+
+unsafe extern "C" fn release_external(_addr: *mut std::ffi::c_void, opaque: *mut std::ffi::c_void) {
+    // SAFETY: the final DPDK external-buffer reference invokes this once,
+    // while the separately reserved record mbuf is still live.
+    unsafe {
+        let record = opaque.cast::<ExternalOwner>();
+        let raw = (*record).record_mbuf;
+        std::ptr::drop_in_place(record);
+        ffi::rte_pktmbuf_free(raw);
+    }
+}
+
 impl Mbuf {
     /// Takes ownership of a raw mbuf pointer received from DPDK (e.g. via
     /// `rx_burst` or `alloc`). Caller must not free/reuse the pointer
@@ -43,6 +63,69 @@ impl Mbuf {
             return None;
         }
         Some(Self { raw })
+    }
+
+    /// DMA-contiguous prefix of EAL-managed memory, capped by mbuf buf_len.
+    /// Ordinary Rust heap memory is deliberately not treated as DMA mapped.
+    pub(crate) fn dma_prefix(data: &[u8]) -> Option<(usize, u64)> {
+        if data.is_empty() {
+            return None;
+        }
+        unsafe {
+            let ms = ffi::rte_mem_virt2memseg(data.as_ptr().cast(), std::ptr::null());
+            if ms.is_null() || (*ms).iova == u64::MAX {
+                return None;
+            }
+            let offset =
+                (data.as_ptr() as usize).checked_sub((*ms).__bindgen_anon_1.addr as usize)?;
+            let n = data
+                .len()
+                .min((*ms).len.checked_sub(offset)?)
+                .min(u16::MAX as usize);
+            if n == 0 {
+                return None;
+            }
+            Some((n, (*ms).iova.checked_add(offset as u64)?))
+        }
+    }
+
+    /// Attaches an immutable DMA-capable Bytes range without copying it.
+    /// Returns None for heap memory or a range spanning DMA segments.
+    /// Writable mbuf methods reject external storage to preserve Bytes immutability.
+    pub fn from_external_bytes(pool: &Mempool, bytes: Bytes) -> Option<Self> {
+        let (n, iova) = Self::dma_prefix(&bytes)?;
+        if n != bytes.len() {
+            return None;
+        }
+        let packet = Self::alloc(pool)?;
+        let record = Self::alloc(pool)?;
+        unsafe {
+            let raw = packet.raw;
+            let storage = (*record.raw).buf_addr.cast::<u8>();
+            let padding = storage.align_offset(std::mem::align_of::<ExternalOwner>());
+            if padding + std::mem::size_of::<ExternalOwner>() > (*record.raw).buf_len as usize {
+                return None;
+            }
+            let owner = storage.add(padding).cast::<ExternalOwner>();
+            let addr = bytes.as_ptr() as *mut std::ffi::c_void;
+            owner.write(ExternalOwner {
+                shared: ffi::rte_mbuf_ext_shared_info {
+                    free_cb: Some(release_external),
+                    fcb_opaque: owner.cast(),
+                    refcnt: 1,
+                },
+                bytes,
+                record_mbuf: record.into_raw(),
+            });
+            ffi::rte_pktmbuf_attach_extbuf(raw, addr, iova, n as u16, &mut (*owner).shared);
+            (*raw).data_len = n as u16;
+            (*raw).pkt_len = n as u32;
+        }
+        Some(packet)
+    }
+
+    fn is_external(&self) -> bool {
+        self.ol_flags() & ffi::RTE_MBUF_F_EXTERNAL != 0
     }
 
     /// Consumes the handle and returns the raw pointer without freeing it,
@@ -186,6 +269,7 @@ impl Mbuf {
     }
 
     pub fn data_mut(&mut self) -> &mut [u8] {
+        assert!(!self.is_external(), "external Bytes payload is immutable");
         let ptr = self.data_ptr();
         let len = self.data_len() as usize;
         if ptr.is_null() || len == 0 {
@@ -198,6 +282,9 @@ impl Mbuf {
     /// view of the newly appended region. `None` if there isn't enough
     /// tailroom.
     pub fn append(&mut self, len: u16) -> Option<&mut [u8]> {
+        if self.is_external() {
+            return None;
+        }
         // SAFETY: `raw` is valid; `rte_pktmbuf_append` returns a pointer
         // into the mbuf's tail (or null if it doesn't fit).
         let ptr = unsafe { ffi::rte_pktmbuf_append(self.raw, len) }.cast::<u8>();
@@ -211,6 +298,9 @@ impl Mbuf {
     /// header) and returns a mutable view of the new region. `None` if
     /// there isn't enough headroom.
     pub fn prepend(&mut self, len: u16) -> Option<&mut [u8]> {
+        if self.is_external() {
+            return None;
+        }
         // SAFETY: as above, into the mbuf's headroom.
         let ptr = unsafe { ffi::rte_pktmbuf_prepend(self.raw, len) }.cast::<u8>();
         if ptr.is_null() {
@@ -228,6 +318,9 @@ impl Mbuf {
             (*self.raw).next = std::ptr::null_mut();
             if !tail.is_null() {
                 ffi::rte_pktmbuf_free(tail);
+            }
+            if self.is_external() {
+                ffi::rte_pktmbuf_detach(self.raw);
             }
             ffi::rte_pktmbuf_reset(self.raw);
         }

@@ -175,6 +175,24 @@ impl Payload {
         out
     }
 
+    /// Checksum over fragmented payload, preserving odd-byte boundaries.
+    pub(crate) fn checksum_sum(&self, mut sum: u32) -> u16 {
+        let mut high = None;
+        for chunk in self.chunks() {
+            for &byte in chunk.iter() {
+                if let Some(first) = high.take() {
+                    sum += u16::from_be_bytes([first, byte]) as u32;
+                } else {
+                    high = Some(byte);
+                }
+            }
+        }
+        if let Some(first) = high {
+            sum += (first as u32) << 8;
+        }
+        crate::dpdk::net::checksum::fold(sum)
+    }
+
     pub fn copy_to(&self, out: &mut [u8]) {
         assert_eq!(out.len(), self.len);
         let mut offset = 0;

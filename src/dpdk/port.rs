@@ -35,6 +35,7 @@ pub struct Offloads {
     pub rx_checksum: bool,
     pub tso_max_payload: usize,
     pub tx_multi_segment: bool,
+    pub tx_max_segments: usize,
 }
 
 pub struct EthPort {
@@ -92,6 +93,18 @@ impl EthPort {
         let rx_cksum_offload = rx_en == rx_want;
 
         let multi = info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_MULTI_SEGS as u64 != 0;
+        let tx_max_segments = if multi {
+            let total = usize::from(info.tx_desc_lim.nb_seg_max);
+            let per_packet = usize::from(info.tx_desc_lim.nb_mtu_seg_max);
+            total
+                .min(if per_packet == 0 { total } else { per_packet })
+                .min(32)
+        } else {
+            1
+        };
+        if multi {
+            tx_en |= ffi::RTE_ETH_TX_OFFLOAD_MULTI_SEGS as u64;
+        }
         let tso = multi
             && (info.tx_desc_lim.nb_mtu_seg_max == 0 || info.tx_desc_lim.nb_mtu_seg_max >= 2)
             && tx_cksum_offload
@@ -111,7 +124,8 @@ impl EthPort {
             tx_checksum: tx_cksum_offload,
             rx_checksum: rx_cksum_offload,
             tso_max_payload,
-            tx_multi_segment: tso,
+            tx_multi_segment: multi,
+            tx_max_segments,
         };
 
         // Single rx queue (0), single tx queue (0). A zeroed `rte_eth_conf`

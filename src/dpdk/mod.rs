@@ -1,6 +1,8 @@
 //! Raw DPDK FFI + safe wrappers. See `ffi.rs` for the ABI notes on why some
 //! functions are declared directly and others go through `csrc/shim.c`.
 
+pub mod dma_buffer;
+pub use dma_buffer::DmaBuffer;
 pub mod eal;
 pub mod ffi;
 pub mod http;

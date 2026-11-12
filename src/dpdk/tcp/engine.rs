@@ -652,7 +652,7 @@ impl TcpEngine {
 
     fn flush_tx(&mut self, port: &EthPort, pool: &Mempool, now: Instant) {
         while let Some(packet) = self.pending_tx.front() {
-            let Some(mbuf) = build_ip_tcp_frame(
+            let Some(mbuf) = build_ip_tcp_frame_external(
                 pool,
                 self.config.local_mac,
                 packet.mac,
@@ -662,6 +662,7 @@ impl TcpEngine {
                 &packet.payload,
                 port.tx_cksum_offload(),
                 packet.tso_mss,
+                port.offloads().tx_max_segments,
             ) else {
                 break;
             };
@@ -865,6 +866,22 @@ impl TcpEngine {
     }
 }
 
+fn external_segment_count(payload: &Payload, max_segments: usize) -> Option<usize> {
+    let mut count = 1; // writable header
+    for chunk in payload.chunks() {
+        let mut data = &chunk[..];
+        while !data.is_empty() {
+            let (n, _) = Mbuf::dma_prefix(data)?;
+            count += 1;
+            if count > max_segments {
+                return None;
+            }
+            data = &data[n..];
+        }
+    }
+    Some(count)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_ip_tcp_frame(
     pool: &Mempool,
@@ -877,8 +894,93 @@ fn build_ip_tcp_frame(
     tx_cksum_offload: bool,
     tso_mss: u16,
 ) -> Option<Mbuf> {
+    build_ip_tcp_frame_external(
+        pool,
+        local_mac,
+        remote_mac,
+        local_ip,
+        remote_ip,
+        tcp_hdr,
+        payload,
+        tx_cksum_offload,
+        tso_mss,
+        1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ip_tcp_frame_external(
+    pool: &Mempool,
+    local_mac: EthAddr,
+    remote_mac: EthAddr,
+    local_ip: Ipv4Addr,
+    remote_ip: Ipv4Addr,
+    tcp_hdr: &tcp::TcpHeader,
+    payload: &Payload,
+    tx_cksum_offload: bool,
+    tso_mss: u16,
+    max_segments: usize,
+) -> Option<Mbuf> {
     let tcp_len = tcp_hdr.wire_len();
     let total_len = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + tcp_len + payload.len();
+
+    // External attachment is all-or-nothing: unsupported memory or too many
+    // DMA ranges uses the established copying path instead of stalling TX.
+    if !payload.is_empty() && external_segment_count(payload, max_segments).is_some() {
+        let mut head = Mbuf::alloc(pool)?;
+        let header_len = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + tcp_len;
+        let buf = head.append(header_len as u16)?;
+        eth::EthHeader {
+            dst: remote_mac,
+            src: local_mac,
+            ethertype: eth::ETHERTYPE_IPV4,
+        }
+        .write(buf);
+        ipv4::Ipv4Header {
+            dscp_ecn: 0,
+            total_length: (total_len - 14) as u16,
+            identification: 0,
+            flags_fragment_offset: 0x4000,
+            ttl: 64,
+            protocol: ipv4::PROTO_TCP,
+            src: local_ip,
+            dst: remote_ip,
+        }
+        .write(&mut buf[14..34], tx_cksum_offload);
+        tcp_hdr.write(&mut buf[34..], &[], local_ip, remote_ip, true);
+        let seed = super::super::net::checksum::ipv4_pseudo_header_sum(
+            local_ip,
+            remote_ip,
+            ipv4::PROTO_TCP,
+            if tso_mss != 0 {
+                0
+            } else {
+                (tcp_len + payload.len()) as u16
+            },
+        );
+        let csum = if tx_cksum_offload {
+            super::super::net::checksum::fold_raw(seed)
+        } else {
+            buf[50..52].fill(0);
+            payload.checksum_sum(super::super::net::checksum::sum16(&buf[34..], seed))
+        };
+        buf[50..52].copy_from_slice(&csum.to_be_bytes());
+        for chunk in payload.chunks() {
+            let mut start = 0;
+            while start < chunk.len() {
+                let (n, _) = Mbuf::dma_prefix(&chunk[start..])?;
+                let tail = Mbuf::from_external_bytes(pool, chunk.slice(start..start + n))?;
+                head.chain(tail).ok()?;
+                start += n;
+            }
+        }
+        if tso_mss != 0 {
+            head.set_tx_tso(tcp_len as u16, tso_mss);
+        } else if tx_cksum_offload {
+            head.set_tx_ipv4_tcp_cksum(14, 20);
+        }
+        return Some(head);
+    }
 
     if tso_mss != 0 {
         let mut head = Mbuf::alloc(pool)?;
@@ -1082,6 +1184,79 @@ mod tests {
             let (tcb, peer) = established_tcb(1234, now);
             let mut header = peer.clone();
             header.flags = tcp::flags::ACK;
+            // The packet chain must point at the application's original DMA
+            // bytes, including odd fragment boundaries, in both normal and TSO TX.
+            let mut dma = crate::dpdk::DmaBuffer::new(8193).unwrap();
+            for (i, b) in dma.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            let dma = dma.freeze();
+            let mut queue = super::super::tx_queue::SendBuffer::default();
+            queue.push(dma.slice(..1001));
+            queue.push(dma.slice(1001..3002));
+            queue.push(dma.slice(3002..));
+            let external = queue.take(dma.len());
+            for tso in [0, 1460] {
+                let packet = build_ip_tcp_frame_external(
+                    &pool,
+                    EthAddr::ZERO,
+                    EthAddr::ZERO,
+                    tcb.tuple.remote_ip,
+                    tcb.tuple.local_ip,
+                    &header,
+                    &external,
+                    tso != 0,
+                    tso,
+                    32,
+                )
+                .unwrap();
+                let mut offset = 0;
+                for segment in packet.segments().skip(1) {
+                    assert_eq!(
+                        segment.as_ptr(),
+                        dma[offset..].as_ptr(),
+                        "payload was copied"
+                    );
+                    offset += segment.len();
+                }
+                assert_eq!(offset, dma.len());
+                let wire: Vec<u8> = packet.segments().flatten().copied().collect();
+                assert_eq!(&wire[54..], &dma[..]);
+                if tso == 0 {
+                    assert!(
+                        tcp::TcpHeader::parse(
+                            &wire[34..],
+                            tcb.tuple.remote_ip,
+                            tcb.tuple.local_ip,
+                            true
+                        )
+                        .is_some(),
+                        "software checksum must span odd-sized external fragments"
+                    );
+                }
+                drop(packet);
+                assert_eq!(available(), baseline);
+            }
+            assert!(external_segment_count(&external, 1).is_none());
+            let fallback = build_ip_tcp_frame_external(
+                &pool,
+                EthAddr::ZERO,
+                EthAddr::ZERO,
+                tcb.tuple.remote_ip,
+                tcb.tuple.local_ip,
+                &header,
+                &external,
+                true,
+                1460,
+                1,
+            )
+            .unwrap();
+            assert_ne!(fallback.segments().nth(1).unwrap().as_ptr(), dma.as_ptr());
+            drop(fallback);
+            drop(external);
+            drop(dma);
+            assert_eq!(available(), baseline);
+
             let payload = Payload::from(Bytes::from(vec![42; 8193]));
             let packet = build_ip_tcp_frame(
                 &pool,
