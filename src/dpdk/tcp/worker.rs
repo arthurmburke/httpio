@@ -257,6 +257,48 @@ struct NewConn {
     inbound_tx: InboundTx,
 }
 
+/// What the worker still owes the application on a connection's inbound
+/// ring. Advances only forward:
+///
+/// ```text
+/// Connecting --Established--> Established --PeerClosed--> Draining
+///     |                           |                           |
+///     | Reset / Closed            | Reset                     | data drained (Eof) / Reset
+///     v                           v                           v
+///  Terminal(ConnectFailed)     Terminal(Reset)          Terminal(Eof | Reset)
+///                                   \________________________/
+///                                               | ring accepts it
+///                                               v
+///                                             Ended
+/// ```
+enum Delivery {
+    /// The handshake has not completed.
+    Connecting,
+    /// `Inbound::Established` is on the ring; data flows.
+    Established,
+    /// The peer sent FIN; `Eof` follows once buffered data has drained.
+    Draining,
+    /// The one terminal signal (`Eof`/`ConnectFailed`/`Reset`), held until
+    /// buffered data has drained and the ring accepts it, so it can never
+    /// be lost to a transiently full ring.
+    Terminal(Inbound),
+    /// The terminal signal has been delivered; nothing more is produced.
+    Ended,
+}
+
+/// The application side's teardown of a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    /// The application holds the connection and has not closed it.
+    Open,
+    /// The engine has been asked to close (half-close); not repeated.
+    Closing,
+    /// The application's handle is gone. The engine has been asked to
+    /// close, and the connection is aborted at `deadline` if the peer has
+    /// not finished by then.
+    Orphaned { deadline: Instant },
+}
+
 /// Worker-side per-connection state.
 struct WorkerConn {
     engine_bytes: usize,
@@ -267,22 +309,62 @@ struct WorkerConn {
     /// A received chunk the inbound ring was too full to accept; retried
     /// before pulling more from the engine so no bytes are dropped.
     pending_in: Option<Bytes>,
-    established: bool,
-    /// Peer sent FIN; deliver an `Eof` once buffered data has drained.
-    peer_fin: bool,
-    /// The one terminal signal (Eof/ConnectFailed/Reset) to deliver after
-    /// buffered data drains. Held (not dropped) until the inbound ring
-    /// accepts it, so it can never be lost to a transiently full ring.
-    terminal: Option<Inbound>,
-    /// The terminal signal has been delivered; stop producing.
-    end_sent: bool,
-    /// We've asked the engine to close (half-close), so don't repeat it.
-    closing: bool,
-    /// Deadline after which we reap the connection if the peer has not sent a FIN.
-    deadline: Option<Instant>,
+    delivery: Delivery,
+    teardown: Teardown,
 }
 
 impl WorkerConn {
+    fn new(
+        tuple: FourTuple,
+        cmd_rx: CmdRx,
+        outstanding: Arc<SendCredit>,
+        inbound_tx: InboundTx,
+    ) -> Self {
+        Self {
+            engine_bytes: 0,
+            tuple,
+            cmd_rx,
+            outstanding,
+            inbound_tx,
+            pending_in: None,
+            delivery: Delivery::Connecting,
+            teardown: Teardown::Open,
+        }
+    }
+
+    /// `Command::Close`: half-close the engine side, once.
+    fn close(&mut self, engine: &mut TcpEngine) {
+        engine.close(self.tuple);
+        if self.teardown == Teardown::Open {
+            self.teardown = Teardown::Closing;
+        }
+    }
+
+    /// Whether the application's handle is gone and the connection is
+    /// waiting out its reap deadline.
+    fn is_orphaned(&self) -> bool {
+        matches!(self.teardown, Teardown::Orphaned { .. })
+    }
+
+    /// Moves the terminal signal toward the application: a drained peer
+    /// FIN becomes `Eof`, and a held terminal is pushed once no data is
+    /// stalled ahead of it.
+    fn deliver_terminal(&mut self, engine: &TcpEngine) {
+        if self.pending_in.is_some() {
+            return;
+        }
+        if matches!(self.delivery, Delivery::Draining) && engine.readable_len(self.tuple) == 0 {
+            self.delivery = Delivery::Terminal(Inbound::Eof);
+        }
+        self.delivery = match std::mem::replace(&mut self.delivery, Delivery::Ended) {
+            Delivery::Terminal(terminal) => match self.inbound_tx.push(terminal) {
+                Ok(()) => Delivery::Ended,
+                Err(returned) => Delivery::Terminal(returned),
+            },
+            other => other,
+        };
+    }
+
     fn release_credit(&mut self, engine: &TcpEngine) {
         let remaining = engine.buffered_send_bytes(self.tuple);
         let released = self.engine_bytes - remaining;
@@ -296,11 +378,17 @@ impl WorkerConn {
         if !self.outstanding.app_gone.load(Ordering::Acquire) {
             return true;
         }
-        let deadline = *self.deadline.get_or_insert(now + REAP_TIMEOUT);
-        if !self.closing {
-            self.closing = true;
-            engine.close(self.tuple);
-        }
+        let deadline = match self.teardown {
+            Teardown::Orphaned { deadline } => deadline,
+            Teardown::Open | Teardown::Closing => {
+                if self.teardown == Teardown::Open {
+                    engine.close(self.tuple);
+                }
+                let deadline = now + REAP_TIMEOUT;
+                self.teardown = Teardown::Orphaned { deadline };
+                deadline
+            }
+        };
         if matches!(
             engine.state(self.tuple),
             None | Some(TcpState::Closed | TcpState::TimeWait)
@@ -317,31 +405,41 @@ impl WorkerConn {
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::Established => {
-                if self.inbound_tx.push(Inbound::Established).is_ok() {
-                    self.established = true;
+                // The ring is empty before the handshake completes, so
+                // this push cannot fail in practice.
+                if matches!(self.delivery, Delivery::Connecting)
+                    && self.inbound_tx.push(Inbound::Established).is_ok()
+                {
+                    self.delivery = Delivery::Established;
                 }
-                // If the ring were somehow full, the app hasn't
-                // consumed anything yet, so it will next iteration.
             }
-            Event::PeerClosed => self.peer_fin = true,
+            Event::PeerClosed => {
+                if matches!(self.delivery, Delivery::Connecting | Delivery::Established) {
+                    self.delivery = Delivery::Draining;
+                }
+            }
             Event::Reset => {
                 self.outstanding.failed.store(true, Ordering::Release);
                 // Distinguish a failed handshake from a reset of an
                 // established connection so the app reports the right
-                // error.
-                self.terminal.get_or_insert(if self.established {
-                    Inbound::Reset
-                } else {
-                    Inbound::ConnectFailed
-                });
+                // error. A terminal already chosen stands.
+                match self.delivery {
+                    Delivery::Connecting => {
+                        self.delivery = Delivery::Terminal(Inbound::ConnectFailed);
+                    }
+                    Delivery::Established | Delivery::Draining => {
+                        self.delivery = Delivery::Terminal(Inbound::Reset);
+                    }
+                    Delivery::Terminal(_) | Delivery::Ended => {}
+                }
             }
             Event::Closed => {
                 // A close before ESTABLISHED is a failed active open;
                 // an established-then-closed connection is delivered as
-                // EOF via the peer_fin path below.
-                if !self.established {
+                // EOF via the `Draining` path.
+                if matches!(self.delivery, Delivery::Connecting) {
                     self.outstanding.failed.store(true, Ordering::Release);
-                    self.terminal.get_or_insert(Inbound::ConnectFailed);
+                    self.delivery = Delivery::Terminal(Inbound::ConnectFailed);
                 }
             }
         }
@@ -571,20 +669,7 @@ fn run(
             nc.outstanding.clear_notification();
             conns.insert(
                 tuple,
-                WorkerConn {
-                    tuple,
-                    cmd_rx: nc.cmd_rx,
-                    outstanding: nc.outstanding,
-                    engine_bytes: 0,
-                    inbound_tx: nc.inbound_tx,
-                    pending_in: None,
-                    established: false,
-                    peer_fin: false,
-                    terminal: None,
-                    end_sent: false,
-                    closing: false,
-                    deadline: None,
-                },
+                WorkerConn::new(tuple, nc.cmd_rx, nc.outstanding, nc.inbound_tx),
             );
             // A connection was just opened; publish the new count (only
             // here, since this is the only place it changes).
@@ -613,10 +698,7 @@ fn run(
                     }
                     Command::SetCork(c) => engine.set_cork(conn.tuple, c),
                     Command::Flush => engine.flush(conn.tuple),
-                    Command::Close => {
-                        engine.close(conn.tuple);
-                        conn.closing = true;
-                    }
+                    Command::Close => conn.close(&mut engine),
                 }
             }
         }
@@ -663,26 +745,9 @@ fn run(
                 }
             }
             // Peer FIN, once buffered data is fully delivered, becomes an
-            // EOF terminal.
-            if conn.peer_fin
-                && conn.terminal.is_none()
-                && !conn.end_sent
-                && conn.pending_in.is_none()
-                && engine.readable_len(conn.tuple) == 0
-            {
-                conn.terminal = Some(Inbound::Eof);
-            }
-            // Deliver the terminal signal only after all data has drained,
-            // retrying until the ring accepts it (never dropped).
-            if !conn.end_sent
-                && conn.pending_in.is_none()
-                && let Some(terminal) = conn.terminal.take()
-            {
-                match conn.inbound_tx.push(terminal) {
-                    Ok(()) => conn.end_sent = true,
-                    Err(returned) => conn.terminal = Some(returned),
-                }
-            }
+            // EOF terminal. The terminal signal goes out only after all
+            // data has drained, retrying until the ring accepts it.
+            conn.deliver_terminal(&engine);
         }
 
         // 5. Reap connections whose app-side handle is gone. Close the
@@ -696,7 +761,7 @@ fn run(
             if !conn.retain_after_drop(&mut engine, now) {
                 conns.remove(&tuple);
                 closing.remove(&tuple);
-            } else if conn.deadline.is_some() {
+            } else if conn.is_orphaned() {
                 closing.insert(tuple);
             }
         }
@@ -718,20 +783,7 @@ mod tests {
         let tuple = engine
             .connect(Ipv4Addr::new(10, 0, 0, 2), 80, 1234)
             .unwrap();
-        let conn = WorkerConn {
-            tuple,
-            cmd_rx,
-            outstanding,
-            engine_bytes: 0,
-            inbound_tx,
-            pending_in: None,
-            established: false,
-            peer_fin: false,
-            terminal: None,
-            end_sent: false,
-            closing: false,
-            deadline: None,
-        };
+        let conn = WorkerConn::new(tuple, cmd_rx, outstanding, inbound_tx);
         (tx, conn, engine)
     }
 
@@ -859,13 +911,19 @@ mod tests {
     fn dropped_connection_deadline_is_fixed_and_aborts_live_engine() {
         for already_closing in [false, true] {
             let (tx, mut conn, mut engine) = fixture();
-            conn.closing = already_closing;
+            if already_closing {
+                conn.close(&mut engine);
+                assert_eq!(conn.teardown, Teardown::Closing);
+            }
             drop(tx);
             let now = Instant::now();
+            let orphaned = Teardown::Orphaned {
+                deadline: now + REAP_TIMEOUT,
+            };
             assert!(conn.retain_after_drop(&mut engine, now));
-            assert!(conn.closing);
+            assert_eq!(conn.teardown, orphaned);
             assert!(conn.retain_after_drop(&mut engine, now + REAP_TIMEOUT / 2));
-            assert_eq!(conn.deadline, Some(now + REAP_TIMEOUT));
+            assert_eq!(conn.teardown, orphaned, "the deadline must not slide");
             assert!(!conn.retain_after_drop(&mut engine, now + REAP_TIMEOUT));
             assert_eq!(engine.state(conn.tuple), None);
         }
@@ -919,25 +977,17 @@ mod tests {
         for established in [false, true] {
             let (cmd_tx, cmd_rx, outstanding) = command_channel();
             let (inbound_tx, _inbound_rx) = spsc::channel::<Inbound, IN_CAP>();
-            let mut conn = WorkerConn {
-                tuple: FourTuple {
-                    local_ip: Ipv4Addr::new(10, 0, 0, 1),
-                    local_port: 1234,
-                    remote_ip: Ipv4Addr::new(10, 0, 0, 2),
-                    remote_port: 80,
-                },
-                cmd_rx,
-                outstanding,
-                engine_bytes: 0,
-                inbound_tx,
-                pending_in: None,
-                established,
-                peer_fin: false,
-                terminal: None,
-                end_sent: false,
-                closing: false,
-                deadline: None,
+            let tuple = FourTuple {
+                local_ip: Ipv4Addr::new(10, 0, 0, 1),
+                local_port: 1234,
+                remote_ip: Ipv4Addr::new(10, 0, 0, 2),
+                remote_port: 80,
             };
+            let mut conn = WorkerConn::new(tuple, cmd_rx, outstanding, inbound_tx);
+            if established {
+                conn.on_event(Event::Established);
+                assert!(matches!(conn.delivery, Delivery::Established));
+            }
             conn.on_event(Event::Reset);
             assert!(cmd_tx.failed());
             assert!(
@@ -946,9 +996,12 @@ mod tests {
                     .is_err()
             );
             if established {
-                assert!(matches!(conn.terminal, Some(Inbound::Reset)));
+                assert!(matches!(conn.delivery, Delivery::Terminal(Inbound::Reset)));
             } else {
-                assert!(matches!(conn.terminal, Some(Inbound::ConnectFailed)));
+                assert!(matches!(
+                    conn.delivery,
+                    Delivery::Terminal(Inbound::ConnectFailed)
+                ));
             }
         }
     }

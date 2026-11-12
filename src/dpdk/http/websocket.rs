@@ -63,6 +63,19 @@ type WsIo = TokioIo<Upgraded>;
 // can name them without reaching across modules.
 pub use crate::http::websocket::{CloseFrame, Message};
 
+/// The closing handshake (RFC 6455 §7.1.2). A peer-initiated Close is
+/// echoed at once, so it goes straight from `Open` to `Closed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseState {
+    /// No Close frame in either direction.
+    Open,
+    /// Our Close is queued or sent; the peer's has not arrived. Sends are
+    /// refused, Pings are no longer answered, and receiving continues.
+    CloseSent,
+    /// Close frames have gone both ways: `recv` ends once ours is flushed.
+    Closed,
+}
+
 /// An established WebSocket connection.
 pub struct WebSocketClient {
     io: WsIo,
@@ -71,8 +84,7 @@ pub struct WebSocketClient {
     read_buf: BytesMut,
     /// In-progress fragmented message: (data opcode, accumulated payload).
     fragment: Option<(u8, BytesMut)>,
-    close_sent: bool,
-    close_received: bool,
+    close: CloseState,
     /// The subprotocol the server selected from the request's offers.
     protocol: Option<String>,
     /// The `101 Switching Protocols` response parts (status, headers,
@@ -238,8 +250,7 @@ impl WebSocketClient {
             rng,
             read_buf: BytesMut::with_capacity(8 * 1024),
             fragment: None,
-            close_sent: false,
-            close_received: false,
+            close: CloseState::Open,
             protocol,
             handshake,
             write_queue: VecDeque::new(),
@@ -281,7 +292,7 @@ impl WebSocketClient {
     /// fails and `recv` keeps delivering anything already in flight until
     /// the peer's Close (or EOF) arrives.
     pub async fn close(&mut self, frame: Option<CloseFrame>) -> Result<(), WebSocketError> {
-        if self.close_sent {
+        if self.close != CloseState::Open {
             return Ok(());
         }
         SinkExt::send(self, Message::Close(frame)).await
@@ -297,7 +308,7 @@ impl WebSocketClient {
     /// finished on the next poll, instead of being dropped with a future.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Message>, WebSocketError>> {
         loop {
-            if self.ready_message.is_some() || (self.close_sent && self.close_received) {
+            if self.ready_message.is_some() || self.close == CloseState::Closed {
                 ready!(self.poll_flush_writes(cx))?;
                 // `None` here is the end of a completed close handshake.
                 return Poll::Ready(Ok(self.ready_message.take()));
@@ -318,7 +329,7 @@ impl WebSocketClient {
             if ready!(self.poll_fill_read_buf(cx))? == 0 {
                 // EOF. Clean only if the close handshake got at least our
                 // half out (some peers close TCP without echoing Close).
-                if self.close_received || self.close_sent {
+                if self.close != CloseState::Open {
                     return Poll::Ready(Ok(None));
                 }
                 return Poll::Ready(Err(WebSocketError::UncleanClose));
@@ -372,7 +383,7 @@ impl WebSocketClient {
                 validate_control(&frame)?;
                 // Auto-pong with the same payload (RFC 6455 §5.5.3),
                 // unless we've already sent our Close.
-                if !self.close_sent {
+                if self.close == CloseState::Open {
                     self.queue_frame(OP_PONG, &frame.payload)?;
                 }
                 Ok(Some(Message::Ping(frame.payload)))
@@ -384,15 +395,15 @@ impl WebSocketClient {
             OP_CLOSE => {
                 validate_control(&frame)?;
                 let close_frame = parse_close_payload(&frame.payload)?;
-                self.close_received = true;
+                let peer_initiated = self.close == CloseState::Open;
+                self.close = CloseState::Closed;
                 // Echo the close (same code) if the peer initiated.
-                if !self.close_sent {
+                if peer_initiated {
                     let echo: Bytes = if frame.payload.len() >= 2 {
                         frame.payload.slice(..2)
                     } else {
                         Bytes::new()
                     };
-                    self.close_sent = true;
                     self.queue_frame(OP_CLOSE, &echo)?;
                 }
                 Ok(Some(Message::Close(close_frame)))
@@ -521,7 +532,7 @@ impl Sink<Message> for WebSocketClient {
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        if this.close_sent {
+        if this.close != CloseState::Open {
             return Poll::Ready(Err(WebSocketError::SendAfterClose));
         }
         // One-frame buffer: everything queued before (including automatic
@@ -531,7 +542,7 @@ impl Sink<Message> for WebSocketClient {
 
     fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
         let this = self.get_mut();
-        if this.close_sent {
+        if this.close != CloseState::Open {
             return Err(WebSocketError::SendAfterClose);
         }
         match message {
@@ -554,7 +565,7 @@ impl Sink<Message> for WebSocketClient {
                 check_control_len(&payload)?;
                 // No further messages may be enqueued, even if encoding
                 // fails below.
-                this.close_sent = true;
+                this.close = CloseState::CloseSent;
                 this.queue_frame(OP_CLOSE, &payload)
             }
         }
@@ -566,8 +577,8 @@ impl Sink<Message> for WebSocketClient {
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        if !this.close_sent {
-            this.close_sent = true;
+        if this.close == CloseState::Open {
+            this.close = CloseState::CloseSent;
             this.queue_frame(OP_CLOSE, &[])?;
         }
         this.poll_flush_writes(cx)

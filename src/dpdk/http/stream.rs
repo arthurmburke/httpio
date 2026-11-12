@@ -102,23 +102,60 @@ impl FlushHandle {
     }
 }
 
+/// Where a connection stands as seen from the application side, driven by
+/// the worker's [`Inbound`] messages:
+///
+/// ```text
+/// Connecting --Established--> Open --Eof / worker gone--> Eof
+///     |                        |                           |
+///     |                        +-----------Reset-----------+--> Reset
+///     +--ConnectFailed / Reset--> Reset
+///     +--AddrInUse--> AddrInUse
+///     +--Eof / worker gone--> Aborted
+/// ```
+///
+/// Everything but `Connecting` and `Open` is terminal for the receive
+/// side. Bytes already in `read_queue` are still delivered first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    /// The handshake is in flight.
+    Connecting,
+    /// The handshake completed and the peer may still send.
+    Open,
+    /// The peer finished sending (or the worker went away) after the
+    /// handshake: reads end cleanly once `read_queue` drains.
+    Eof,
+    /// The connection was reset, or the handshake failed: reads error once
+    /// `read_queue` drains and writes error at once.
+    Reset,
+    /// The worker refused the open: the 4-tuple is already in use.
+    AddrInUse,
+    /// The worker went away before the handshake completed.
+    Aborted,
+}
+
+impl StreamState {
+    /// The inbound side ended without an error message: a peer FIN, or
+    /// the worker dropping its sender.
+    fn on_end_of_input(self) -> Self {
+        match self {
+            StreamState::Connecting => StreamState::Aborted,
+            StreamState::Open => StreamState::Eof,
+            terminal => terminal,
+        }
+    }
+}
+
 pub struct TcpStream {
     cmd_tx: CmdTx,
     inbound_rx: InboundRx,
     /// Shared with a user `FlushHandle`; observed on each poll to enqueue
     /// an ordered `Command::Flush`.
     flush: Option<Arc<AtomicBool>>,
-    /// Handshake completed (worker sent `Established`).
-    established: bool,
+    state: StreamState,
     /// In-order received chunks not yet delivered to the reader (copied out
     /// by `poll_read`, or handed over as-is by `poll_recv`).
     read_queue: VecDeque<Bytes>,
-    /// Peer finished sending; deliver EOF once `read_queue` drains.
-    got_eof: bool,
-    /// Connection was reset; surface as an error on the next empty read.
-    got_reset: bool,
-    /// The worker refused the open: the 4-tuple is already in use.
-    addr_in_use: bool,
 }
 
 impl TcpStream {
@@ -148,11 +185,8 @@ impl TcpStream {
             cmd_tx: endpoints.cmd_tx,
             inbound_rx: endpoints.inbound_rx,
             flush: flush.map(FlushHandle::cell),
-            established: false,
+            state: StreamState::Connecting,
             read_queue: VecDeque::new(),
-            got_eof: false,
-            got_reset: false,
-            addr_in_use: false,
         };
         poll_fn(|cx| stream.poll_established(cx)).await?;
         Ok(stream)
@@ -188,7 +222,7 @@ impl TcpStream {
         data: &mut Option<Bytes>,
     ) -> Poll<io::Result<()>> {
         self.drain_inbound();
-        if self.got_reset || self.cmd_tx.failed() {
+        if self.state == StreamState::Reset || self.cmd_tx.failed() {
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
         self.drain_flush();
@@ -241,47 +275,43 @@ impl TcpStream {
         if let Some(chunk) = self.read_queue.pop_front() {
             return Poll::Ready(Ok(Some(chunk)));
         }
-        if self.got_reset {
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
-        }
-        if self.got_eof {
+        match self.state {
+            StreamState::Reset => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+            StreamState::Connecting | StreamState::Open => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             // Clean EOF.
-            return Poll::Ready(Ok(None));
+            StreamState::Eof | StreamState::AddrInUse | StreamState::Aborted => {
+                Poll::Ready(Ok(None))
+            }
         }
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 
     fn poll_established(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.drain_inbound();
-        if self.addr_in_use {
-            return Poll::Ready(Err(io::Error::new(
+        match self.state {
+            StreamState::Connecting => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            // A peer that completed the handshake and already finished
+            // sending still yields a usable (write-only) stream.
+            StreamState::Open | StreamState::Eof => Poll::Ready(Ok(())),
+            StreamState::AddrInUse => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "local address (4-tuple) already in use",
-            )));
-        }
-        if self.got_reset {
-            return Poll::Ready(Err(io::Error::new(
+            ))),
+            StreamState::Reset => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "connection refused or reset during handshake",
-            )));
-        }
-        // The worker emits `Established` before any data, so once we've
-        // seen the connection produce anything (data queued or EOF) or an
-        // explicit ready signal, it's usable. `Established` itself is
-        // consumed in drain_inbound; track readiness via a dedicated flag.
-        if self.established {
-            Poll::Ready(Ok(()))
-        } else if self.got_eof {
+            ))),
             // The worker dropped its sender without ever sending
             // `Established` or a failure: it stopped or reaped us.
-            Poll::Ready(Err(io::Error::new(
+            StreamState::Aborted => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "worker went away before the handshake completed",
-            )))
-        } else {
-            cx.waker().wake_by_ref();
-            Poll::Pending
+            ))),
         }
     }
 
@@ -299,21 +329,12 @@ impl TcpStream {
                 break;
             };
             match msg {
-                Inbound::Established => self.established = true,
                 Inbound::Data(bytes) => {
                     if !bytes.is_empty() {
                         self.read_queue.push_back(bytes);
                     }
                 }
-                Inbound::Eof => self.got_eof = true,
-                Inbound::Reset | Inbound::ConnectFailed => {
-                    self.got_reset = true;
-                    self.got_eof = true;
-                }
-                Inbound::AddrInUse => {
-                    self.addr_in_use = true;
-                    self.got_eof = true;
-                }
+                control => self.on_control(control),
             }
         }
         // If the worker dropped its inbound sender (connection reaped),
@@ -321,8 +342,26 @@ impl TcpStream {
         // ring was already closed before the drain above, so it is now
         // known to be empty.
         if sender_gone && self.inbound_rx.is_empty() {
-            self.got_eof = true;
+            self.state = self.state.on_end_of_input();
         }
+    }
+
+    /// The one place `state` advances on a worker message. The worker
+    /// sends at most one terminal message, and nothing after it.
+    fn on_control(&mut self, msg: Inbound) {
+        self.state = match (self.state, msg) {
+            (state, Inbound::Data(_)) => state,
+            (StreamState::Connecting, Inbound::Established) => StreamState::Open,
+            (state, Inbound::Established) => state,
+            (state, Inbound::Eof) => state.on_end_of_input(),
+            // The refusal outranks everything, and a reset outranks a clean
+            // end, as they did when these were independent flags.
+            (_, Inbound::AddrInUse) => StreamState::AddrInUse,
+            (StreamState::AddrInUse, Inbound::Reset | Inbound::ConnectFailed) => {
+                StreamState::AddrInUse
+            }
+            (_, Inbound::Reset | Inbound::ConnectFailed) => StreamState::Reset,
+        };
     }
 
     /// If the user requested a flush, enqueue it now (ordered after any
@@ -370,15 +409,16 @@ impl AsyncRead for TcpStream {
         if wrote {
             return Poll::Ready(Ok(()));
         }
-        if this.got_reset && this.read_queue.is_empty() {
-            return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
-        }
-        if this.got_eof && this.read_queue.is_empty() {
+        // `read_queue` is empty here: surface how the inbound side ended.
+        match this.state {
+            StreamState::Reset => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+            StreamState::Connecting | StreamState::Open => {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             // Clean EOF: signalled by a zero-length read.
-            return Poll::Ready(Ok(()));
+            StreamState::Eof | StreamState::AddrInUse | StreamState::Aborted => Poll::Ready(Ok(())),
         }
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 }
 
@@ -390,7 +430,7 @@ impl AsyncWrite for TcpStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         this.drain_inbound();
-        if this.got_reset || this.cmd_tx.failed() {
+        if this.state == StreamState::Reset || this.cmd_tx.failed() {
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
@@ -470,11 +510,8 @@ mod tests {
                 cmd_tx,
                 inbound_rx,
                 flush: None,
-                established: true,
+                state: StreamState::Open,
                 read_queue: VecDeque::new(),
-                got_eof: false,
-                got_reset: false,
-                addr_in_use: false,
             },
             cmd_rx,
             inbound_tx,
@@ -552,7 +589,7 @@ mod tests {
         }
         assert_eq!(stream.read_queue.len(), 1);
         assert_eq!(stream.inbound_rx.len(), 2);
-        assert!(!stream.got_eof);
+        assert_eq!(stream.state, StreamState::Open);
         for expected in [b"first".as_slice(), b"second".as_slice()] {
             match stream.poll_recv(&mut cx) {
                 Poll::Ready(Ok(Some(bytes))) => assert_eq!(&bytes[..], expected),

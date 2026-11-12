@@ -76,6 +76,13 @@ impl<'a, T> AsMut<T> for Guard<'a, T> {
     }
 }
 
+/// [`RwSpinLock::state`] encoding: `UNLOCKED`, or `WRITER` alone (one
+/// exclusive holder), or a multiple of `READER` (that many shared
+/// holders). The writer bit and a reader count are never set together.
+const UNLOCKED: usize = 0;
+const WRITER: usize = 1;
+const READER: usize = 2;
+
 pub struct RwSpinLock<T> {
     state: AtomicUsize,
     data: UnsafeCell<T>,
@@ -90,7 +97,7 @@ unsafe impl<T> Sync for RwSpinLock<T> where T: Send + Sync {}
 impl<T> RwSpinLock<T> {
     pub const fn new(value: T) -> Self {
         Self {
-            state: AtomicUsize::new(0),
+            state: AtomicUsize::new(UNLOCKED),
             data: UnsafeCell::new(value),
         }
     }
@@ -103,11 +110,16 @@ impl<T> RwSpinLock<T> {
     pub fn read_lock(&self) -> ReadGuard<'_, T> {
         loop {
             let state = self.state.load(Ordering::Acquire);
-            if state & 1 == 0 {
+            if state & WRITER == 0 {
                 // No writer, try to increment reader count
                 if self
                     .state
-                    .compare_exchange_weak(state, state + 2, Ordering::Acquire, Ordering::Relaxed)
+                    .compare_exchange_weak(
+                        state,
+                        state + READER,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
                     .is_ok()
                 {
                     break;
@@ -131,7 +143,7 @@ impl<T> RwSpinLock<T> {
     pub fn write_lock(&self) -> WriteGuard<'_, T> {
         while self
             .state
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(UNLOCKED, WRITER, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             core::hint::spin_loop();
@@ -151,7 +163,7 @@ pub struct WriteGuard<'a, T> {
 
 impl<'a, T> Drop for WriteGuard<'a, T> {
     fn drop(&mut self) {
-        self.lock.state.store(0, Ordering::Release);
+        self.lock.state.store(UNLOCKED, Ordering::Release);
     }
 }
 
@@ -174,7 +186,7 @@ pub struct ReadGuard<'a, T> {
 
 impl<'a, T> Drop for ReadGuard<'a, T> {
     fn drop(&mut self) {
-        self.lock.state.fetch_sub(2, Ordering::Release);
+        self.lock.state.fetch_sub(READER, Ordering::Release);
     }
 }
 

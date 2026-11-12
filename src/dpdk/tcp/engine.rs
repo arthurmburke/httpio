@@ -36,6 +36,56 @@ struct PendingTcp {
     mac: EthAddr,
     header: tcp::TcpHeader,
     payload: Payload,
+    /// Whether the connection is still tracked and counts this packet in
+    /// [`Conn::queued_tx`]. The last segments of a connection that closed
+    /// (its final reset) are unowned: the connection is already gone.
+    owned: bool,
+}
+
+/// Whether a connection came from a listener, and if so how far it is
+/// from being handed to `accept()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptState {
+    /// An active open (`connect`): never offered to `accept()`.
+    NotApplicable,
+    /// Spawned from a listener's SYN; waiting for its first
+    /// `Event::Established`.
+    AwaitingHandshake,
+    /// Established and placed on its port's accept queue.
+    Queued,
+}
+
+/// Next-hop MAC resolution as seen by one connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextHop {
+    /// Not waiting on ARP: the last attempt resolved, or none was needed
+    /// yet.
+    Resolved,
+    /// Output is held back until ARP answers. The connection is reset if
+    /// that takes longer than [`ARP_TIMEOUT`] from `since`.
+    Resolving { since: Instant },
+}
+
+/// One tracked connection: the TCP state machine plus the engine's own
+/// bookkeeping for it.
+struct Conn {
+    tcb: Tcb,
+    accept: AcceptState,
+    next_hop: NextHop,
+    /// Segments of this connection queued locally (awaiting pool space or
+    /// NIC acceptance). No new output is produced while this is non-zero.
+    queued_tx: usize,
+}
+
+impl Conn {
+    fn new(tcb: Tcb, accept: AcceptState) -> Self {
+        Self {
+            tcb,
+            accept,
+            next_hop: NextHop::Resolved,
+            queued_tx: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,12 +174,9 @@ fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix_len: u8) -> bool {
 pub struct TcpEngine {
     config: EngineConfig,
     listeners: HashSet<u16>,
-    connections: HashMap<FourTuple, Tcb>,
+    connections: HashMap<FourTuple, Conn>,
     connections_opened: u64,
     accept_queues: HashMap<u16, VecDeque<FourTuple>>,
-    /// Tuples spawned from a listener's SYN, awaiting their first
-    /// `Event::Established` before being handed to `accept()`.
-    pending_accept: HashSet<FourTuple>,
     /// Connections that need per-poll attention -- they have pending
     /// output or an armed timer. `poll` processes only these, so idle
     /// connections aren't walked every iteration. Invariant: a connection
@@ -143,8 +190,6 @@ pub struct TcpEngine {
     tx_batch: Vec<Mbuf>,
     tx_owners: Vec<Option<(FourTuple, Seq)>>,
     pending_tx: VecDeque<PendingTcp>,
-    queued_tx: HashMap<FourTuple, usize>,
-    arp_wait: HashMap<FourTuple, Instant>,
     updated: Vec<FourTuple>,
     segments: Vec<OutSegment>,
 
@@ -166,7 +211,6 @@ impl TcpEngine {
             connections: HashMap::default(),
             connections_opened: 0,
             accept_queues: HashMap::default(),
-            pending_accept: HashSet::default(),
             arp: ArpTable::new(),
             pending_arp_replies: Vec::new(),
             pending_raw_resets: Vec::new(),
@@ -175,8 +219,6 @@ impl TcpEngine {
             tx_batch: Vec::new(),
             tx_owners: Vec::new(),
             pending_tx: VecDeque::new(),
-            queued_tx: HashMap::default(),
-            arp_wait: HashMap::default(),
             updated: Vec::new(),
             segments: Vec::new(),
         }
@@ -218,7 +260,10 @@ impl TcpEngine {
         match self.connections.entry(tuple) {
             std::collections::hash_map::Entry::Occupied(_) => return None,
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(Tcb::new_active(tuple));
+                v.insert(Conn::new(
+                    Tcb::new_active(tuple),
+                    AcceptState::NotApplicable,
+                ));
             }
         }
         self.connections_opened += 1;
@@ -239,15 +284,13 @@ impl TcpEngine {
     pub(crate) fn buffered_send_bytes(&self, tuple: FourTuple) -> usize {
         self.connections
             .get(&tuple)
-            .map_or(0, Tcb::buffered_send_bytes)
+            .map_or(0, |c| c.tcb.buffered_send_bytes())
     }
 
     /// Discards an abandoned connection and all its retained buffers.
     pub(crate) fn abort(&mut self, tuple: FourTuple) {
         self.connections.remove(&tuple);
         self.active.remove(&tuple);
-        self.pending_accept.remove(&tuple);
-        self.arp_wait.remove(&tuple);
         self.discard_queued(tuple);
     }
 
@@ -259,12 +302,14 @@ impl TcpEngine {
                 self.tx_batch.remove(i);
             }
         }
-        self.queued_tx.remove(&tuple);
+        if let Some(conn) = self.connections.get_mut(&tuple) {
+            conn.queued_tx = 0;
+        }
     }
 
     pub fn send(&mut self, tuple: FourTuple, data: Bytes) {
-        if let Some(tcb) = self.connections.get_mut(&tuple) {
-            tcb.send(data);
+        if let Some(conn) = self.connections.get_mut(&tuple) {
+            conn.tcb.send(data);
             self.mark_active(tuple);
         }
     }
@@ -273,7 +318,7 @@ impl TcpEngine {
         let data = self
             .connections
             .get_mut(&tuple)
-            .map(|t| t.recv(max_len))
+            .map(|c| c.tcb.recv(max_len))
             .unwrap_or_default();
         if !data.is_empty() {
             self.mark_active(tuple);
@@ -284,13 +329,13 @@ impl TcpEngine {
     pub fn readable_len(&self, tuple: FourTuple) -> usize {
         self.connections
             .get(&tuple)
-            .map(|t| t.readable_len())
+            .map(|c| c.tcb.readable_len())
             .unwrap_or(0)
     }
 
     pub fn close(&mut self, tuple: FourTuple) {
-        if let Some(tcb) = self.connections.get_mut(&tuple) {
-            tcb.close();
+        if let Some(conn) = self.connections.get_mut(&tuple) {
+            conn.tcb.close();
             self.mark_active(tuple);
         }
     }
@@ -298,8 +343,8 @@ impl TcpEngine {
     /// TCP_NODELAY: disable (or re-enable) Nagle's algorithm for one
     /// connection.
     pub fn set_nodelay(&mut self, tuple: FourTuple, nodelay: bool) {
-        if let Some(tcb) = self.connections.get_mut(&tuple) {
-            tcb.set_nodelay(nodelay);
+        if let Some(conn) = self.connections.get_mut(&tuple) {
+            conn.tcb.set_nodelay(nodelay);
             // May unblock a Nagle-held tail.
             self.mark_active(tuple);
         }
@@ -308,8 +353,8 @@ impl TcpEngine {
     /// TCP_CORK-style hold: while set, the trailing sub-MSS segment is
     /// held back until `flush()` (full-MSS segments still flow).
     pub fn set_cork(&mut self, tuple: FourTuple, corked: bool) {
-        if let Some(tcb) = self.connections.get_mut(&tuple) {
-            tcb.set_cork(corked);
+        if let Some(conn) = self.connections.get_mut(&tuple) {
+            conn.tcb.set_cork(corked);
             // Uncorking flushes a held tail.
             self.mark_active(tuple);
         }
@@ -317,14 +362,14 @@ impl TcpEngine {
 
     /// Manual trigger releasing a corked connection's held tail segment.
     pub fn flush(&mut self, tuple: FourTuple) {
-        if let Some(tcb) = self.connections.get_mut(&tuple) {
-            tcb.flush();
+        if let Some(conn) = self.connections.get_mut(&tuple) {
+            conn.tcb.flush();
             self.mark_active(tuple);
         }
     }
 
     pub fn state(&self, tuple: FourTuple) -> Option<TcpState> {
-        self.connections.get(&tuple).map(|t| t.state)
+        self.connections.get(&tuple).map(|c| c.tcb.state)
     }
 
     /// One iteration of the poll loop: drains received frames, ticks
@@ -379,18 +424,17 @@ impl TcpEngine {
         // until phase 2 has serialized any final reset.
         for &tuple in &self.processing {
             self.updated.push(tuple);
+            let Some(conn) = self.connections.get_mut(&tuple) else {
+                continue;
+            };
+            conn.tcb.tick(now);
             let mut established = false;
-            {
-                let Some(tcb) = self.connections.get_mut(&tuple) else {
-                    continue;
-                };
-                tcb.tick(now);
-                for ev in tcb.events.drain(..) {
-                    established |= ev == Event::Established;
-                    events.push((tuple, ev));
-                }
+            for ev in conn.tcb.events.drain(..) {
+                established |= ev == Event::Established;
+                events.push((tuple, ev));
             }
-            if established && self.pending_accept.remove(&tuple) {
+            if established && conn.accept == AcceptState::AwaitingHandshake {
+                conn.accept = AcceptState::Queued;
                 self.accept_queues
                     .entry(tuple.local_port)
                     .or_default()
@@ -414,47 +458,57 @@ impl TcpEngine {
         let arp = &mut self.arp;
         let active_set = &mut self.active;
         for &tuple in &self.processing {
-            let Some(tcb) = connections.get_mut(&tuple) else {
+            let Some(conn) = connections.get_mut(&tuple) else {
                 continue;
             };
             // Do not consume output until both resolution and bounded
             // local queue space are available. ARP replies are usable this poll.
             let room = MAX_PENDING_TX.saturating_sub(self.tx_batch.len() + self.pending_tx.len());
-            if self.queued_tx.contains_key(&tuple) || room == 0 {
+            if conn.queued_tx != 0 || room == 0 {
                 active_set.insert(tuple);
                 continue;
             }
             let Some(mac) = arp.resolve(config.next_hop(tuple.remote_ip), now) else {
-                let since = self.arp_wait.entry(tuple).or_insert(now);
-                if now.saturating_duration_since(*since) >= ARP_TIMEOUT {
+                let since = match conn.next_hop {
+                    NextHop::Resolving { since } => since,
+                    NextHop::Resolved => {
+                        conn.next_hop = NextHop::Resolving { since: now };
+                        now
+                    }
+                };
+                if now.saturating_duration_since(since) >= ARP_TIMEOUT {
                     connections.remove(&tuple);
-                    self.pending_accept.remove(&tuple);
-                    self.arp_wait.remove(&tuple);
                     events.push((tuple, Event::Reset));
                 } else {
                     active_set.insert(tuple);
                 }
                 continue;
             };
-            self.arp_wait.remove(&tuple);
-            tcb.set_local_mss(local_mss);
-            tcb.poll_output_limited(now, &mut self.segments, room.min(32));
+            conn.next_hop = NextHop::Resolved;
+            conn.tcb.set_local_mss(local_mss);
+            conn.tcb
+                .poll_output_limited(now, &mut self.segments, room.min(32));
+            // A connection that closed is dropped below, so whatever it
+            // just produced (a final reset) goes out unowned.
+            let owned = !conn.tcb.is_closed();
             for seg in self.segments.drain(..) {
-                tcb.mark_transmit_pending(seg.seq);
+                if owned {
+                    conn.tcb.mark_transmit_pending(seg.seq);
+                    conn.queued_tx += 1;
+                }
                 self.pending_tx.push_back(PendingTcp {
                     tuple,
                     mac,
-                    header: tcb.to_header(&seg),
+                    header: conn.tcb.to_header(&seg),
                     payload: seg.payload,
+                    owned,
                 });
-                *self.queued_tx.entry(tuple).or_default() += 1;
             }
-            if tcb.is_closed() {
+            if !owned {
                 connections.remove(&tuple);
-                self.pending_accept.remove(&tuple);
-            } else if tcb.has_pending_output()
-                || tcb.has_armed_timer()
-                || self.queued_tx.contains_key(&tuple)
+            } else if conn.tcb.has_pending_output()
+                || conn.tcb.has_armed_timer()
+                || conn.queued_tx != 0
             {
                 active_set.insert(tuple);
             }
@@ -538,8 +592,11 @@ impl TcpEngine {
             ) else {
                 break;
             };
-            self.tx_owners
-                .push(Some((packet.tuple, Seq::new(packet.header.seq))));
+            self.tx_owners.push(
+                packet
+                    .owned
+                    .then(|| (packet.tuple, Seq::new(packet.header.seq))),
+            );
             self.tx_batch.push(mbuf);
             self.pending_tx.pop_front();
         }
@@ -551,14 +608,11 @@ impl TcpEngine {
         let sent = before - self.tx_batch.len();
         for owner in self.tx_owners.drain(..sent).flatten() {
             let (tuple, seq) = owner;
-            if let Some(tcb) = self.connections.get_mut(&tuple) {
-                tcb.mark_transmitted(seq, now);
-            }
-            if let Some(count) = self.queued_tx.get_mut(&tuple) {
-                *count -= 1;
-                if *count == 0 {
-                    self.queued_tx.remove(&tuple);
-                }
+            // An owned packet's connection is still tracked: `abort`
+            // discards a connection's queued packets along with it.
+            if let Some(conn) = self.connections.get_mut(&tuple) {
+                conn.tcb.mark_transmitted(seq, now);
+                conn.queued_tx = conn.queued_tx.saturating_sub(1);
             }
         }
         // The unaccepted suffix and its ownership metadata remain for retry.
@@ -620,16 +674,16 @@ impl TcpEngine {
             remote_port: tcp_hdr.src_port,
         };
 
-        if let Some(tcb) = self.connections.get_mut(&tuple) {
+        if let Some(conn) = self.connections.get_mut(&tuple) {
             let start = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + hdr_len;
             let end = eth::ETH_HDR_LEN + total_len;
-            tcb.on_segment_with(
+            conn.tcb.on_segment_with(
                 &tcp_hdr,
                 segment_payload.len(),
                 || mbuf.into_bytes().slice(start..end),
                 now,
             );
-            if tcb.is_closed() {
+            if conn.tcb.is_closed() {
                 self.discard_queued(tuple);
             }
             // The segment may have produced an ACK/data to send, an event,
@@ -642,8 +696,8 @@ impl TcpEngine {
         if is_bare_syn && self.listeners.contains(&tcp_hdr.dst_port) {
             let peer_mss = tcp_hdr.options.mss.unwrap_or(536);
             let tcb = Tcb::new_from_listen(tuple, Seq::new(tcp_hdr.seq), peer_mss);
-            self.connections.insert(tuple, tcb);
-            self.pending_accept.insert(tuple);
+            self.connections
+                .insert(tuple, Conn::new(tcb, AcceptState::AwaitingHandshake));
             self.mark_active(tuple); // has a SYN-ACK to send
             return;
         }

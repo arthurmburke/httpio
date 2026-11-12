@@ -54,6 +54,62 @@ pub enum Event {
     Reset,
 }
 
+/// The handshake control segment waiting to be emitted. A SYN-ACK
+/// supersedes a SYN that has not gone out yet (simultaneous open), since
+/// it carries the same SYN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeOut {
+    Syn,
+    SynAck,
+}
+
+/// The sequence number of a reset waiting to be emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetOut {
+    /// `<SEQ=SND.NXT><CTL=RST>`: aborting a synchronized connection.
+    AtSndNxt,
+    /// `<SEQ=SEG.ACK><CTL=RST>`: answering an unacceptable handshake ACK
+    /// (RFC 9293 §3.10.7.3 / §3.10.7.4).
+    At(Seq),
+}
+
+/// Progress of the application's close (RFC 9293 §3.10.4). Advances only
+/// forward: `Open -> Requested -> FinQueued -> FinSent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalClose {
+    /// The application has not closed its sending side.
+    Open,
+    /// `close()` was called; the FIN waits for buffered and in-flight data
+    /// to drain (and for the handshake to finish).
+    Requested,
+    /// Everything drained; the FIN goes out as soon as an output poll has
+    /// room for it.
+    FinQueued,
+    /// The FIN is on the retransmit queue (sent, possibly not yet acked).
+    FinSent,
+}
+
+/// The zero-window probe cycle (RFC 9293 §3.8.6.1):
+///
+/// ```text
+/// Idle -> Armed -> ProbeDue -> ProbeOutstanding -> Idle | Armed
+/// ```
+///
+/// `Armed` and `ProbeDue` exist only while the persist condition holds
+/// (data buffered, nothing in flight, peer window zero); they fall back to
+/// `Idle` the moment it stops holding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Persist {
+    Idle,
+    /// The timer is running; a probe becomes due at the deadline.
+    Armed(Instant),
+    /// The timer fired: the next output poll sends a 1-byte probe.
+    ProbeDue,
+    /// A probe is unacknowledged. A peer that answers it (even with a zero
+    /// window) is alive, so such answers reset its retransmit count.
+    ProbeOutstanding,
+}
+
 pub struct Tcb {
     pub tuple: FourTuple,
     pub state: TcpState,
@@ -80,29 +136,18 @@ pub struct Tcb {
     recv_buffer: ReassemblyBuffer,
 
     ack_pending: bool,
-    want_syn: bool,
-    want_synack: bool,
-    want_fin: bool,
-    fin_sent: bool,
-    want_rst: bool,
-    close_requested: bool,
     retransmit_now: bool,
-    /// SEG.ACK of an unacceptable handshake ACK: RFC 9293 §3.10.7.3 /
-    /// §3.10.7.4 require the answering RST to use it as its sequence number
-    /// (`<SEQ=SEG.ACK><CTL=RST>`). `None` means the RST uses `snd_nxt`.
-    rst_seq: Option<Seq>,
+    /// SYN / SYN-ACK waiting to be emitted.
+    handshake_out: Option<HandshakeOut>,
+    /// RST waiting to be emitted.
+    reset_out: Option<ResetOut>,
+    local_close: LocalClose,
 
-    /// Zero-window probe timer (RFC 9293 §3.8.6.1): armed while data is
-    /// buffered, nothing is in flight, and the peer's window is zero.
-    persist_deadline: Option<Instant>,
+    /// Where the zero-window probe cycle stands.
+    persist: Persist,
     /// Interval to use for the next persist arming; doubles per probe up to
     /// `MAX_RTO` and resets once the window opens or the buffer empties.
     persist_backoff: Option<Duration>,
-    /// The persist timer fired: the next output poll sends a 1-byte probe.
-    persist_probe_now: bool,
-    /// A window probe is unacknowledged. A peer that answers it (even with
-    /// a zero window) is alive, so such answers reset its retransmit count.
-    probe_outstanding: bool,
 
     /// TCP_NODELAY: when set, Nagle's algorithm (RFC 9293 §3.7.4) is
     /// disabled and sub-MSS segments are sent immediately instead of
@@ -154,18 +199,12 @@ impl Tcb {
             send_buffer: SendBuffer::default(),
             recv_buffer: ReassemblyBuffer::default(),
             ack_pending: false,
-            want_syn: false,
-            want_synack: false,
-            want_fin: false,
-            fin_sent: false,
-            want_rst: false,
-            close_requested: false,
             retransmit_now: false,
-            rst_seq: None,
-            persist_deadline: None,
+            handshake_out: None,
+            reset_out: None,
+            local_close: LocalClose::Open,
+            persist: Persist::Idle,
             persist_backoff: None,
-            persist_probe_now: false,
-            probe_outstanding: false,
             nodelay: false,
             corked: false,
             flush_requested: false,
@@ -178,7 +217,7 @@ impl Tcb {
     pub fn new_active(tuple: FourTuple) -> Self {
         let mut tcb = Self::new(tuple, TcpState::SynSent);
         tcb.snd_nxt = tcb.iss + 1;
-        tcb.want_syn = true;
+        tcb.handshake_out = Some(HandshakeOut::Syn);
         tcb
     }
 
@@ -191,7 +230,7 @@ impl Tcb {
         tcb.peer_mss = peer_mss.clamp(1, DEFAULT_MSS);
         tcb.congestion = CongestionControl::new(tcb.peer_mss);
         tcb.snd_nxt = tcb.iss + 1;
-        tcb.want_synack = true;
+        tcb.handshake_out = Some(HandshakeOut::SynAck);
         tcb
     }
 
@@ -260,7 +299,9 @@ impl Tcb {
     /// Application-initiated close: RFC 9293 §3.10.4. The FIN is deferred
     /// until any buffered data has actually been sent.
     pub fn close(&mut self) {
-        self.close_requested = true;
+        if self.local_close == LocalClose::Open {
+            self.local_close = LocalClose::Requested;
+        }
         // Implicit flush: the FIN is only sent once the send buffer has
         // drained, so a corked/Nagle-held tail must be released or the
         // close would deadlock waiting on a trigger that never comes.
@@ -347,8 +388,7 @@ impl Tcb {
             // §3.10.7.3 step 1).
             let ack = Seq::new(hdr.ack);
             if ack.leq(self.iss) || ack.gt(self.snd_nxt) {
-                self.want_rst = true;
-                self.rst_seq = Some(ack);
+                self.reset_out = Some(ResetOut::At(ack));
                 return;
             }
         }
@@ -379,7 +419,7 @@ impl Tcb {
             // Simultaneous open (RFC 9293 §3.10.7.3 step 2): both sides
             // sent SYN before either ACK arrived.
             self.state = TcpState::SynReceived;
-            self.want_synack = true;
+            self.handshake_out = Some(HandshakeOut::SynAck);
         }
     }
 
@@ -437,8 +477,7 @@ impl Tcb {
         if hdr.has_flag(flags::SYN) && self.state.is_synchronized() {
             // RFC 9293 §3.10.7.4 step 4: SYN in the window after the
             // connection is synchronized is an error -> reset.
-            self.want_rst = true;
-            self.rst_seq = None;
+            self.reset_out = Some(ResetOut::AtSndNxt);
             self.state = TcpState::Closed;
             self.events.push(Event::Reset);
             return;
@@ -492,8 +531,7 @@ impl Tcb {
         match self.state {
             TcpState::SynReceived => {
                 if ack.leq(self.snd_una) || ack.gt(self.snd_nxt) {
-                    self.want_rst = true;
-                    self.rst_seq = Some(ack);
+                    self.reset_out = Some(ResetOut::At(ack));
                     return;
                 }
                 self.snd_una = ack;
@@ -509,8 +547,7 @@ impl Tcb {
             }
             TcpState::LastAck => {
                 if ack.geq(self.snd_nxt) {
-                    self.state = TcpState::Closed;
-                    self.events.push(Event::Closed);
+                    self.fin_acked();
                 }
                 return;
             }
@@ -550,7 +587,7 @@ impl Tcb {
                 && !hdr.has_flag(flags::SYN)
                 && !hdr.has_flag(flags::FIN);
             if is_dup_candidate
-                && !self.probe_outstanding
+                && self.persist != Persist::ProbeOutstanding
                 && self.flight_size() > 0
                 && self.congestion.on_duplicate_ack(self.snd_nxt.0)
             {
@@ -566,9 +603,9 @@ impl Tcb {
             self.update_send_window(hdr, ack);
         }
 
-        if self.probe_outstanding {
+        if self.persist == Persist::ProbeOutstanding {
             if self.flight_size() == 0 || self.snd_wnd > 0 {
-                self.probe_outstanding = false;
+                self.persist = Persist::Idle;
             } else if hdr.window == 0
                 && let Some(seg) = self.retransmit.segments.front_mut()
             {
@@ -579,15 +616,17 @@ impl Tcb {
             }
         }
 
-        match self.state {
-            TcpState::FinWait1 if self.fin_sent && ack.geq(self.snd_nxt) => {
-                self.state = TcpState::FinWait2;
-            }
-            TcpState::Closing if ack.geq(self.snd_nxt) => {
-                self.state = TcpState::Closed;
-                self.events.push(Event::Closed);
-            }
-            _ => {}
+        if matches!(self.state, TcpState::FinWait1 | TcpState::Closing) && ack.geq(self.snd_nxt) {
+            self.fin_acked();
+        }
+    }
+
+    /// Our FIN was acknowledged: advance the teardown (see
+    /// [`TcpState::on_fin_acked`]), reporting the close if that finished it.
+    fn fin_acked(&mut self) {
+        self.state = self.state.on_fin_acked();
+        if self.state.is_closed() {
+            self.events.push(Event::Closed);
         }
     }
 
@@ -613,15 +652,11 @@ impl Tcb {
         self.ack_pending = true;
         self.events.push(Event::PeerClosed);
 
-        self.state = match self.state {
-            TcpState::Established => TcpState::CloseWait,
-            TcpState::FinWait1 => TcpState::Closing,
-            TcpState::FinWait2 => {
-                self.time_wait_deadline = Some(now + TIME_WAIT_DURATION);
-                TcpState::TimeWait
-            }
-            other => other,
-        };
+        let next = self.state.on_fin_received();
+        if next == TcpState::TimeWait && self.state != TcpState::TimeWait {
+            self.time_wait_deadline = Some(now + TIME_WAIT_DURATION);
+        }
+        self.state = next;
     }
 
     // ---- timers ----------------------------------------------------------
@@ -633,11 +668,10 @@ impl Tcb {
             return;
         }
         self.update_persist(now);
-        if let Some(deadline) = self.persist_deadline
+        if let Persist::Armed(deadline) = self.persist
             && now >= deadline
         {
-            self.persist_deadline = None;
-            self.persist_probe_now = true;
+            self.persist = Persist::ProbeDue;
         }
         if let Some(deadline) = self.time_wait_deadline
             && now >= deadline
@@ -669,14 +703,15 @@ impl Tcb {
     /// window opens or the buffer empties.
     fn update_persist(&mut self, now: Instant) {
         if self.persist_needed() {
-            if self.persist_deadline.is_none() && !self.persist_probe_now {
+            if matches!(self.persist, Persist::Idle | Persist::ProbeOutstanding) {
                 let interval = self.persist_backoff.unwrap_or_else(|| self.rto.rto());
-                self.persist_deadline = Some(now + interval);
+                self.persist = Persist::Armed(now + interval);
                 self.persist_backoff = Some((interval * 2).min(MAX_RTO));
             }
         } else {
-            self.persist_deadline = None;
-            self.persist_probe_now = false;
+            if matches!(self.persist, Persist::Armed(_) | Persist::ProbeDue) {
+                self.persist = Persist::Idle;
+            }
             if self.snd_wnd > 0 || self.send_buffer.is_empty() {
                 self.persist_backoff = None;
             }
@@ -691,8 +726,7 @@ impl Tcb {
             seg.retransmit_count += 1;
             seg.last_sent_at = now;
             if seg.retransmit_count > MAX_RETRANSMITS {
-                self.want_rst = true;
-                self.rst_seq = None;
+                self.reset_out = Some(ResetOut::AtSndNxt);
                 self.state = TcpState::Closed;
                 // An aborted connection must reach the worker's error
                 // path, including after the handshake has completed.
@@ -756,9 +790,11 @@ impl Tcb {
             return;
         }
 
-        if self.want_rst {
-            self.want_rst = false;
-            let seq = self.rst_seq.take().unwrap_or(self.snd_nxt);
+        if let Some(reset) = self.reset_out.take() {
+            let seq = match reset {
+                ResetOut::AtSndNxt => self.snd_nxt,
+                ResetOut::At(seq) => seq,
+            };
             out.push(self.make_segment(seq, flags::RST, Bytes::new(), None));
             return;
         }
@@ -767,24 +803,14 @@ impl Tcb {
             return;
         }
 
-        if self.want_syn {
-            self.want_syn = false;
+        if let Some(handshake) = self.handshake_out.take() {
+            let seg_flags = match handshake {
+                HandshakeOut::Syn => flags::SYN,
+                HandshakeOut::SynAck => flags::SYN | flags::ACK,
+            };
             self.retransmit
                 .push(self.iss, Bytes::new(), true, false, now);
-            out.push(self.make_segment(self.iss, flags::SYN, Bytes::new(), Some(self.local_mss)));
-            return;
-        }
-
-        if self.want_synack {
-            self.want_synack = false;
-            self.retransmit
-                .push(self.iss, Bytes::new(), true, false, now);
-            out.push(self.make_segment(
-                self.iss,
-                flags::SYN | flags::ACK,
-                Bytes::new(),
-                Some(self.local_mss),
-            ));
+            out.push(self.make_segment(self.iss, seg_flags, Bytes::new(), Some(self.local_mss)));
             return;
         }
 
@@ -817,27 +843,20 @@ impl Tcb {
             self.send_new_data(now, out, limit);
         }
 
-        if self.close_requested
-            && !self.want_fin
-            && !self.fin_sent
+        if self.local_close == LocalClose::Requested
             && self.send_buffer.is_empty()
             && self.retransmit.is_empty()
-            && matches!(self.state, TcpState::Established | TcpState::CloseWait)
+            && self.state.can_send()
         {
-            self.want_fin = true;
+            self.local_close = LocalClose::FinQueued;
         }
 
-        if self.want_fin && out.len() < limit {
-            self.want_fin = false;
-            self.fin_sent = true;
+        if self.local_close == LocalClose::FinQueued && out.len() < limit {
+            self.local_close = LocalClose::FinSent;
             let seq = self.snd_nxt;
             self.snd_nxt = self.snd_nxt + 1;
             self.retransmit.push(seq, Bytes::new(), false, true, now);
-            self.state = match self.state {
-                TcpState::Established => TcpState::FinWait1,
-                TcpState::CloseWait => TcpState::LastAck,
-                other => other,
-            };
+            self.state = self.state.on_fin_sent();
             out.push(self.make_segment(seq, flags::FIN | flags::ACK, Bytes::new(), None));
         } else if self.ack_pending && out.is_empty() {
             self.ack_pending = false;
@@ -851,14 +870,14 @@ impl Tcb {
         }
         // Zero-window probe: one byte as an ordinary data segment, so the
         // retransmit queue and ACK processing handle it like any other.
-        if self.persist_probe_now {
-            self.persist_probe_now = false;
+        if self.persist == Persist::ProbeDue {
+            self.persist = Persist::Idle;
             if self.persist_needed() {
                 let data = self.send_buffer.take(1);
                 let seq = self.snd_nxt;
                 self.snd_nxt = self.snd_nxt + data.len() as u32;
                 self.retransmit.push(seq, data.clone(), false, false, now);
-                self.probe_outstanding = true;
+                self.persist = Persist::ProbeOutstanding;
                 out.push(self.make_segment(seq, flags::ACK | flags::PSH, data, None));
                 self.ack_pending = false;
             }
@@ -963,16 +982,18 @@ impl Tcb {
                 || self.flush_requested
                 || (!self.corked && self.nodelay)
                 || (!self.corked && self.flight_size() == 0));
-        self.want_syn
-            || self.want_synack
-            || self.want_rst
+        self.handshake_out.is_some()
+            || self.reset_out.is_some()
             || self.ack_pending
             || self.retransmit_now
-            || self.persist_probe_now
+            || self.persist == Persist::ProbeDue
             || sendable_data
             // A FIN still waiting to be sent (close requested, buffer
             // drained, not yet sent).
-            || (self.close_requested && !self.fin_sent && self.send_buffer.is_empty())
+            || (matches!(
+                self.local_close,
+                LocalClose::Requested | LocalClose::FinQueued
+            ) && self.send_buffer.is_empty())
     }
 
     /// Whether a retransmission, persist or TIME_WAIT timer is armed, i.e. the
@@ -985,7 +1006,7 @@ impl Tcb {
             || self.time_wait_deadline.is_some()
             // Reported as soon as the persist condition holds (before the
             // deadline is armed by the next tick/poll) so the engine ticks it.
-            || self.persist_deadline.is_some()
+            || matches!(self.persist, Persist::Armed(_))
             || self.persist_needed()
     }
 }
@@ -1319,7 +1340,7 @@ mod tests {
         let rest = tcb.poll_output(now);
         assert_eq!(rest.len(), 1);
         assert!(rest[0].payload == b"123456789"[..]);
-        assert!(tcb.persist_deadline.is_none());
+        assert!(!matches!(tcb.persist, Persist::Armed(_)));
     }
 
     #[test]

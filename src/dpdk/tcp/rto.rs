@@ -15,17 +15,24 @@ const CLOCK_GRANULARITY: Duration = Duration::from_millis(100);
 /// retransmissions of the same segment.
 pub const MAX_RETRANSMITS: u32 = 12;
 
+/// The smoothed round-trip estimate (RFC 6298 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RttEstimate {
+    /// No sample yet: the RTO is the initial 1s (§2.1).
+    Unmeasured,
+    /// At least one sample has been folded in (§2.2, §2.3).
+    Measured { srtt: Duration, rttvar: Duration },
+}
+
 pub struct RtoEstimator {
-    srtt: Option<Duration>,
-    rttvar: Duration,
+    estimate: RttEstimate,
     rto: Duration,
 }
 
 impl Default for RtoEstimator {
     fn default() -> Self {
         Self {
-            srtt: None,
-            rttvar: Duration::ZERO,
+            estimate: RttEstimate::Unmeasured,
             // RFC 6298 §2.1: until the first RTT sample, use 1s.
             rto: Duration::from_secs(1),
         }
@@ -38,19 +45,15 @@ impl RtoEstimator {
     /// retransmitted before being acked, since the sample would be
     /// ambiguous about which transmission was actually acked.
     pub fn sample(&mut self, rtt: Duration) {
-        match self.srtt {
-            None => {
-                self.srtt = Some(rtt);
-                self.rttvar = rtt / 2;
-            }
-            Some(srtt) => {
+        let (srtt, rttvar) = match self.estimate {
+            RttEstimate::Unmeasured => (rtt, rtt / 2),
+            RttEstimate::Measured { srtt, rttvar } => {
                 let delta = rtt.abs_diff(srtt);
-                self.rttvar = self.rttvar * 3 / 4 + delta / 4;
-                self.srtt = Some(srtt * 7 / 8 + rtt / 8);
+                (srtt * 7 / 8 + rtt / 8, rttvar * 3 / 4 + delta / 4)
             }
-        }
-        let srtt = self.srtt.unwrap();
-        let candidate = srtt + std::cmp::max(CLOCK_GRANULARITY, self.rttvar * 4);
+        };
+        self.estimate = RttEstimate::Measured { srtt, rttvar };
+        let candidate = srtt + std::cmp::max(CLOCK_GRANULARITY, rttvar * 4);
         self.rto = candidate.clamp(MIN_RTO, MAX_RTO);
     }
 

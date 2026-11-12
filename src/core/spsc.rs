@@ -11,6 +11,14 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
+/// Liveness bits in [`SpscRing::flags`]. Each endpoint clears its own bit
+/// when dropped, so the ring is in one of four states: both alive
+/// (`OPEN`), only one side alive, or neither.
+const PRODUCER_ALIVE: u8 = 0b01;
+const CONSUMER_ALIVE: u8 = 0b10;
+/// Both endpoints alive; anything else reads as closed.
+const OPEN: u8 = PRODUCER_ALIVE | CONSUMER_ALIVE;
+
 #[repr(C)]
 struct SpscRing<T, const N: usize> {
     head: AtomicUsize,
@@ -42,7 +50,7 @@ impl<T, const N: usize> SpscRing<T, N> {
             tail: AtomicUsize::new(0),
             _pad1: [0u8; 56],
             buffer: core::array::from_fn(|_| UnsafeCell::new(None)),
-            flags: AtomicU8::new(0b11), // 0b11 indicates there is a consumer and a producer
+            flags: AtomicU8::new(OPEN),
         }
     }
 
@@ -109,8 +117,7 @@ pub struct SpscRx<T, const N: usize> {
 
 impl<T, const N: usize> Drop for SpscRx<T, N> {
     fn drop(&mut self) {
-        // Consumer is the second bit, producer is the first bit. Clear the consumer bit.
-        self.ring.flags.fetch_and(0b10, Ordering::AcqRel);
+        self.ring.flags.fetch_and(!CONSUMER_ALIVE, Ordering::AcqRel);
     }
 }
 
@@ -120,7 +127,7 @@ impl<T, const N: usize> SpscRx<T, N> {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.ring.flags.load(Ordering::Acquire) != 0b11
+        self.ring.flags.load(Ordering::Acquire) != OPEN
     }
 
     pub fn len(&self) -> usize {
@@ -142,7 +149,7 @@ pub struct SpscTx<T, const N: usize> {
 
 impl<T, const N: usize> Drop for SpscTx<T, N> {
     fn drop(&mut self) {
-        self.ring.flags.fetch_and(0b01, Ordering::AcqRel);
+        self.ring.flags.fetch_and(!PRODUCER_ALIVE, Ordering::AcqRel);
     }
 }
 
@@ -152,7 +159,7 @@ impl<T, const N: usize> SpscTx<T, N> {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.ring.flags.load(Ordering::Acquire) != 0b11
+        self.ring.flags.load(Ordering::Acquire) != OPEN
     }
 
     pub fn len(&self) -> usize {
