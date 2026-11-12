@@ -458,13 +458,13 @@ impl AsyncWrite for TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::spsc;
     use crate::dpdk::tcp::worker::SendCredit;
+    use crate::dpdk::tcp::worker::inbound_channel;
     use crate::dpdk::tcp::worker::{CmdRx, InboundTx, SEND_CAPACITY, command_channel};
 
     fn fixture() -> (TcpStream, CmdRx, InboundTx, Arc<SendCredit>) {
         let (cmd_tx, cmd_rx, credit) = command_channel();
-        let (inbound_tx, inbound_rx) = spsc::channel();
+        let (inbound_tx, inbound_rx) = inbound_channel(credit.clone());
         (
             TcpStream {
                 cmd_tx,

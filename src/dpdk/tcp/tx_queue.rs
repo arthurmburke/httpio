@@ -39,8 +39,29 @@ impl SendBuffer {
     pub fn take(&mut self, max_len: usize) -> Payload {
         let mut out = Payload::default();
         let mut remaining = max_len.min(self.len);
-        let mut overflow = Vec::new();
+        let mut overflow_index = 0;
         while remaining > 0 {
+            if out.count == INLINE_FRAGMENTS && out.overflow.is_none() {
+                let mut bytes_left = remaining;
+                let count = self
+                    .chunks
+                    .iter()
+                    .take_while(|chunk| {
+                        if bytes_left == 0 {
+                            return false;
+                        }
+                        bytes_left = bytes_left.saturating_sub(chunk.len());
+                        true
+                    })
+                    .count();
+                let mut storage = Arc::<[Bytes]>::new_uninit_slice(count);
+                for slot in Arc::get_mut(&mut storage).unwrap() {
+                    slot.write(Bytes::new());
+                }
+                // SAFETY: every element was initialized above. Filling the
+                // slots below uses ordinary assignments with normal drop semantics.
+                out.overflow = Some(unsafe { storage.assume_init() });
+            }
             let front = self.chunks.front_mut().unwrap();
             let n = remaining.min(front.len());
             let chunk = if n == front.len() {
@@ -52,14 +73,12 @@ impl SendBuffer {
                 out.chunks[out.count] = chunk;
                 out.count += 1;
             } else {
-                overflow.push(chunk);
+                Arc::get_mut(out.overflow.as_mut().unwrap()).unwrap()[overflow_index] = chunk;
+                overflow_index += 1;
             }
             out.len += n;
             self.len -= n;
             remaining -= n;
-        }
-        if !overflow.is_empty() {
-            out.overflow = Some(overflow.into());
         }
         out
     }

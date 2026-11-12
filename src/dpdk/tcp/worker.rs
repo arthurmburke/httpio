@@ -4,9 +4,11 @@
 //! Threading model:
 //!  - The **worker lcore** owns the `TcpEngine`, `EthPort`, and mbuf
 //!    `PktMbufPool` outright. It busy-polls in a run-to-completion loop:
-//!    drain per-connection command rings into the engine, pump the engine
-//!    (rx burst -> state machines/timers -> tx burst), then drain engine
-//!    receive buffers back out to per-connection inbound rings. No locks.
+//!    service notified command rings, pump the engine (rx burst -> state
+//!    machines/timers -> tx burst), then deliver data for changed connections.
+//!    Application writes, reads and drops publish coalesced notifications
+//!    through a bounded MPSC queue. Only queue overflow falls back to a scan.
+//!    No locks.
 //!  - The **application thread** (the tokio `current_thread` runtime
 //!    driving the HTTP client) never touches the engine. It talks to the
 //!    worker only through rings: one process-wide *control* ring to open
@@ -28,6 +30,7 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::core::hashmap::HashMap;
+use crate::core::hashset::HashSet;
 use crate::core::mpsc;
 use crate::core::mpsc::{MpscRx, MpscTx};
 use crate::core::spsc;
@@ -54,9 +57,40 @@ const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Maximum queued plus unacknowledged application bytes per connection.
 pub const SEND_CAPACITY: usize = 256 * 1024;
 
+const READY_CAP: usize = 4096;
+#[derive(Clone)]
+struct ReadySender {
+    tx: MpscTx<FourTuple, READY_CAP>,
+    overflow: Arc<AtomicBool>,
+}
+struct Wake {
+    tuple: FourTuple,
+    sender: ReadySender,
+    queued: AtomicBool,
+}
+
 pub(crate) struct SendCredit {
+    wake: Option<Wake>,
+    app_gone: AtomicBool,
     pub(crate) bytes: AtomicUsize,
     pub(crate) failed: AtomicBool,
+}
+
+impl SendCredit {
+    fn notify(&self) {
+        if let Some(wake) = &self.wake {
+            if !wake.queued.swap(true, Ordering::AcqRel) && wake.sender.tx.push(wake.tuple).is_err()
+            {
+                // A saturated notification queue must never lose a wakeup.
+                wake.sender.overflow.store(true, Ordering::Release);
+            }
+        }
+    }
+    fn clear_notification(&self) {
+        if let Some(wake) = &self.wake {
+            wake.queued.store(false, Ordering::Release);
+        }
+    }
 }
 
 pub struct CmdTx {
@@ -97,7 +131,10 @@ impl CmdTx {
             self.outstanding.bytes.fetch_add(bytes, Ordering::AcqRel);
         }
         match self.ring.push(cmd) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.outstanding.notify();
+                Ok(())
+            }
             Err(cmd) => {
                 if bytes != 0 {
                     self.outstanding.bytes.fetch_sub(bytes, Ordering::AcqRel);
@@ -108,9 +145,23 @@ impl CmdTx {
     }
 }
 
+impl Drop for CmdTx {
+    fn drop(&mut self) {
+        self.outstanding.app_gone.store(true, Ordering::Release);
+        self.outstanding.notify();
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn command_channel() -> (CmdTx, CmdRx, Arc<SendCredit>) {
+    command_channel_with_wake(None)
+}
+
+fn command_channel_with_wake(wake: Option<Wake>) -> (CmdTx, CmdRx, Arc<SendCredit>) {
     let (ring, rx) = spsc::channel();
     let outstanding = Arc::new(SendCredit {
+        wake,
+        app_gone: AtomicBool::new(false),
         bytes: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
     });
@@ -125,7 +176,35 @@ pub(crate) fn command_channel() -> (CmdTx, CmdRx, Arc<SendCredit>) {
 }
 pub type CmdRx = SpscRx<Command, CMD_CAP>;
 pub type InboundTx = SpscTx<Inbound, IN_CAP>;
-pub type InboundRx = SpscRx<Inbound, IN_CAP>;
+pub struct InboundRx {
+    ring: SpscRx<Inbound, IN_CAP>,
+    signal: Arc<SendCredit>,
+}
+impl InboundRx {
+    pub fn pop(&self) -> Option<Inbound> {
+        let value = self.ring.pop();
+        if value.is_some() {
+            self.signal.notify();
+        }
+        value
+    }
+    pub fn is_closed(&self) -> bool {
+        self.ring.is_closed()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+    pub fn capacity(&self) -> usize {
+        self.ring.capacity()
+    }
+}
+pub(crate) fn inbound_channel(signal: Arc<SendCredit>) -> (InboundTx, InboundRx) {
+    let (tx, ring) = spsc::channel();
+    (tx, InboundRx { ring, signal })
+}
 // The connection-open control ring is MPSC: any number of application
 // threads can share one `WorkerHandle` and open connections concurrently
 // (multiple producers), while the worker lcore is the sole consumer.
@@ -214,7 +293,7 @@ impl WorkerConn {
     }
 
     fn retain_after_drop(&mut self, engine: &mut TcpEngine, now: Instant) -> bool {
-        if !self.cmd_rx.is_closed() {
+        if !self.outstanding.app_gone.load(Ordering::Acquire) {
             return true;
         }
         let deadline = *self.deadline.get_or_insert(now + REAP_TIMEOUT);
@@ -279,6 +358,8 @@ impl WorkerConn {
 #[derive(Clone)]
 pub struct WorkerHandle {
     ctrl_tx: CtrlTx,
+    ready: ReadySender,
+    local_ip: Ipv4Addr,
     /// Shared only by application-side handles. Dropping the final clone drops
     /// `WorkerLifetime`, which signals the worker without a racy strong-count
     /// check. The worker itself deliberately does not own this token.
@@ -321,14 +402,32 @@ impl WorkerHandle {
         let worker_stop = stop.clone();
         let connections_opened = Arc::new(AtomicU64::new(0));
         let worker_opened = connections_opened.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let ready = ReadySender {
+            tx: ready_tx,
+            overflow: overflow.clone(),
+        };
+        let local_ip = engine.local_ip();
 
         let join = dpdk::launch(worker_lcore, move || {
-            run(engine, port, pool, ctrl_rx, worker_stop, worker_opened);
+            run(
+                engine,
+                port,
+                pool,
+                ctrl_rx,
+                worker_stop,
+                worker_opened,
+                ready_rx,
+                overflow,
+            );
         })?;
 
         Ok((
             WorkerHandle {
                 ctrl_tx,
+                ready,
+                local_ip,
                 _lifetime: Arc::new(WorkerLifetime { stop }),
                 connections_opened,
             },
@@ -349,8 +448,18 @@ impl WorkerHandle {
         local_port: u16,
         nodelay: bool,
     ) -> Option<ConnEndpoints> {
-        let (cmd_tx, cmd_rx, outstanding) = command_channel();
-        let (inbound_tx, inbound_rx) = spsc::channel::<Inbound, IN_CAP>();
+        let tuple = FourTuple {
+            local_ip: self.local_ip,
+            local_port,
+            remote_ip,
+            remote_port,
+        };
+        let (cmd_tx, cmd_rx, outstanding) = command_channel_with_wake(Some(Wake {
+            tuple,
+            sender: self.ready.clone(),
+            queued: AtomicBool::new(false),
+        }));
+        let (inbound_tx, inbound_rx) = inbound_channel(outstanding.clone());
 
         let mut msg = NewConn {
             remote_ip,
@@ -383,6 +492,37 @@ impl WorkerHandle {
     }
 }
 
+/// Drains bounded notifications, visiting the map only on queue overflow.
+fn collect_ready(
+    ready_rx: &MpscRx<FourTuple, READY_CAP>,
+    overflow: &AtomicBool,
+    conns: &HashMap<FourTuple, WorkerConn>,
+    work: &mut HashSet<FourTuple>,
+) {
+    for _ in 0..READY_CAP {
+        let Some(tuple) = ready_rx.pop() else {
+            break;
+        };
+        if let Some(conn) = conns.get(&tuple) {
+            conn.outstanding.clear_notification();
+            work.insert(tuple);
+        }
+    }
+    if overflow.swap(false, Ordering::AcqRel) {
+        // Rare bounded-queue overflow recovery; normal polls do no global scan.
+        for (&tuple, conn) in conns {
+            if conn
+                .outstanding
+                .wake
+                .as_ref()
+                .is_some_and(|w| w.queued.swap(false, Ordering::AcqRel))
+            {
+                work.insert(tuple);
+            }
+        }
+    }
+}
+
 /// The worker lcore's run-to-completion loop.
 fn run(
     mut engine: TcpEngine,
@@ -391,6 +531,8 @@ fn run(
     ctrl_rx: CtrlRx,
     stop: Arc<AtomicBool>,
     connections_opened: Arc<AtomicU64>,
+    ready_rx: MpscRx<FourTuple, READY_CAP>,
+    overflow: Arc<AtomicBool>,
 ) {
     let mut conns: HashMap<FourTuple, WorkerConn> = HashMap::default();
     // Mirror of the last value published to `connections_opened`, so the
@@ -399,6 +541,8 @@ fn run(
     let mut published_opened = 0u64;
 
     let mut events = Vec::new();
+    let mut work = HashSet::default();
+    let mut closing = HashSet::default();
     while !stop.load(Ordering::Acquire) {
         // 1. Register newly opened connections.
         while let Some(nc) = ctrl_rx.pop() {
@@ -423,6 +567,8 @@ fn run(
                 continue;
             };
             engine.set_nodelay(tuple, nc.nodelay);
+            work.insert(tuple);
+            nc.outstanding.clear_notification();
             conns.insert(
                 tuple,
                 WorkerConn {
@@ -449,9 +595,17 @@ fn run(
             }
         }
 
-        // 2. Apply queued commands from each connection.
-        for conn in conns.values_mut() {
-            while let Some(cmd) = conn.cmd_rx.pop() {
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        work.extend(closing.iter().copied());
+        // 2. Apply commands only to notified connections.
+        for tuple in &work {
+            let Some(conn) = conns.get_mut(tuple) else {
+                continue;
+            };
+            for _ in 0..CMD_CAP {
+                let Some(cmd) = conn.cmd_rx.pop() else {
+                    break;
+                };
                 match cmd {
                     Command::Send(data) => {
                         conn.engine_bytes += data.len();
@@ -467,9 +621,19 @@ fn run(
             }
         }
 
+        for tuple in &work {
+            if let Some(conn) = conns.get(tuple) {
+                if !conn.cmd_rx.is_empty() {
+                    conn.outstanding.notify();
+                }
+            }
+        }
+
         // 3. Pump the engine: rx burst, state machines, timers, tx burst.
         engine.poll_into(&port, &pool, Instant::now(), &mut events);
+        work.extend(engine.updated_connections().iter().copied());
         for (tuple, ev) in events.drain(..) {
+            work.insert(tuple);
             let Some(conn) = conns.get_mut(&tuple) else {
                 continue;
             };
@@ -477,7 +641,10 @@ fn run(
         }
 
         // 4. Deliver received bytes, then the terminal signal, to the app.
-        for conn in conns.values_mut() {
+        for tuple in &work {
+            let Some(conn) = conns.get_mut(tuple) else {
+                continue;
+            };
             conn.release_credit(&engine);
             // Retry a previously un-pushable chunk first.
             if let Some(pending) = conn.pending_in.take()
@@ -522,7 +689,17 @@ fn run(
         //    engine side (idempotent) and drop the worker state; the
         //    engine finishes any TIME_WAIT on its own.
         let now = Instant::now();
-        conns.retain(|_, conn| conn.retain_after_drop(&mut engine, now));
+        for tuple in work.drain() {
+            let Some(conn) = conns.get_mut(&tuple) else {
+                continue;
+            };
+            if !conn.retain_after_drop(&mut engine, now) {
+                conns.remove(&tuple);
+                closing.remove(&tuple);
+            } else if conn.deadline.is_some() {
+                closing.insert(tuple);
+            }
+        }
     }
 }
 
@@ -531,7 +708,11 @@ mod tests {
     use super::*;
 
     fn fixture() -> (CmdTx, WorkerConn, TcpEngine) {
-        let (tx, cmd_rx, outstanding) = command_channel();
+        fixture_with_wake(None)
+    }
+
+    fn fixture_with_wake(wake: Option<Wake>) -> (CmdTx, WorkerConn, TcpEngine) {
+        let (tx, cmd_rx, outstanding) = command_channel_with_wake(wake);
         let (inbound_tx, _rx) = spsc::channel();
         let mut engine = TcpEngine::new(super::super::engine::EngineConfig::default());
         let tuple = engine
@@ -552,6 +733,126 @@ mod tests {
             deadline: None,
         };
         (tx, conn, engine)
+    }
+
+    #[test]
+    fn notifications_cover_commands_receive_space_and_drop_without_idle_work() {
+        let (_, base, _) = fixture();
+        let tuple = base.tuple;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let wake = Wake {
+            tuple,
+            queued: AtomicBool::new(false),
+            sender: ReadySender {
+                tx: ready_tx,
+                overflow: overflow.clone(),
+            },
+        };
+        let (tx, conn, _) = fixture_with_wake(Some(wake));
+        let (in_tx, in_rx) = inbound_channel(conn.outstanding.clone());
+        let mut conns = HashMap::default();
+        conns.insert(tuple, conn);
+        let mut work = HashSet::default();
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert!(work.is_empty());
+        for _ in 0..10 {
+            assert!(tx.push(Command::Flush).is_ok());
+        }
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert_eq!(work.len(), 1);
+        work.clear();
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert!(work.is_empty(), "idle connections must not be scheduled");
+        assert!(in_tx.push(Inbound::Data(Bytes::from_static(b"x"))).is_ok());
+        assert!(in_rx.pop().is_some());
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert!(work.remove(&tuple), "reading must wake a stalled delivery");
+        drop(tx);
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert!(work.contains(&tuple), "dropping must schedule cleanup");
+        assert!(conns[&tuple].outstanding.app_gone.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn concurrent_notifications_do_not_strand_commands() {
+        let (_, base, _) = fixture();
+        let tuple = base.tuple;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let wake = Wake {
+            tuple,
+            queued: AtomicBool::new(false),
+            sender: ReadySender {
+                tx: ready_tx,
+                overflow: overflow.clone(),
+            },
+        };
+        let (tx, conn, _) = fixture_with_wake(Some(wake));
+        let mut conns = HashMap::default();
+        conns.insert(tuple, conn);
+        let producer = std::thread::spawn(move || {
+            for _ in 0..10000 {
+                while tx.push(Command::Flush).is_err() {
+                    std::thread::yield_now();
+                }
+            }
+        });
+        let mut work = HashSet::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut received = 0;
+        while received < 10000 || !conns[&tuple].outstanding.app_gone.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "lost a command/drop notification"
+            );
+            collect_ready(&ready_rx, &overflow, &conns, &mut work);
+            if work.remove(&tuple) {
+                while conns[&tuple].cmd_rx.pop().is_some() {
+                    received += 1;
+                }
+            }
+            std::thread::yield_now();
+        }
+        producer.join().unwrap();
+        assert_eq!(received, 10000);
+    }
+
+    #[test]
+    fn full_notification_queue_recovers_without_losing_work() {
+        let (_, base, _) = fixture();
+        let tuple = base.tuple;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let mut unrelated = tuple;
+        unrelated.local_port += 1;
+        for _ in 0..READY_CAP {
+            assert!(ready_tx.push(unrelated).is_ok());
+        }
+        let wake = Wake {
+            tuple,
+            queued: AtomicBool::new(false),
+            sender: ReadySender {
+                tx: ready_tx,
+                overflow: overflow.clone(),
+            },
+        };
+        let (tx, conn, _) = fixture_with_wake(Some(wake));
+        let mut conns = HashMap::default();
+        conns.insert(tuple, conn);
+        assert!(tx.push(Command::Flush).is_ok());
+        assert!(overflow.load(Ordering::Acquire));
+        let mut work = HashSet::default();
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert_eq!(work.len(), 1);
+        assert!(work.remove(&tuple));
+        assert!(!overflow.load(Ordering::Acquire));
+        assert!(tx.push(Command::Flush).is_ok());
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert!(
+            work.contains(&tuple),
+            "notification must rearm after overflow"
+        );
     }
 
     #[test]
@@ -656,8 +957,14 @@ mod tests {
     fn dropping_a_cloned_handle_does_not_stop_the_worker() {
         let (ctrl_tx, _ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
         let stop = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = mpsc::channel();
         let handle = WorkerHandle {
             ctrl_tx,
+            local_ip: Ipv4Addr::UNSPECIFIED,
+            ready: ReadySender {
+                tx,
+                overflow: Arc::new(AtomicBool::new(false)),
+            },
             _lifetime: Arc::new(WorkerLifetime { stop: stop.clone() }),
             connections_opened: Arc::new(AtomicU64::new(0)),
         };

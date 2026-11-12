@@ -167,11 +167,21 @@ fn engine_transmits_window_updates_and_final_reset() {
             .write(&mut packet.data_mut()[eth::ETH_HDR_LEN..]);
             assert!(port.tx_burst(vec![packet]).is_empty());
         };
-        arp_reply();
-        engine.poll(&port, &pool, now);
+        // A cold next hop emits ARP, but must not consume the SYN or arm RTO.
         let tuple = engine.connect(PEER_IP, 80, 1234).unwrap();
         engine.poll(&port, &pool, now);
-        let syn = output(&port).remove(0);
+        let requests = port.rx_burst(64);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            eth::EthHeader::parse(requests[0].data()).unwrap().ethertype,
+            arp::ETHERTYPE_ARP
+        );
+        drop(requests);
+        now += Duration::from_millis(1);
+        arp_reply();
+        engine.poll(&port, &pool, now);
+        let syn = output(&port).remove(0); // immediate, without a one-second RTO
+        assert!(syn.has_flag(tcp::flags::SYN));
         let mut peer = tcp::TcpHeader {
             src_port: 80,
             dst_port: 1234,
@@ -239,6 +249,77 @@ fn engine_transmits_window_updates_and_final_reset() {
         assert_eq!(engine.state(tuple), None);
         engine.poll(&port, &pool, now);
         assert!(output(&port).is_empty());
+
+        // Pool exhaustion retains the SYN without advancing retransmission
+        // backoff. It goes out immediately once an mbuf becomes available.
+        arp_reply();
+        engine.poll(&port, &pool, now);
+        let starved = engine.connect(PEER_IP, 80, 2000).unwrap();
+        let mut held = Vec::new();
+        while let Some(packet) = Mbuf::alloc(&pool) {
+            held.push(packet);
+        }
+        engine.poll(&port, &pool, now);
+        assert_eq!(engine.pending_tx_len(), 1);
+        for _ in 0..3 {
+            now += Duration::from_secs(2);
+            assert!(
+                !engine
+                    .poll(&port, &pool, now)
+                    .contains(&(starved, Event::Reset))
+            );
+            assert_eq!(engine.pending_tx_len(), 1);
+        }
+        drop(held);
+        engine.poll(&port, &pool, now);
+        assert_eq!(engine.pending_tx_len(), 0);
+        let sent = output(&port);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].src_port, 2000);
+        engine.poll(&port, &pool, now + Duration::from_millis(500));
+        assert!(output(&port).is_empty(), "RTO must start at NIC acceptance");
+
+        // Fill the virtual NIC, leaving only the RX burst's freed slots.
+        // A burst of new SYNs must retain its unaccepted suffix locally.
+        let mut filler: Vec<_> = (0..2048).map(|_| Mbuf::alloc(&pool).unwrap()).collect();
+        port.tx_burst_in_place(&mut filler);
+        assert!(!filler.is_empty());
+        drop(filler);
+        for port_number in 3000..3128 {
+            engine.connect(PEER_IP, 80, port_number).unwrap();
+        }
+        engine.poll(&port, &pool, now);
+        assert!(engine.pending_tx_len() > 0);
+        assert!(engine.pending_tx_len() <= 256);
+        let mut source_ports = std::collections::HashSet::new();
+        // Drain the NIC completely before the next poll (net_ring loops TX to RX).
+        for _ in 0..32 {
+            for hdr in output(&port) {
+                if (3000..3128).contains(&hdr.src_port) {
+                    assert!(source_ports.insert(hdr.src_port), "duplicate SYN");
+                }
+            }
+        }
+        engine.poll(&port, &pool, now);
+        assert_eq!(engine.pending_tx_len(), 0);
+        for _ in 0..4 {
+            for hdr in output(&port) {
+                if (3000..3128).contains(&hdr.src_port) {
+                    assert!(source_ports.insert(hdr.src_port), "duplicate SYN");
+                }
+            }
+        }
+        assert_eq!(source_ports.len(), 128, "partial TX must not lose SYNs");
+
+        // Unreachable neighbors still fail promptly instead of hanging connect forever.
+        let unreachable = engine
+            .connect(Ipv4Addr::new(10, 0, 0, 99), 80, 4000)
+            .unwrap();
+        engine.poll(&port, &pool, now);
+        output(&port);
+        let events = engine.poll(&port, &pool, now + Duration::from_secs(30));
+        assert!(events.contains(&(unreachable, Event::Reset)));
+        assert_eq!(engine.state(unreachable), None);
     }
     eal::cleanup();
 }

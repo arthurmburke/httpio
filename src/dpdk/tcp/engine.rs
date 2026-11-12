@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -28,6 +28,15 @@ use super::tcb::{Event, FourTuple, OutSegment, Tcb};
 use super::tx_queue::Payload;
 
 const MAX_RX_BURST: usize = 64;
+const MAX_PENDING_TX: usize = 256;
+const ARP_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PendingTcp {
+    tuple: FourTuple,
+    mac: EthAddr,
+    header: tcp::TcpHeader,
+    payload: Payload,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EngineConfig {
@@ -132,6 +141,11 @@ pub struct TcpEngine {
     /// with `active` and clearing afterward retains both allocations.
     processing: HashSet<FourTuple>,
     tx_batch: Vec<Mbuf>,
+    tx_owners: Vec<Option<(FourTuple, Seq)>>,
+    pending_tx: VecDeque<PendingTcp>,
+    queued_tx: HashMap<FourTuple, usize>,
+    arp_wait: HashMap<FourTuple, Instant>,
+    updated: Vec<FourTuple>,
     segments: Vec<OutSegment>,
 
     /// Next-hop MAC resolution: expiring mappings plus the requests that
@@ -159,6 +173,11 @@ impl TcpEngine {
             active: HashSet::default(),
             processing: HashSet::default(),
             tx_batch: Vec::new(),
+            tx_owners: Vec::new(),
+            pending_tx: VecDeque::new(),
+            queued_tx: HashMap::default(),
+            arp_wait: HashMap::default(),
+            updated: Vec::new(),
             segments: Vec::new(),
         }
     }
@@ -228,6 +247,19 @@ impl TcpEngine {
         self.connections.remove(&tuple);
         self.active.remove(&tuple);
         self.pending_accept.remove(&tuple);
+        self.arp_wait.remove(&tuple);
+        self.discard_queued(tuple);
+    }
+
+    fn discard_queued(&mut self, tuple: FourTuple) {
+        self.pending_tx.retain(|p| p.tuple != tuple);
+        for i in (0..self.tx_owners.len()).rev() {
+            if self.tx_owners[i].is_some_and(|(owner, _)| owner == tuple) {
+                self.tx_owners.remove(i);
+                self.tx_batch.remove(i);
+            }
+        }
+        self.queued_tx.remove(&tuple);
     }
 
     pub fn send(&mut self, tuple: FourTuple, data: Bytes) {
@@ -320,6 +352,7 @@ impl TcpEngine {
         events: &mut Vec<(FourTuple, Event)>,
     ) {
         events.clear();
+        self.updated.clear();
         self.arp.expire(now);
         for mbuf in port.rx_packets(MAX_RX_BURST) {
             // RX checksum offload: if the NIC checked a checksum and it was
@@ -334,7 +367,7 @@ impl TcpEngine {
             self.handle_frame(mbuf, ip_ok, l4_ok, now);
         }
 
-        let mut out_mbufs = std::mem::take(&mut self.tx_batch);
+        self.flush_tx(port, pool, now);
 
         // Process only the connections that need attention this poll.
         // Swap into retained scratch storage. Both phases visit the same
@@ -345,6 +378,7 @@ impl TcpEngine {
         // Phase 1: tick timers and drain events. Closed connections remain
         // until phase 2 has serialized any final reset.
         for &tuple in &self.processing {
+            self.updated.push(tuple);
             let mut established = false;
             {
                 let Some(tcb) = self.connections.get_mut(&tuple) else {
@@ -367,10 +401,8 @@ impl TcpEngine {
         // Phase 2: build output for the connections still present, and
         // re-arm the active set for any that still need attention.
         //
-        // Disjoint field borrows: `connections` is borrowed for the loop
-        // while `arp` is borrowed separately by `build_tcp_frame` (a free
-        // function, so the borrow checker sees the borrows don't overlap),
-        // and `active` is a third disjoint field.
+        // Resolve next hops before consuming output, and cap production
+        // by the available local transmit queue space.
         let tx_offload = port.tx_cksum_offload();
         let local_mss = port
             .mtu()
@@ -385,25 +417,54 @@ impl TcpEngine {
             let Some(tcb) = connections.get_mut(&tuple) else {
                 continue;
             };
-            tcb.set_local_mss(local_mss);
-            tcb.poll_output_into(now, &mut self.segments);
-            for seg in self.segments.drain(..) {
-                if let Some(mbuf) = build_tcp_frame(
-                    pool, config, arp, &tuple, tcb, &seg, tx_offload, now,
-                ) {
-                    out_mbufs.push(mbuf);
+            // Do not consume output until both resolution and bounded
+            // local queue space are available. ARP replies are usable this poll.
+            let room = MAX_PENDING_TX.saturating_sub(self.tx_batch.len() + self.pending_tx.len());
+            if self.queued_tx.contains_key(&tuple) || room == 0 {
+                active_set.insert(tuple);
+                continue;
+            }
+            let Some(mac) = arp.resolve(config.next_hop(tuple.remote_ip), now) else {
+                let since = self.arp_wait.entry(tuple).or_insert(now);
+                if now.saturating_duration_since(*since) >= ARP_TIMEOUT {
+                    connections.remove(&tuple);
+                    self.pending_accept.remove(&tuple);
+                    self.arp_wait.remove(&tuple);
+                    events.push((tuple, Event::Reset));
+                } else {
+                    active_set.insert(tuple);
                 }
+                continue;
+            };
+            self.arp_wait.remove(&tuple);
+            tcb.set_local_mss(local_mss);
+            tcb.poll_output_limited(now, &mut self.segments, room.min(32));
+            for seg in self.segments.drain(..) {
+                tcb.mark_transmit_pending(seg.seq);
+                self.pending_tx.push_back(PendingTcp {
+                    tuple,
+                    mac,
+                    header: tcb.to_header(&seg),
+                    payload: seg.payload,
+                });
+                *self.queued_tx.entry(tuple).or_default() += 1;
             }
             if tcb.is_closed() {
                 connections.remove(&tuple);
                 self.pending_accept.remove(&tuple);
-            } else if tcb.has_pending_output() || tcb.has_armed_timer() {
+            } else if tcb.has_pending_output()
+                || tcb.has_armed_timer()
+                || self.queued_tx.contains_key(&tuple)
+            {
                 active_set.insert(tuple);
             }
         }
         self.processing.clear();
 
         for (dst_mac, dst_ip) in self.pending_arp_replies.drain(..) {
+            if self.tx_batch.len() + self.pending_tx.len() >= MAX_PENDING_TX {
+                break;
+            }
             if let Some(mbuf) = build_arp_frame(
                 pool,
                 arp::OP_REPLY,
@@ -412,10 +473,14 @@ impl TcpEngine {
                 dst_mac,
                 dst_ip,
             ) {
-                out_mbufs.push(mbuf);
+                self.tx_batch.push(mbuf);
+                self.tx_owners.push(None);
             }
         }
         for dst_ip in self.arp.drain_requests() {
+            if self.tx_batch.len() + self.pending_tx.len() >= MAX_PENDING_TX {
+                break;
+            }
             if let Some(mbuf) = build_arp_frame(
                 pool,
                 arp::OP_REQUEST,
@@ -424,10 +489,14 @@ impl TcpEngine {
                 EthAddr::BROADCAST,
                 dst_ip,
             ) {
-                out_mbufs.push(mbuf);
+                self.tx_batch.push(mbuf);
+                self.tx_owners.push(None);
             }
         }
         for (dst_mac, dst_ip, hdr) in self.pending_raw_resets.drain(..) {
+            if self.tx_batch.len() + self.pending_tx.len() >= MAX_PENDING_TX {
+                break;
+            }
             if let Some(mbuf) = build_ip_tcp_frame(
                 pool,
                 self.config.local_mac,
@@ -438,16 +507,61 @@ impl TcpEngine {
                 &Payload::default(),
                 tx_offload,
             ) {
-                out_mbufs.push(mbuf);
+                self.tx_batch.push(mbuf);
+                self.tx_owners.push(None);
             }
         }
 
-        if !out_mbufs.is_empty() {
-            port.tx_burst_in_place(&mut out_mbufs);
+        self.flush_tx(port, pool, now);
+    }
+
+    /// Packets retained locally awaiting pool space or NIC acceptance.
+    pub fn pending_tx_len(&self) -> usize {
+        self.tx_batch.len() + self.pending_tx.len()
+    }
+
+    pub(crate) fn updated_connections(&self) -> &[FourTuple] {
+        &self.updated
+    }
+
+    fn flush_tx(&mut self, port: &EthPort, pool: &Mempool, now: Instant) {
+        while let Some(packet) = self.pending_tx.front() {
+            let Some(mbuf) = build_ip_tcp_frame(
+                pool,
+                self.config.local_mac,
+                packet.mac,
+                packet.tuple.local_ip,
+                packet.tuple.remote_ip,
+                &packet.header,
+                &packet.payload,
+                port.tx_cksum_offload(),
+            ) else {
+                break;
+            };
+            self.tx_owners
+                .push(Some((packet.tuple, Seq::new(packet.header.seq))));
+            self.tx_batch.push(mbuf);
+            self.pending_tx.pop_front();
         }
-        // Unsent packets are dropped as before, but storage stays warm.
-        out_mbufs.clear();
-        self.tx_batch = out_mbufs;
+        let before = self.tx_batch.len();
+        if before == 0 {
+            return;
+        }
+        port.tx_burst_in_place(&mut self.tx_batch);
+        let sent = before - self.tx_batch.len();
+        for owner in self.tx_owners.drain(..sent).flatten() {
+            let (tuple, seq) = owner;
+            if let Some(tcb) = self.connections.get_mut(&tuple) {
+                tcb.mark_transmitted(seq, now);
+            }
+            if let Some(count) = self.queued_tx.get_mut(&tuple) {
+                *count -= 1;
+                if *count == 0 {
+                    self.queued_tx.remove(&tuple);
+                }
+            }
+        }
+        // The unaccepted suffix and its ownership metadata remain for retry.
     }
 
     /// `ip_ok`/`l4_ok` report that the NIC already verified the IPv4 /
@@ -515,6 +629,9 @@ impl TcpEngine {
                 || mbuf.into_bytes().slice(start..end),
                 now,
             );
+            if tcb.is_closed() {
+                self.discard_queued(tuple);
+            }
             // The segment may have produced an ACK/data to send, an event,
             // or a state change -- process it next poll.
             self.mark_active(tuple);
@@ -583,34 +700,6 @@ impl TcpEngine {
         self.pending_raw_resets
             .push((remote_mac, remote_ip, response_hdr));
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_tcp_frame(
-    pool: &Mempool,
-    config: &EngineConfig,
-    arp: &mut ArpTable,
-    tuple: &FourTuple,
-    tcb: &Tcb,
-    seg: &OutSegment,
-    tx_cksum_offload: bool,
-    now: Instant,
-) -> Option<Mbuf> {
-    // An unresolved next hop queues an ARP request and drops this segment;
-    // TCP's own retransmission resends it once the reply is in.
-    let next_hop = config.next_hop(tuple.remote_ip);
-    let remote_mac = arp.resolve(next_hop, now)?;
-    let hdr = tcb.to_header(seg);
-    build_ip_tcp_frame(
-        pool,
-        config.local_mac,
-        remote_mac,
-        config.local_ip,
-        tuple.remote_ip,
-        &hdr,
-        &seg.payload,
-        tx_cksum_offload,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -748,31 +837,58 @@ mod tests {
     fn no_gateway_is_always_on_link() {
         let c = cfg("10.0.1.25/24", None);
         assert_eq!(c.gateway, None);
-        assert_eq!(c.next_hop(Ipv4Addr::new(203, 0, 113, 10)), Ipv4Addr::new(203, 0, 113, 10));
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(203, 0, 113, 10)),
+            Ipv4Addr::new(203, 0, 113, 10)
+        );
     }
 
     #[test]
     fn off_subnet_goes_to_gateway() {
         let c = cfg("10.0.1.25/24", Some("10.0.1.1"));
         assert_eq!(c.local_ip, Ipv4Addr::new(10, 0, 1, 25));
-        assert_eq!(c.next_hop(Ipv4Addr::new(10, 0, 1, 99)), Ipv4Addr::new(10, 0, 1, 99));
-        assert_eq!(c.next_hop(Ipv4Addr::new(10, 0, 2, 99)), Ipv4Addr::new(10, 0, 1, 1));
-        assert_eq!(c.next_hop(Ipv4Addr::new(203, 0, 113, 10)), Ipv4Addr::new(10, 0, 1, 1));
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(10, 0, 1, 99)),
+            Ipv4Addr::new(10, 0, 1, 99)
+        );
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(10, 0, 2, 99)),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(203, 0, 113, 10)),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
     }
 
     #[test]
     fn prefix_edges() {
         // No prefix with a gateway means /32: everything via the gateway.
         let c = cfg("10.0.1.25", Some("10.0.1.1"));
-        assert_eq!(c.next_hop(Ipv4Addr::new(10, 0, 1, 99)), Ipv4Addr::new(10, 0, 1, 1));
-        assert_eq!(c.next_hop(Ipv4Addr::new(10, 0, 1, 25)), Ipv4Addr::new(10, 0, 1, 25));
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(10, 0, 1, 99)),
+            Ipv4Addr::new(10, 0, 1, 1)
+        );
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(10, 0, 1, 25)),
+            Ipv4Addr::new(10, 0, 1, 25)
+        );
         // /0: everything on-link.
         let c = cfg("10.0.1.25/0", Some("10.0.1.1"));
-        assert_eq!(c.next_hop(Ipv4Addr::new(203, 0, 113, 10)), Ipv4Addr::new(203, 0, 113, 10));
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(203, 0, 113, 10)),
+            Ipv4Addr::new(203, 0, 113, 10)
+        );
         // Non-octet boundary: 10.0.0.0/20 covers 10.0.0.0-10.0.15.255.
         let c = cfg("10.0.1.25/20", Some("10.0.0.1"));
-        assert_eq!(c.next_hop(Ipv4Addr::new(10, 0, 15, 255)), Ipv4Addr::new(10, 0, 15, 255));
-        assert_eq!(c.next_hop(Ipv4Addr::new(10, 0, 16, 0)), Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(10, 0, 15, 255)),
+            Ipv4Addr::new(10, 0, 15, 255)
+        );
+        assert_eq!(
+            c.next_hop(Ipv4Addr::new(10, 0, 16, 0)),
+            Ipv4Addr::new(10, 0, 0, 1)
+        );
     }
 
     #[test]

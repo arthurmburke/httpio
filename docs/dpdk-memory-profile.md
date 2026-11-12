@@ -87,3 +87,13 @@ byte totals are recorded correctly:
 ```sh
 cargo test --test dpdk_memory_profile allocator_accounting
 ```
+
+After the bounded-transmit and fragment-metadata changes, a 10,000-iteration
+release run measured `tx_32_fragments` at one allocation and 784 requested
+bytes per operation (previously five allocation/reallocation calls and 2,704
+bytes). Its baseline p50 was 1,667 ns in this run versus 2,000 ns in the earlier
+run; these separate container runs are not a controlled latency comparison.
+Warmed owned TX, four-fragment TX, ACK handling, rejected RX and idle polling
+still measured zero Rust allocations. The profiler does not exercise worker
+notification scheduling; that path has separate command/read/drop and
+notification-overflow regression tests.

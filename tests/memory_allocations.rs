@@ -51,7 +51,8 @@ fn fragmented_segments_keep_packet_size_and_share_retransmit_storage() {
     for _ in 0..100 {
         queue.push(Bytes::from_static(b"ab"));
     }
-    let payload = queue.take(199);
+    let (payload, count) = count_allocations(|| queue.take(199));
+    assert_eq!(count, 1, "overflow metadata needs exactly one allocation");
     assert_eq!(payload.len(), 199);
     assert_eq!(payload.chunks().count(), 100);
     let (retransmit, count) = count_allocations(|| payload.clone());

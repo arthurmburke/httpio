@@ -545,8 +545,10 @@ impl Tcb {
             // RFC 5681 §2: a duplicate ACK carries no data and doesn't
             // move the window; with nothing in flight it's just a normal
             // keepalive-style ACK, not a loss signal.
-            let is_dup_candidate =
-                payload_len == 0 && !hdr.has_flag(flags::SYN) && !hdr.has_flag(flags::FIN);
+            let is_dup_candidate = payload_len == 0
+                && hdr.window as u32 == self.snd_wnd
+                && !hdr.has_flag(flags::SYN)
+                && !hdr.has_flag(flags::FIN);
             if is_dup_candidate
                 && !self.probe_outstanding
                 && self.flight_size() > 0
@@ -714,7 +716,45 @@ impl Tcb {
 
     /// Writes into reusable caller storage, retaining its capacity.
     pub fn poll_output_into(&mut self, now: Instant, out: &mut Vec<OutSegment>) {
+        self.poll_output_limited(now, out, usize::MAX);
+    }
+
+    pub(crate) fn mark_transmit_pending(&mut self, seq: Seq) {
+        if let Ok(index) = self
+            .retransmit
+            .segments
+            .binary_search_by_key(&seq, |s| s.seq)
+        {
+            let seg = &mut self.retransmit.segments[index];
+            seg.pending_transmit = true;
+        }
+    }
+
+    pub(crate) fn mark_transmitted(&mut self, seq: Seq, now: Instant) {
+        if let Ok(index) = self
+            .retransmit
+            .segments
+            .binary_search_by_key(&seq, |s| s.seq)
+        {
+            let seg = &mut self.retransmit.segments[index];
+            seg.pending_transmit = false;
+            seg.last_sent_at = now;
+            if !seg.retransmitted {
+                seg.first_sent_at = now;
+            }
+        }
+    }
+
+    pub(crate) fn poll_output_limited(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<OutSegment>,
+        limit: usize,
+    ) {
         out.clear();
+        if limit == 0 {
+            return;
+        }
 
         if self.want_rst {
             self.want_rst = false;
@@ -774,7 +814,7 @@ impl Tcb {
         }
 
         if self.state.can_send() {
-            self.send_new_data(now, out);
+            self.send_new_data(now, out, limit);
         }
 
         if self.close_requested
@@ -787,7 +827,7 @@ impl Tcb {
             self.want_fin = true;
         }
 
-        if self.want_fin {
+        if self.want_fin && out.len() < limit {
             self.want_fin = false;
             self.fin_sent = true;
             let seq = self.snd_nxt;
@@ -805,7 +845,10 @@ impl Tcb {
         }
     }
 
-    fn send_new_data(&mut self, now: Instant, out: &mut Vec<OutSegment>) {
+    fn send_new_data(&mut self, now: Instant, out: &mut Vec<OutSegment>, limit: usize) {
+        if out.len() == limit {
+            return;
+        }
         // Zero-window probe: one byte as an ordinary data segment, so the
         // retransmit queue and ACK processing handle it like any other.
         if self.persist_probe_now {
@@ -821,7 +864,7 @@ impl Tcb {
             }
         }
 
-        loop {
+        while out.len() < limit {
             let usable_window = self.snd_wnd.min(self.congestion.cwnd());
             let flight = self.flight_size();
             let available = usable_window.saturating_sub(flight);
@@ -1160,6 +1203,60 @@ mod tests {
 
         assert_eq!(tcb.state, TcpState::Established);
         assert!(!tcb.events.contains(&Event::Reset));
+    }
+
+    #[test]
+    fn locally_queued_segments_do_not_expire_before_transmission() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.send(Bytes::from_static(b"payload"));
+        let output = tcb.poll_output(now);
+        tcb.mark_transmit_pending(output[0].seq);
+        let later = now + Duration::from_secs(60);
+        tcb.tick(later);
+        assert!(!tcb.retransmit_now);
+        assert_eq!(tcb.retransmit.segments.front().unwrap().retransmit_count, 0);
+        tcb.mark_transmitted(output[0].seq, later);
+        tcb.tick(later);
+        assert!(!tcb.retransmit_now);
+        tcb.tick(later + tcb.rto.rto());
+        assert!(tcb.retransmit_now);
+    }
+
+    #[test]
+    fn output_budget_leaves_unsent_data_in_the_send_buffer() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.send(Bytes::from(vec![0; 4096]));
+        let mut output = Vec::new();
+        tcb.poll_output_limited(now, &mut output, 0);
+        assert!(output.is_empty());
+        assert_eq!(tcb.send_buffer.len(), 4096);
+        tcb.poll_output_limited(now, &mut output, 1);
+        assert_eq!(output.len(), 1);
+        assert_eq!(tcb.send_buffer.len(), 4096 - output[0].payload.len());
+    }
+
+    #[test]
+    fn window_updates_do_not_trigger_fast_retransmit() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.send(Bytes::from_static(b"payload"));
+        tcb.poll_output(now);
+        let cwnd = tcb.congestion.cwnd();
+        for window in [40000, 45000, 50000, 55000] {
+            let ack = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, window);
+            tcb.on_segment(&ack, Bytes::new(), now);
+            assert!(tcb.poll_output(now).is_empty());
+            assert_eq!(tcb.congestion.cwnd(), cwnd);
+            assert!(!tcb.congestion.in_fast_recovery());
+        }
+        // Genuine duplicates still trigger recovery after three ACKs.
+        let ack = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, 55000);
+        for _ in 0..3 {
+            tcb.on_segment(&ack, Bytes::new(), now);
+        }
+        assert_eq!(tcb.poll_output(now).len(), 1);
     }
 
     #[test]

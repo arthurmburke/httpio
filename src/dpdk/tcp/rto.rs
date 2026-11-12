@@ -80,6 +80,7 @@ pub struct UnackedSegment {
     /// generate an RTT sample when it's finally acked.
     pub retransmitted: bool,
     pub retransmit_count: u32,
+    pub(crate) pending_transmit: bool,
 }
 
 impl UnackedSegment {
@@ -103,9 +104,9 @@ impl RetransmitQueue {
     /// Enqueues a sent-but-unacked segment so it can be resent verbatim
     /// if `on_rto` fires before it's acked. `syn`/`fin` mark control
     /// segments (the handshake SYN/SYN-ACK and the closing FIN) so they
-    /// get retried through the same mechanism as data instead of being
-    /// silently dropped if the first transmission is lost (e.g. to an
-    /// unresolved ARP entry).
+    /// get retried through the same mechanism as data. The engine marks
+    /// locally queued output pending until NIC acceptance, so local
+    /// backpressure does not start a network retransmission timer.
     pub fn push(&mut self, seq: Seq, data: impl Into<Payload>, syn: bool, fin: bool, now: Instant) {
         let data = data.into();
         self.payload_bytes += data.len();
@@ -118,6 +119,7 @@ impl RetransmitQueue {
             last_sent_at: now,
             retransmitted: false,
             retransmit_count: 0,
+            pending_transmit: false,
         });
     }
 
@@ -149,6 +151,9 @@ impl RetransmitQueue {
     }
 
     pub fn oldest_deadline(&self, rto: Duration) -> Option<Instant> {
-        self.segments.front().map(|s| s.last_sent_at + rto)
+        self.segments
+            .front()
+            .filter(|s| !s.pending_transmit)
+            .map(|s| s.last_sent_at + rto)
     }
 }
