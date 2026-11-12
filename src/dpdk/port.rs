@@ -28,7 +28,17 @@ fn check(what: &'static str, rc: i32) -> Result<(), PortError> {
     }
 }
 
+/// Negotiated device features. Unsupported features stay disabled.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Offloads {
+    pub tx_checksum: bool,
+    pub rx_checksum: bool,
+    pub tso_max_payload: usize,
+    pub tx_multi_segment: bool,
+}
+
 pub struct EthPort {
+    offloads: Offloads,
     port_id: u16,
     mtu: u32,
     /// The NIC will compute IPv4 + TCP checksums on TX (both offloads were
@@ -72,7 +82,7 @@ impl EthPort {
             (ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | ffi::RTE_ETH_TX_OFFLOAD_TCP_CKSUM) as u64;
         let rx_want =
             (ffi::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM | ffi::RTE_ETH_RX_OFFLOAD_TCP_CKSUM) as u64;
-        let tx_en = tx_want & info.tx_offload_capa;
+        let mut tx_en = tx_want & info.tx_offload_capa;
         let rx_en = rx_want & info.rx_offload_capa;
         // Take the fast path only when BOTH IPv4 and TCP checksums can be
         // offloaded together (our frames always carry both); otherwise fall
@@ -80,6 +90,29 @@ impl EthPort {
         // state per packet.
         let tx_cksum_offload = tx_en == tx_want;
         let rx_cksum_offload = rx_en == rx_want;
+
+        let multi = info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_MULTI_SEGS as u64 != 0;
+        let tso = multi
+            && (info.tx_desc_lim.nb_mtu_seg_max == 0 || info.tx_desc_lim.nb_mtu_seg_max >= 2)
+            && tx_cksum_offload
+            && info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_TCP_TSO as u64 != 0;
+        let tso_max_payload = if tso {
+            tx_en |=
+                ffi::RTE_ETH_TX_OFFLOAD_MULTI_SEGS as u64 | ffi::RTE_ETH_TX_OFFLOAD_TCP_TSO as u64;
+            // Respect descriptor limits and keep IPv4 packet length below 65536.
+            let max_segments = usize::from(info.tx_desc_lim.nb_seg_max).min(32);
+            (max_segments.saturating_sub(1) * usize::from(rx_pool.packet_capacity()))
+                .saturating_sub(54)
+                .min(32768)
+        } else {
+            0
+        };
+        let offloads = Offloads {
+            tx_checksum: tx_cksum_offload,
+            rx_checksum: rx_cksum_offload,
+            tso_max_payload,
+            tx_multi_segment: tso,
+        };
 
         // Single rx queue (0), single tx queue (0). A zeroed `rte_eth_conf`
         // is the DPDK-conventional starting point (like the sample apps'
@@ -122,11 +155,16 @@ impl EthPort {
         })?;
 
         Ok(Self {
+            offloads,
             port_id,
             mtu,
             tx_cksum_offload,
             rx_cksum_offload,
         })
+    }
+
+    pub fn offloads(&self) -> Offloads {
+        self.offloads
     }
 
     /// Whether IPv4 + TCP TX checksum offload is active on this port. When

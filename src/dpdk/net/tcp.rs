@@ -1,5 +1,5 @@
-//! TCP segment header parsing/serialization (RFC 9293 §3.1), including the
-//! MSS option. Window scale / SACK / timestamps are intentionally out of
+//! TCP segment header parsing/serialization (RFC 9293 §3.1), including
+//! MSS and window scale options. SACK / timestamps are intentionally out of
 //! scope -- see the top-level README for what this stack does and doesn't
 //! implement.
 
@@ -27,6 +27,7 @@ pub const OPT_KIND_MSS: u8 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TcpOptions {
     pub mss: Option<u16>,
+    pub window_scale: Option<u8>,
 }
 
 impl TcpOptions {
@@ -39,6 +40,10 @@ impl TcpOptions {
                 OPT_KIND_MSS if buf.len() >= 4 && buf[1] == 4 => {
                     opts.mss = Some(u16::from_be_bytes([buf[2], buf[3]]));
                     buf = &buf[4..];
+                }
+                3 if buf.len() >= 3 && buf[1] == 3 => {
+                    opts.window_scale = Some(buf[2].min(14));
+                    buf = &buf[3..];
                 }
                 _kind => {
                     // Unknown/other option: length-prefixed per RFC 9293
@@ -132,7 +137,13 @@ impl TcpHeader {
     /// Total serialized header length in bytes (20 + options, padded to a
     /// 4-byte boundary).
     pub fn wire_len(&self) -> usize {
-        TCP_HDR_LEN + if self.options.mss.is_some() { 4 } else { 0 }
+        TCP_HDR_LEN
+            + if self.options.mss.is_some() { 4 } else { 0 }
+            + if self.options.window_scale.is_some() {
+                4
+            } else {
+                0
+            }
     }
 
     /// Writes the header (and options) into `out` and fills in the
@@ -167,6 +178,10 @@ impl TcpHeader {
             TcpOptions::write_mss(mss, &mut out[TCP_HDR_LEN..hdr_len]);
         }
 
+        if let Some(scale) = self.options.window_scale {
+            let start = TCP_HDR_LEN + if self.options.mss.is_some() { 4 } else { 0 };
+            out[start..start + 4].copy_from_slice(&[1, 3, 3, scale.min(14)]);
+        }
         let pseudo = checksum::ipv4_pseudo_header_sum(
             src_ip,
             dst_ip,
@@ -201,7 +216,10 @@ mod tests {
             flags: 0x18,
             window: 0xffff,
             urgent_pointer: 0,
-            options: TcpOptions { mss },
+            options: TcpOptions {
+                mss,
+                ..Default::default()
+            },
         }
     }
 
@@ -224,6 +242,21 @@ mod tests {
                 .collect(),
             vec![0xff; 1461],
         ]
+    }
+
+    #[test]
+    fn window_scale_options_round_trip_with_and_without_mss() {
+        for mss in [None, Some(1460)] {
+            for scale in [0, 4, 14, 255] {
+                let mut h = header(mss);
+                h.options.window_scale = Some(scale);
+                let wire = build(&h, b"payload", false);
+                let (decoded, len) = TcpHeader::parse(&wire, SRC, DST, true).unwrap();
+                assert_eq!(len, h.wire_len());
+                assert_eq!(decoded.options.window_scale, Some(scale.min(14)));
+                assert_eq!(decoded.options.mss, mss);
+            }
+        }
     }
 
     #[test]

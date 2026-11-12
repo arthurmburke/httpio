@@ -97,11 +97,7 @@ impl Mbuf {
         }
     }
 
-    /// Read-only view of the single-segment packet data.
-    ///
-    /// Multi-segment (chained) mbufs are out of scope for this stack: rx
-    /// mbuf pools are sized so a full frame fits in one segment, and this
-    /// stack never receives jumbo frames that would force segmentation.
+    /// First segment's data. Use `segments()` to visit a complete chained packet.
     pub fn data(&self) -> &[u8] {
         let ptr = self.data_ptr();
         let len = self.data_len() as usize;
@@ -109,6 +105,84 @@ impl Mbuf {
             return &[];
         }
         unsafe { slice::from_raw_parts(ptr, len) }
+    }
+
+    /// Borrow every segment without flattening the packet.
+    pub fn segments(&self) -> impl Iterator<Item = &[u8]> {
+        let mut next = self.raw;
+        std::iter::from_fn(move || {
+            if next.is_null() {
+                return None;
+            }
+            // SAFETY: each linked segment belongs to this live packet.
+            unsafe {
+                let segment = &*next;
+                next = segment.next;
+                Some(slice::from_raw_parts(
+                    segment.buf_addr.cast::<u8>().add(segment.data_off as usize),
+                    segment.data_len as usize,
+                ))
+            }
+        })
+    }
+
+    /// Internet checksum sum over a byte range, carrying odd bytes across segments.
+    pub(crate) fn checksum_sum(&self, start: usize, len: usize, mut sum: u32) -> u32 {
+        let mut skip = start;
+        let mut remaining = len;
+        let mut high = None;
+        for segment in self.segments() {
+            if skip >= segment.len() {
+                skip -= segment.len();
+                continue;
+            }
+            let n = remaining.min(segment.len() - skip);
+            for &byte in &segment[skip..skip + n] {
+                if let Some(first) = high.take() {
+                    sum += u16::from_be_bytes([first, byte]) as u32;
+                } else {
+                    high = Some(byte);
+                }
+            }
+            remaining -= n;
+            skip = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if let Some(first) = high {
+            sum += (first as u32) << 8;
+        }
+        sum
+    }
+
+    /// Transfers a tail chain into this packet. Failure returns ownership.
+    pub fn chain(&mut self, tail: Mbuf) -> Result<(), Mbuf> {
+        // SAFETY: the two owned, disjoint chains are live. DPDK only links on success.
+        if unsafe { ffi::rte_pktmbuf_chain(self.raw, tail.raw) } != 0 {
+            return Err(tail);
+        }
+        std::mem::forget(tail);
+        Ok(())
+    }
+
+    /// Detaches each segment, yielding independently owned zero-copy views.
+    pub fn into_segments(self) -> impl Iterator<Item = Mbuf> {
+        let mut remaining = Some(self);
+        std::iter::from_fn(move || {
+            let packet = remaining.take()?;
+            unsafe {
+                let raw = packet.raw;
+                let next = (*raw).next;
+                (*raw).next = std::ptr::null_mut();
+                (*raw).nb_segs = 1;
+                (*raw).pkt_len = u32::from((*raw).data_len);
+                if !next.is_null() {
+                    remaining = Some(Mbuf::from_raw(next));
+                }
+            }
+            Some(packet)
+        })
     }
 
     pub fn data_mut(&mut self) -> &mut [u8] {
@@ -149,7 +223,14 @@ impl Mbuf {
     /// so a freshly allocated mbuf can be built up with `prepend`/`append`.
     pub fn reset(&mut self) {
         // SAFETY: `raw` is a valid, singly-owned mbuf.
-        unsafe { ffi::rte_pktmbuf_reset(self.raw) }
+        unsafe {
+            let tail = (*self.raw).next;
+            (*self.raw).next = std::ptr::null_mut();
+            if !tail.is_null() {
+                ffi::rte_pktmbuf_free(tail);
+            }
+            ffi::rte_pktmbuf_reset(self.raw);
+        }
     }
 
     /// The mbuf's offload flags (`ol_flags`), e.g. the RX checksum-result
@@ -201,7 +282,22 @@ impl Mbuf {
     /// last `Bytes` reference drops, so long-held small payloads hold more
     /// pool memory than a copy would.
     pub fn into_bytes(self) -> Bytes {
+        assert_eq!(
+            self.pkt_len(),
+            self.data_len() as u32,
+            "use into_segments() to convert chained packets without truncation"
+        );
         Bytes::from_owner(self)
+    }
+
+    /// Marks an IPv4/TCP super-packet for segmentation by the device.
+    pub fn set_tx_tso(&mut self, tcp_len: u16, mss: u16) {
+        self.set_tx_ipv4_tcp_cksum(14, 20);
+        unsafe {
+            (*self.raw).ol_flags |= ffi::RTE_MBUF_F_TX_TCP_SEG;
+            (*self.raw).__bindgen_anon_3.tx_offload |=
+                ((tcp_len as u64) << 16) | ((mss as u64) << 24);
+        }
     }
 
     /// Requests NIC TX checksum offload for an IPv4 + TCP packet: the

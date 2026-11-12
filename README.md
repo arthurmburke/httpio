@@ -67,7 +67,7 @@ IPv4 + TCP, no kernel network stack involved.
   builds one from strings; `http_get`/`ws_client` take `LOCAL_IP/PREFIX`
   and `--gateway IP`.
 
-Not implemented (explicitly out of scope): window scaling, SACK, timestamps,
+Not implemented (explicitly out of scope): SACK, timestamps,
 delayed ACK, IPv6, IP fragmentation/options, multi-segment (chained) mbufs,
 a route table beyond the single default gateway.
 
@@ -188,3 +188,6 @@ Requires a DPDK-bound NIC (via `vfio-pci`/`igb_uio`) or a `--vdev`
 virtio-user interface, plus hugepages configured (`/proc/sys/vm/nr_hugepages`
 or a hugetlbfs mount) — standard DPDK environment setup, not specific to
 this project.
+
+TCP window scaling, capability-gated TSO, and burst-local software GRO are
+supported. See [offload setup and validation](docs/dpdk-offloads.md).

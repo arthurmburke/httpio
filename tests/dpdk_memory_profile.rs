@@ -101,7 +101,10 @@ mod dpdk {
                     flags: tcp::flags::ACK,
                     window: u16::MAX,
                     urgent_pointer: 0,
-                    options: tcp::TcpOptions { mss: Some(1460) },
+                    options: tcp::TcpOptions {
+                        mss: Some(1460),
+                        ..Default::default()
+                    },
                 },
                 injection: Vec::with_capacity(64),
                 events: Vec::new(),

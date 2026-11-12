@@ -6,5 +6,6 @@ pub mod seq;
 pub mod socket;
 pub mod state;
 pub mod tcb;
+mod timers;
 pub mod tx_queue;
 pub mod worker;

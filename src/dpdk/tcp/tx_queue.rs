@@ -132,6 +132,49 @@ impl Payload {
             .iter()
             .chain(self.overflow.as_deref().unwrap_or(&[]).iter())
     }
+    /// Shares only the requested byte range, preserving fragment boundaries.
+    pub fn slice(&self, start: usize, len: usize) -> Self {
+        assert!(start <= self.len && len <= self.len - start);
+        let selected = || {
+            let mut skip = start;
+            let mut remaining = len;
+            self.chunks().filter_map(move |chunk| {
+                if skip >= chunk.len() {
+                    skip -= chunk.len();
+                    return None;
+                }
+                let n = remaining.min(chunk.len() - skip);
+                if n == 0 {
+                    return None;
+                }
+                let part = chunk.slice(skip..skip + n);
+                skip = 0;
+                remaining -= n;
+                Some(part)
+            })
+        };
+        let count = selected().count();
+        let mut out = Self::default();
+        if count > INLINE_FRAGMENTS {
+            let mut storage = Arc::<[Bytes]>::new_uninit_slice(count - INLINE_FRAGMENTS);
+            for slot in Arc::get_mut(&mut storage).unwrap() {
+                slot.write(Bytes::new());
+            }
+            // SAFETY: all elements initialized above before normal assignments below.
+            out.overflow = Some(unsafe { storage.assume_init() });
+        }
+        for (i, chunk) in selected().enumerate() {
+            if i < INLINE_FRAGMENTS {
+                out.chunks[i] = chunk;
+                out.count += 1;
+            } else {
+                Arc::get_mut(out.overflow.as_mut().unwrap()).unwrap()[i - INLINE_FRAGMENTS] = chunk;
+            }
+        }
+        out.len = len;
+        out
+    }
+
     pub fn copy_to(&self, out: &mut [u8]) {
         assert_eq!(out.len(), self.len);
         let mut offset = 0;

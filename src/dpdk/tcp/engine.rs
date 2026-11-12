@@ -25,6 +25,7 @@ use crate::dpdk::{EthPort, Mbuf, Mempool};
 use super::seq::Seq;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple, OutSegment, Tcb};
+use super::timers::Timers;
 use super::tx_queue::Payload;
 
 const MAX_RX_BURST: usize = 64;
@@ -40,6 +41,7 @@ struct PendingTcp {
     /// [`Conn::queued_tx`]. The last segments of a connection that closed
     /// (its final reset) are unowned: the connection is already gone.
     owned: bool,
+    tso_mss: u16,
 }
 
 /// Whether a connection came from a listener, and if so how far it is
@@ -173,16 +175,14 @@ fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix_len: u8) -> bool {
 
 pub struct TcpEngine {
     config: EngineConfig,
+    rx_gro: bool,
     listeners: HashSet<u16>,
     connections: HashMap<FourTuple, Conn>,
     connections_opened: u64,
     accept_queues: HashMap<u16, VecDeque<FourTuple>>,
-    /// Connections that need per-poll attention -- they have pending
-    /// output or an armed timer. `poll` processes only these, so idle
-    /// connections aren't walked every iteration. Invariant: a connection
-    /// *not* in this set has no pending output and no armed timer, so only
-    /// an inbound frame or an app call can make it need work -- and both
-    /// re-insert it here (see `mark_active`).
+    /// Immediately runnable connections only. Future timers live in an
+    /// indexed heap and enter this set when due, or on packet/app activity.
+    timers: Timers,
     active: HashSet<FourTuple>,
     /// Scratch set for both poll phases; empty between polls. Swapping
     /// with `active` and clearing afterward retains both allocations.
@@ -207,6 +207,7 @@ impl TcpEngine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
             config,
+            rx_gro: true,
             listeners: HashSet::default(),
             connections: HashMap::default(),
             connections_opened: 0,
@@ -214,6 +215,7 @@ impl TcpEngine {
             arp: ArpTable::new(),
             pending_arp_replies: Vec::new(),
             pending_raw_resets: Vec::new(),
+            timers: Timers::default(),
             active: HashSet::default(),
             processing: HashSet::default(),
             tx_batch: Vec::new(),
@@ -224,10 +226,16 @@ impl TcpEngine {
         }
     }
 
+    /// Enable/disable burst-local receive aggregation for workload comparisons.
+    pub fn set_rx_gro(&mut self, enabled: bool) {
+        self.rx_gro = enabled;
+    }
+
     /// Marks a connection as needing attention on the next `poll`. Cheap
     /// and idempotent; called from every path that can give a connection
     /// pending output (app ops, inbound segments).
     fn mark_active(&mut self, tuple: FourTuple) {
+        self.timers.remove(tuple);
         self.active.insert(tuple);
     }
 
@@ -290,6 +298,7 @@ impl TcpEngine {
     /// Discards an abandoned connection and all its retained buffers.
     pub(crate) fn abort(&mut self, tuple: FourTuple) {
         self.connections.remove(&tuple);
+        self.timers.remove(tuple);
         self.active.remove(&tuple);
         self.discard_queued(tuple);
     }
@@ -372,8 +381,8 @@ impl TcpEngine {
         self.connections.get(&tuple).map(|c| c.tcb.state)
     }
 
-    /// One iteration of the poll loop: drains received frames, ticks
-    /// every connection's timers, and transmits whatever each connection
+    /// One iteration of the poll loop: drains received frames, runs due
+    /// timers, and transmits whatever each runnable connection
     /// (or the ARP layer) now has pending. Returns state-change events
     /// the socket layer may care about. This convenience method returns a
     /// fresh vector; use `poll_into` to retain event storage across polls.
@@ -399,7 +408,16 @@ impl TcpEngine {
         events.clear();
         self.updated.clear();
         self.arp.expire(now);
-        for mbuf in port.rx_packets(MAX_RX_BURST) {
+        let mut gro_packets = [std::ptr::null_mut(); MAX_RX_BURST];
+        let mut gro_count = 0;
+        for mut mbuf in port.rx_packets(MAX_RX_BURST) {
+            if self.rx_gro && super::super::net::gro::prepare(&mut mbuf) {
+                gro_packets[gro_count] = mbuf.into_raw();
+                gro_count += 1;
+                continue;
+            }
+            self.handle_gro(&mut gro_packets, gro_count, now);
+            gro_count = 0;
             // RX checksum offload: if the NIC checked a checksum and it was
             // wrong, drop the frame; if it verified one as good, skip the
             // corresponding software check. When RX offload is off the
@@ -412,12 +430,15 @@ impl TcpEngine {
             self.handle_frame(mbuf, ip_ok, l4_ok, now);
         }
 
+        self.handle_gro(&mut gro_packets, gro_count, now);
         self.flush_tx(port, pool, now);
+
+        self.activate_due(now);
 
         // Process only the connections that need attention this poll.
         // Swap into retained scratch storage. Both phases visit the same
-        // tuples; phase 2 re-inserts those needing another poll into the
-        // now-empty active set. Neither set's allocation is discarded.
+        // tuples; after TX, rescheduling separates runnable work from
+        // future deadlines. Neither set's allocation is discarded.
         std::mem::swap(&mut self.active, &mut self.processing);
 
         // Phase 1: tick timers and drain events. Closed connections remain
@@ -456,16 +477,20 @@ impl TcpEngine {
         let connections = &mut self.connections;
         let config = &self.config;
         let arp = &mut self.arp;
-        let active_set = &mut self.active;
         for &tuple in &self.processing {
             let Some(conn) = connections.get_mut(&tuple) else {
                 continue;
             };
+            if !conn.tcb.has_pending_output() {
+                if conn.tcb.is_closed() {
+                    connections.remove(&tuple);
+                }
+                continue;
+            }
             // Do not consume output until both resolution and bounded
             // local queue space are available. ARP replies are usable this poll.
             let room = MAX_PENDING_TX.saturating_sub(self.tx_batch.len() + self.pending_tx.len());
             if conn.queued_tx != 0 || room == 0 {
-                active_set.insert(tuple);
                 continue;
             }
             let Some(mac) = arp.resolve(config.next_hop(tuple.remote_ip), now) else {
@@ -479,13 +504,13 @@ impl TcpEngine {
                 if now.saturating_duration_since(since) >= ARP_TIMEOUT {
                     connections.remove(&tuple);
                     events.push((tuple, Event::Reset));
-                } else {
-                    active_set.insert(tuple);
                 }
                 continue;
             };
             conn.next_hop = NextHop::Resolved;
             conn.tcb.set_local_mss(local_mss);
+            conn.tcb
+                .set_tx_payload_limit(port.offloads().tso_max_payload);
             conn.tcb
                 .poll_output_limited(now, &mut self.segments, room.min(32));
             // A connection that closed is dropped below, so whatever it
@@ -500,20 +525,19 @@ impl TcpEngine {
                     tuple,
                     mac,
                     header: conn.tcb.to_header(&seg),
+                    tso_mss: if seg.payload.len() > conn.tcb.send_mss() as usize {
+                        conn.tcb.send_mss()
+                    } else {
+                        0
+                    },
                     payload: seg.payload,
                     owned,
                 });
             }
             if !owned {
                 connections.remove(&tuple);
-            } else if conn.tcb.has_pending_output()
-                || conn.tcb.has_armed_timer()
-                || conn.queued_tx != 0
-            {
-                active_set.insert(tuple);
             }
         }
-        self.processing.clear();
 
         for (dst_mac, dst_ip) in self.pending_arp_replies.drain(..) {
             if self.tx_batch.len() + self.pending_tx.len() >= MAX_PENDING_TX {
@@ -560,6 +584,7 @@ impl TcpEngine {
                 &hdr,
                 &Payload::default(),
                 tx_offload,
+                0,
             ) {
                 self.tx_batch.push(mbuf);
                 self.tx_owners.push(None);
@@ -567,6 +592,53 @@ impl TcpEngine {
         }
 
         self.flush_tx(port, pool, now);
+        // NIC acceptance can arm/restart RTO, so schedule only after TX.
+        self.reschedule_processed();
+    }
+
+    fn handle_gro(
+        &mut self,
+        packets: &mut [*mut crate::dpdk::ffi::rte_mbuf],
+        count: usize,
+        now: Instant,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let merged = if count > 1 {
+            unsafe { super::super::net::gro::merge(packets, count) }
+        } else {
+            count
+        };
+        for raw in &packets[..merged] {
+            // SAFETY: GRO returns ownership of each complete output chain exactly once.
+            let packet = unsafe { Mbuf::from_raw(*raw) };
+            self.handle_frame(packet, true, true, now);
+        }
+    }
+
+    fn activate_due(&mut self, now: Instant) {
+        while let Some(tuple) = self.timers.pop_due(now) {
+            self.active.insert(tuple);
+        }
+    }
+
+    fn reschedule_processed(&mut self) {
+        for &tuple in &self.processing {
+            self.active.remove(&tuple);
+            let Some(conn) = self.connections.get(&tuple) else {
+                self.timers.remove(tuple);
+                continue;
+            };
+            self.timers.set(tuple, conn.tcb.next_deadline());
+            if conn.tcb.has_pending_output()
+                || conn.queued_tx != 0
+                || matches!(conn.next_hop, NextHop::Resolving { .. })
+            {
+                self.active.insert(tuple);
+            }
+        }
+        self.processing.clear();
     }
 
     /// Packets retained locally awaiting pool space or NIC acceptance.
@@ -589,6 +661,7 @@ impl TcpEngine {
                 &packet.header,
                 &packet.payload,
                 port.tx_cksum_offload(),
+                packet.tso_mss,
             ) else {
                 break;
             };
@@ -655,17 +728,34 @@ impl TcpEngine {
         if ip_hdr.protocol != ipv4::PROTO_TCP || ip_hdr.dst != self.config.local_ip {
             return;
         }
-        let total_len = (ip_hdr.total_length as usize).min(buf.len());
+        let total_len = ip_hdr.total_length as usize;
+        if total_len + eth::ETH_HDR_LEN > mbuf.pkt_len() as usize
+            || ip_hdr.flags_fragment_offset & 0x3fff != 0
+        {
+            return;
+        }
         if total_len < ipv4::IPV4_HDR_LEN {
             return;
         }
-        let ip_payload = &buf[ipv4::IPV4_HDR_LEN..total_len];
+        let ip_payload = &buf[ipv4::IPV4_HDR_LEN..total_len.min(buf.len())];
+        let chained = mbuf.pkt_len() as usize != mbuf.data().len();
+        if chained && !l4_ok {
+            let seed = super::super::net::checksum::ipv4_pseudo_header_sum(
+                ip_hdr.src,
+                ip_hdr.dst,
+                ipv4::PROTO_TCP,
+                (total_len - ipv4::IPV4_HDR_LEN) as u16,
+            );
+            if super::super::net::checksum::fold(mbuf.checksum_sum(34, total_len - 20, seed)) != 0 {
+                return;
+            }
+        }
         let Some((tcp_hdr, hdr_len)) =
-            tcp::TcpHeader::parse(ip_payload, ip_hdr.src, ip_hdr.dst, !l4_ok)
+            tcp::TcpHeader::parse(ip_payload, ip_hdr.src, ip_hdr.dst, !l4_ok && !chained)
         else {
             return;
         };
-        let segment_payload = &ip_payload[hdr_len..];
+        let payload_len = total_len - ipv4::IPV4_HDR_LEN - hdr_len;
 
         let tuple = FourTuple {
             local_ip: self.config.local_ip,
@@ -677,10 +767,28 @@ impl TcpEngine {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             let start = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + hdr_len;
             let end = eth::ETH_HDR_LEN + total_len;
-            conn.tcb.on_segment_with(
+            conn.tcb.on_segment_chunks_with(
                 &tcp_hdr,
-                segment_payload.len(),
-                || mbuf.into_bytes().slice(start..end),
+                payload_len,
+                || {
+                    let mut skip = start;
+                    let mut remaining = end - start;
+                    mbuf.into_segments().filter_map(move |segment| {
+                        let len = segment.data_len() as usize;
+                        if skip >= len {
+                            skip -= len;
+                            return None;
+                        }
+                        let n = remaining.min(len - skip);
+                        if n == 0 {
+                            return None;
+                        }
+                        let bytes = segment.into_bytes().slice(skip..skip + n);
+                        skip = 0;
+                        remaining -= n;
+                        Some(bytes)
+                    })
+                },
                 now,
             );
             if conn.tcb.is_closed() {
@@ -695,7 +803,8 @@ impl TcpEngine {
         let is_bare_syn = tcp_hdr.has_flag(tcp::flags::SYN) && !tcp_hdr.has_flag(tcp::flags::ACK);
         if is_bare_syn && self.listeners.contains(&tcp_hdr.dst_port) {
             let peer_mss = tcp_hdr.options.mss.unwrap_or(536);
-            let tcb = Tcb::new_from_listen(tuple, Seq::new(tcp_hdr.seq), peer_mss);
+            let mut tcb = Tcb::new_from_listen(tuple, Seq::new(tcp_hdr.seq), peer_mss);
+            tcb.set_peer_scale(tcp_hdr.options.window_scale);
             self.connections
                 .insert(tuple, Conn::new(tcb, AcceptState::AwaitingHandshake));
             self.mark_active(tuple); // has a SYN-ACK to send
@@ -705,7 +814,7 @@ impl TcpEngine {
         // RFC 9293 §3.10.7.1: a segment addressed to no listener/connection
         // gets reset, unless it's an RST itself (which would just loop).
         if !tcp_hdr.has_flag(tcp::flags::RST) {
-            self.send_reset_for_unknown(&tcp_hdr, segment_payload.len(), ip_hdr.src, now);
+            self.send_reset_for_unknown(&tcp_hdr, payload_len, ip_hdr.src, now);
         }
     }
 
@@ -766,9 +875,59 @@ fn build_ip_tcp_frame(
     tcp_hdr: &tcp::TcpHeader,
     payload: &Payload,
     tx_cksum_offload: bool,
+    tso_mss: u16,
 ) -> Option<Mbuf> {
     let tcp_len = tcp_hdr.wire_len();
     let total_len = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + tcp_len + payload.len();
+
+    if tso_mss != 0 {
+        let mut head = Mbuf::alloc(pool)?;
+        let header_len = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + tcp_len;
+        let buf = head.append(header_len as u16)?;
+        eth::EthHeader {
+            dst: remote_mac,
+            src: local_mac,
+            ethertype: eth::ETHERTYPE_IPV4,
+        }
+        .write(buf);
+        ipv4::Ipv4Header {
+            dscp_ecn: 0,
+            total_length: (total_len - eth::ETH_HDR_LEN) as u16,
+            identification: 0,
+            flags_fragment_offset: 0x4000,
+            ttl: 64,
+            protocol: ipv4::PROTO_TCP,
+            src: local_ip,
+            dst: remote_ip,
+        }
+        .write(&mut buf[14..34], true);
+        tcp_hdr.write(&mut buf[34..], &[], local_ip, remote_ip, true);
+        // TSO pseudo header excludes length: the device adds each wire segment's length.
+        let seed = super::super::net::checksum::ipv4_pseudo_header_sum(
+            local_ip,
+            remote_ip,
+            ipv4::PROTO_TCP,
+            0,
+        );
+        buf[50..52].copy_from_slice(&super::super::net::checksum::fold_raw(seed).to_be_bytes());
+        // Fill pool-backed segments once; never flatten the payload into a temporary buffer.
+        let mut tail = Mbuf::alloc(pool)?;
+        for chunk in payload.chunks() {
+            let mut data = &chunk[..];
+            while !data.is_empty() {
+                if tail.tailroom() == 0 {
+                    head.chain(tail).ok()?;
+                    tail = Mbuf::alloc(pool)?;
+                }
+                let n = data.len().min(tail.tailroom() as usize);
+                tail.append(n as u16)?.copy_from_slice(&data[..n]);
+                data = &data[n..];
+            }
+        }
+        head.chain(tail).ok()?;
+        head.set_tx_tso(tcp_len as u16, tso_mss);
+        return Some(head);
+    }
 
     let mut mbuf = Mbuf::alloc(pool)?;
     mbuf.reset();
@@ -862,6 +1021,300 @@ mod tests {
 
     fn cfg(local: &str, gateway: Option<&str>) -> EngineConfig {
         EngineConfig::from_cli(EthAddr::ZERO, local, gateway).unwrap()
+    }
+
+    fn established_tcb(port: u16, now: Instant) -> (Tcb, tcp::TcpHeader) {
+        let tuple = FourTuple {
+            local_ip: Ipv4Addr::new(10, 0, 0, 1),
+            local_port: port,
+            remote_ip: Ipv4Addr::new(10, 0, 0, 2),
+            remote_port: 80,
+        };
+        let mut tcb = Tcb::new_active(tuple);
+        let syn = tcb.poll_output(now).remove(0);
+        let mut peer = tcp::TcpHeader {
+            src_port: 80,
+            dst_port: port,
+            seq: 100,
+            ack: syn.seq.0.wrapping_add(1),
+            flags: tcp::flags::SYN | tcp::flags::ACK,
+            window: u16::MAX,
+            urgent_pointer: 0,
+            options: tcp::TcpOptions::default(),
+        };
+        tcb.on_segment(&peer, Bytes::new(), now);
+        tcb.poll_output(now);
+        peer.seq += 1;
+        peer.flags = tcp::flags::ACK;
+        (tcb, peer)
+    }
+
+    fn schedule_tcb(engine: &mut TcpEngine, tcb: Tcb) -> FourTuple {
+        let tuple = tcb.tuple;
+        engine
+            .connections
+            .insert(tuple, Conn::new(tcb, AcceptState::NotApplicable));
+        engine.processing.insert(tuple);
+        engine.reschedule_processed();
+        tuple
+    }
+
+    #[test]
+    fn native_chains_tso_and_gro_preserve_payload_and_reclaim_pool() {
+        use crate::dpdk::net::{checksum, gro};
+        use crate::dpdk::{eal, ffi};
+        let cpu = unsafe { libc::sched_getcpu() };
+        eal::init(&[
+            "offload-test",
+            "--no-huge",
+            "--no-pci",
+            "--no-shconf",
+            "--no-telemetry",
+            "--lcores",
+            &format!("0@{cpu}"),
+        ])
+        .unwrap();
+        {
+            let pool = Mempool::create("offload-test", 1023, 0, 2176, -1).unwrap();
+            let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
+            let baseline = available();
+            let now = Instant::now();
+            let (tcb, peer) = established_tcb(1234, now);
+            let mut header = peer.clone();
+            header.flags = tcp::flags::ACK;
+            let payload = Payload::from(Bytes::from(vec![42; 8193]));
+            let packet = build_ip_tcp_frame(
+                &pool,
+                EthAddr::ZERO,
+                EthAddr::ZERO,
+                tcb.tuple.remote_ip,
+                tcb.tuple.local_ip,
+                &header,
+                &payload,
+                true,
+                1460,
+            )
+            .unwrap();
+            assert_eq!(packet.pkt_len(), 8193 + 54);
+            assert!(packet.segments().count() > 1);
+            assert!(packet.ol_flags() & ffi::RTE_MBUF_F_TX_TCP_SEG != 0);
+            let wire: Vec<u8> = packet.segments().flatten().copied().collect();
+            assert_eq!(&wire[54..], vec![42; 8193]);
+            assert_eq!(
+                u16::from_be_bytes([wire[50], wire[51]]),
+                checksum::fold_raw(checksum::ipv4_pseudo_header_sum(
+                    tcb.tuple.remote_ip,
+                    tcb.tuple.local_ip,
+                    ipv4::PROTO_TCP,
+                    0
+                ))
+            );
+            // Simulate the device's segmentation and checksum completion.
+            for (index, data) in wire[54..].chunks(1460).enumerate() {
+                let mut h = header.clone();
+                h.seq += (index * 1460) as u32;
+                let mut segment = vec![0; 20 + data.len()];
+                h.write(
+                    &mut segment[..20],
+                    data,
+                    tcb.tuple.remote_ip,
+                    tcb.tuple.local_ip,
+                    false,
+                );
+                segment[20..].copy_from_slice(data);
+                assert!(
+                    tcp::TcpHeader::parse(&segment, tcb.tuple.remote_ip, tcb.tuple.local_ip, true)
+                        .is_some()
+                );
+            }
+            // Early iterator drop must free the unconsumed chain too.
+            let mut segments = packet.into_segments();
+            drop(segments.next());
+            drop(segments);
+            assert_eq!(available(), baseline);
+
+            let mut engine = TcpEngine::new(EngineConfig {
+                local_ip: tcb.tuple.local_ip,
+                local_mac: EthAddr::ZERO,
+                gateway: None,
+            });
+            let tuple = schedule_tcb(&mut engine, tcb);
+            let mut raw = [std::ptr::null_mut(); 3];
+            for (i, slot) in raw.iter_mut().enumerate() {
+                let data = Payload::from(Bytes::from(vec![i as u8; 1001]));
+                header.seq = peer.seq + (i * 1001) as u32;
+                let mut packet = build_ip_tcp_frame(
+                    &pool,
+                    EthAddr::ZERO,
+                    EthAddr::ZERO,
+                    tuple.remote_ip,
+                    tuple.local_ip,
+                    &header,
+                    &data,
+                    false,
+                    0,
+                )
+                .unwrap();
+                assert!(gro::prepare(&mut packet));
+                *slot = packet.into_raw();
+            }
+            let count = unsafe { gro::merge(&mut raw, 3) };
+            assert_eq!(
+                count, 1,
+                "contiguous packets must merge within the RX burst"
+            );
+            let packet = unsafe { Mbuf::from_raw(raw[0]) };
+            assert_eq!(packet.pkt_len(), 54 + 3003);
+            engine.handle_frame(packet, true, true, now);
+            let mut received = Vec::new();
+            while engine.readable_len(tuple) != 0 {
+                received.extend_from_slice(&engine.recv(tuple, 65536));
+            }
+            assert_eq!(received.len(), 3003);
+            for (i, chunk) in received.chunks(1001).enumerate() {
+                assert!(chunk.iter().all(|b| *b == i as u8));
+            }
+            assert_eq!(available(), baseline);
+
+            // Corrupted payloads are never eligible for GRO or accepted by TCP.
+            let data = Payload::from(Bytes::from_static(b"corrupt"));
+            header.seq = peer.seq + 3003;
+            let mut packet = build_ip_tcp_frame(
+                &pool,
+                EthAddr::ZERO,
+                EthAddr::ZERO,
+                tuple.remote_ip,
+                tuple.local_ip,
+                &header,
+                &data,
+                false,
+                0,
+            )
+            .unwrap();
+            packet.data_mut()[54] ^= 1;
+            assert!(!gro::prepare(&mut packet));
+            engine.handle_frame(packet, false, false, now);
+            assert_eq!(engine.readable_len(tuple), 0);
+            assert_eq!(available(), baseline);
+        }
+        eal::cleanup();
+    }
+
+    #[test]
+    fn three_hundred_time_wait_connections_do_no_work_until_due() {
+        let now = Instant::now();
+        let mut engine = TcpEngine::new(EngineConfig::default());
+        let mut deadline = now;
+        for port in 1000..1300 {
+            let (mut tcb, mut peer) = established_tcb(port, now);
+            tcb.close();
+            let fin = tcb.poll_output(now).remove(0);
+            peer.ack = fin.seq.0.wrapping_add(1);
+            peer.flags |= tcp::flags::FIN;
+            tcb.on_segment(&peer, Bytes::new(), now);
+            tcb.poll_output(now); // final ACK
+            assert_eq!(tcb.state, TcpState::TimeWait);
+            deadline = tcb.next_deadline().unwrap();
+            schedule_tcb(&mut engine, tcb);
+        }
+        assert!(engine.active.is_empty());
+        for _ in 0..1000 {
+            engine.activate_due(deadline - Duration::from_nanos(1));
+            assert!(
+                engine.active.is_empty(),
+                "future timers must not enter either poll phase"
+            );
+        }
+        engine.activate_due(deadline);
+        assert_eq!(engine.active.len(), 300);
+        for tuple in &engine.active {
+            let conn = engine.connections.get_mut(tuple).unwrap();
+            conn.tcb.tick(deadline);
+            assert!(conn.tcb.is_closed());
+        }
+    }
+
+    #[test]
+    fn retransmitted_fin_moves_time_wait_deadline_without_stale_wakeup() {
+        let now = Instant::now();
+        let mut engine = TcpEngine::new(EngineConfig::default());
+        let (mut tcb, mut peer) = established_tcb(1234, now);
+        tcb.close();
+        let fin = tcb.poll_output(now).remove(0);
+        peer.ack = fin.seq.0.wrapping_add(1);
+        peer.flags |= tcp::flags::FIN;
+        tcb.on_segment(&peer, Bytes::new(), now);
+        tcb.poll_output(now);
+        let old_deadline = tcb.next_deadline().unwrap();
+        let tuple = schedule_tcb(&mut engine, tcb);
+        let later = now + Duration::from_secs(1);
+        let conn = engine.connections.get_mut(&tuple).unwrap();
+        conn.tcb.on_segment(&peer, Bytes::new(), later);
+        conn.tcb.poll_output(later);
+        let new_deadline = conn.tcb.next_deadline().unwrap();
+        assert!(new_deadline > old_deadline);
+        engine.mark_active(tuple);
+        engine.processing.insert(tuple);
+        engine.reschedule_processed();
+        engine.activate_due(old_deadline);
+        assert!(engine.active.is_empty());
+        engine.activate_due(new_deadline);
+        assert!(engine.active.contains(&tuple));
+    }
+
+    #[test]
+    fn retransmit_and_persist_sleep_until_their_deadline() {
+        let now = Instant::now();
+        for persist in [false, true] {
+            let mut engine = TcpEngine::new(EngineConfig::default());
+            let (mut tcb, mut peer) = established_tcb(1234, now);
+            if persist {
+                peer.window = 0;
+                tcb.on_segment(&peer, Bytes::new(), now);
+            }
+            tcb.send(Bytes::from_static(b"payload"));
+            tcb.poll_output(now);
+            let deadline = tcb.next_deadline().unwrap();
+            let tuple = schedule_tcb(&mut engine, tcb);
+            assert!(engine.active.is_empty());
+            engine.activate_due(deadline - Duration::from_nanos(1));
+            assert!(engine.active.is_empty());
+            engine.activate_due(deadline);
+            assert!(engine.active.contains(&tuple));
+            let conn = engine.connections.get_mut(&tuple).unwrap();
+            conn.tcb.tick(deadline);
+            assert!(!conn.tcb.poll_output(deadline).is_empty());
+        }
+    }
+
+    #[test]
+    fn packet_activity_cancels_old_deadline_and_abort_cannot_wake_reused_tuple() {
+        let now = Instant::now();
+        let mut engine = TcpEngine::new(EngineConfig::default());
+        let (mut tcb, mut peer) = established_tcb(1234, now);
+        tcb.send(Bytes::from_static(b"payload"));
+        let packet = tcb.poll_output(now).remove(0);
+        let deadline = tcb.next_deadline().unwrap();
+        let tuple = schedule_tcb(&mut engine, tcb);
+        peer.ack = (packet.seq + packet.payload.len() as u32).0;
+        engine
+            .connections
+            .get_mut(&tuple)
+            .unwrap()
+            .tcb
+            .on_segment(&peer, Bytes::new(), now);
+        engine.mark_active(tuple);
+        engine.processing.insert(tuple);
+        engine.reschedule_processed();
+        engine.activate_due(deadline);
+        assert!(engine.active.is_empty());
+        // An aborted timer must not later activate a new connection with the same tuple.
+        engine.timers.set(tuple, Some(deadline));
+        engine.abort(tuple);
+        let (tcb, _) = established_tcb(1234, now);
+        schedule_tcb(&mut engine, tcb);
+        engine.activate_due(deadline);
+        assert!(engine.active.is_empty());
     }
 
     #[test]

@@ -22,6 +22,7 @@
 #include <rte_ether.h>
 #include <rte_ip.h>
 #include <rte_tcp.h>
+#include <rte_gro.h>
 #include <rte_udp.h>
 #include <rte_arp.h>
 #include <rte_byteorder.h>

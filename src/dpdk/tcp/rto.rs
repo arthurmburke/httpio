@@ -139,6 +139,16 @@ impl RetransmitQueue {
                     sample = now.checked_duration_since(seg.first_sent_at);
                 }
             } else {
+                // Large TSO ranges can be cumulatively ACKed a segment at a time.
+                let front = self.segments.front_mut().unwrap();
+                if !front.syn && front.seq.lt(snd_una) {
+                    let n = snd_una.distance(front.seq) as usize;
+                    if n <= front.data.len() {
+                        front.data = front.data.slice(n, front.data.len() - n);
+                        front.seq = snd_una;
+                        self.payload_bytes -= n;
+                    }
+                }
                 break;
             }
         }
