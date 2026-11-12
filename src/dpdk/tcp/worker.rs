@@ -22,7 +22,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -51,7 +51,78 @@ const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // Per-connection rings stay SPSC: exactly one thread owns each end (the
 // thread driving that connection's `TcpStream`, and the worker lcore).
-pub type CmdTx = SpscTx<Command, CMD_CAP>;
+/// Maximum queued plus unacknowledged application bytes per connection.
+pub const SEND_CAPACITY: usize = 256 * 1024;
+
+pub(crate) struct SendCredit {
+    pub(crate) bytes: AtomicUsize,
+    pub(crate) failed: AtomicBool,
+}
+
+pub struct CmdTx {
+    ring: SpscTx<Command, CMD_CAP>,
+    outstanding: Arc<SendCredit>,
+}
+
+impl CmdTx {
+    pub fn failed(&self) -> bool {
+        self.outstanding.failed.load(Ordering::Acquire)
+    }
+    pub fn available_bytes(&self) -> usize {
+        SEND_CAPACITY.saturating_sub(self.outstanding.bytes.load(Ordering::Acquire))
+    }
+    pub fn len(&self) -> usize {
+        self.ring.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty()
+    }
+    pub fn capacity(&self) -> usize {
+        self.ring.capacity()
+    }
+    pub fn is_closed(&self) -> bool {
+        self.ring.is_closed()
+    }
+
+    /// Send commands also reserve byte credit, released only after ACK or discard.
+    pub fn push(&self, cmd: Command) -> Result<(), Command> {
+        let bytes = match &cmd {
+            Command::Send(b) => b.len(),
+            _ => 0,
+        };
+        if self.is_closed() || self.failed() || bytes > self.available_bytes() {
+            return Err(cmd);
+        }
+        if bytes != 0 {
+            self.outstanding.bytes.fetch_add(bytes, Ordering::AcqRel);
+        }
+        match self.ring.push(cmd) {
+            Ok(()) => Ok(()),
+            Err(cmd) => {
+                if bytes != 0 {
+                    self.outstanding.bytes.fetch_sub(bytes, Ordering::AcqRel);
+                }
+                Err(cmd)
+            }
+        }
+    }
+}
+
+pub(crate) fn command_channel() -> (CmdTx, CmdRx, Arc<SendCredit>) {
+    let (ring, rx) = spsc::channel();
+    let outstanding = Arc::new(SendCredit {
+        bytes: AtomicUsize::new(0),
+        failed: AtomicBool::new(false),
+    });
+    (
+        CmdTx {
+            ring,
+            outstanding: outstanding.clone(),
+        },
+        rx,
+        outstanding,
+    )
+}
 pub type CmdRx = SpscRx<Command, CMD_CAP>;
 pub type InboundTx = SpscTx<Inbound, IN_CAP>;
 pub type InboundRx = SpscRx<Inbound, IN_CAP>;
@@ -103,13 +174,16 @@ struct NewConn {
     local_port: u16,
     nodelay: bool,
     cmd_rx: CmdRx,
+    outstanding: Arc<SendCredit>,
     inbound_tx: InboundTx,
 }
 
 /// Worker-side per-connection state.
 struct WorkerConn {
+    engine_bytes: usize,
     tuple: FourTuple,
     cmd_rx: CmdRx,
+    outstanding: Arc<SendCredit>,
     inbound_tx: InboundTx,
     /// A received chunk the inbound ring was too full to accept; retried
     /// before pulling more from the engine so no bytes are dropped.
@@ -130,6 +204,37 @@ struct WorkerConn {
 }
 
 impl WorkerConn {
+    fn release_credit(&mut self, engine: &TcpEngine) {
+        let remaining = engine.buffered_send_bytes(self.tuple);
+        let released = self.engine_bytes - remaining;
+        if released != 0 {
+            self.outstanding.bytes.fetch_sub(released, Ordering::AcqRel);
+        }
+        self.engine_bytes = remaining;
+    }
+
+    fn retain_after_drop(&mut self, engine: &mut TcpEngine, now: Instant) -> bool {
+        if !self.cmd_rx.is_closed() {
+            return true;
+        }
+        let deadline = *self.deadline.get_or_insert(now + REAP_TIMEOUT);
+        if !self.closing {
+            self.closing = true;
+            engine.close(self.tuple);
+        }
+        if matches!(
+            engine.state(self.tuple),
+            None | Some(TcpState::Closed | TcpState::TimeWait)
+        ) {
+            return false;
+        }
+        if now >= deadline {
+            engine.abort(self.tuple);
+            return false;
+        }
+        true
+    }
+
     fn on_event(&mut self, ev: Event) {
         match ev {
             Event::Established => {
@@ -141,6 +246,7 @@ impl WorkerConn {
             }
             Event::PeerClosed => self.peer_fin = true,
             Event::Reset => {
+                self.outstanding.failed.store(true, Ordering::Release);
                 // Distinguish a failed handshake from a reset of an
                 // established connection so the app reports the right
                 // error.
@@ -155,6 +261,7 @@ impl WorkerConn {
                 // an established-then-closed connection is delivered as
                 // EOF via the peer_fin path below.
                 if !self.established {
+                    self.outstanding.failed.store(true, Ordering::Release);
                     self.terminal.get_or_insert(Inbound::ConnectFailed);
                 }
             }
@@ -242,7 +349,7 @@ impl WorkerHandle {
         local_port: u16,
         nodelay: bool,
     ) -> Option<ConnEndpoints> {
-        let (cmd_tx, cmd_rx) = spsc::channel::<Command, CMD_CAP>();
+        let (cmd_tx, cmd_rx, outstanding) = command_channel();
         let (inbound_tx, inbound_rx) = spsc::channel::<Inbound, IN_CAP>();
 
         let mut msg = NewConn {
@@ -251,6 +358,7 @@ impl WorkerHandle {
             local_port,
             nodelay,
             cmd_rx,
+            outstanding,
             inbound_tx,
         };
         // Control-ring pushes only fail if the worker has stalled; a short
@@ -320,6 +428,8 @@ fn run(
                 WorkerConn {
                     tuple,
                     cmd_rx: nc.cmd_rx,
+                    outstanding: nc.outstanding,
+                    engine_bytes: 0,
                     inbound_tx: nc.inbound_tx,
                     pending_in: None,
                     established: false,
@@ -343,7 +453,10 @@ fn run(
         for conn in conns.values_mut() {
             while let Some(cmd) = conn.cmd_rx.pop() {
                 match cmd {
-                    Command::Send(data) => engine.send(conn.tuple, data),
+                    Command::Send(data) => {
+                        conn.engine_bytes += data.len();
+                        engine.send(conn.tuple, data);
+                    }
                     Command::SetCork(c) => engine.set_cork(conn.tuple, c),
                     Command::Flush => engine.flush(conn.tuple),
                     Command::Close => {
@@ -365,6 +478,7 @@ fn run(
 
         // 4. Deliver received bytes, then the terminal signal, to the app.
         for conn in conns.values_mut() {
+            conn.release_credit(&engine);
             // Retry a previously un-pushable chunk first.
             if let Some(pending) = conn.pending_in.take()
                 && let Err(Inbound::Data(b)) = conn.inbound_tx.push(Inbound::Data(pending))
@@ -407,22 +521,8 @@ fn run(
         // 5. Reap connections whose app-side handle is gone. Close the
         //    engine side (idempotent) and drop the worker state; the
         //    engine finishes any TIME_WAIT on its own.
-        conns.retain(|_, conn| {
-            let app_gone = conn.cmd_rx.is_closed();
-            if app_gone {
-                if !conn.closing {
-                    engine.close(conn.tuple);
-                    // Set the deadline for the connection to be reaped if the peer does not send a FIN.
-                    conn.deadline = Some(Instant::now() + REAP_TIMEOUT);
-                }
-                // Keep it only until the engine no longer tracks it, so a
-                // trailing FIN/ACK still gets sent.
-                return matches!(engine.state(conn.tuple), Some(s) if s != TcpState::Closed) ||
-                    // If the engine has closed it, but the peer hasn't sent a FIN, we wait for the deadline to expire before reaping.
-                    conn.deadline.map_or(false, |deadline| Instant::now() < deadline);
-            }
-            true
-        });
+        let now = Instant::now();
+        conns.retain(|_, conn| conn.retain_after_drop(&mut engine, now));
     }
 }
 
@@ -430,10 +530,93 @@ fn run(
 mod tests {
     use super::*;
 
+    fn fixture() -> (CmdTx, WorkerConn, TcpEngine) {
+        let (tx, cmd_rx, outstanding) = command_channel();
+        let (inbound_tx, _rx) = spsc::channel();
+        let mut engine = TcpEngine::new(super::super::engine::EngineConfig::default());
+        let tuple = engine
+            .connect(Ipv4Addr::new(10, 0, 0, 2), 80, 1234)
+            .unwrap();
+        let conn = WorkerConn {
+            tuple,
+            cmd_rx,
+            outstanding,
+            engine_bytes: 0,
+            inbound_tx,
+            pending_in: None,
+            established: false,
+            peer_fin: false,
+            terminal: None,
+            end_sent: false,
+            closing: false,
+            deadline: None,
+        };
+        (tx, conn, engine)
+    }
+
+    #[test]
+    fn dropped_connection_deadline_is_fixed_and_aborts_live_engine() {
+        for already_closing in [false, true] {
+            let (tx, mut conn, mut engine) = fixture();
+            conn.closing = already_closing;
+            drop(tx);
+            let now = Instant::now();
+            assert!(conn.retain_after_drop(&mut engine, now));
+            assert!(conn.closing);
+            assert!(conn.retain_after_drop(&mut engine, now + REAP_TIMEOUT / 2));
+            assert_eq!(conn.deadline, Some(now + REAP_TIMEOUT));
+            assert!(!conn.retain_after_drop(&mut engine, now + REAP_TIMEOUT));
+            assert_eq!(engine.state(conn.tuple), None);
+        }
+    }
+
+    #[test]
+    fn dropped_connection_is_reaped_immediately_when_engine_finishes() {
+        let (tx, mut conn, mut engine) = fixture();
+        drop(tx);
+        let now = Instant::now();
+        assert!(conn.retain_after_drop(&mut engine, now));
+        engine.abort(conn.tuple);
+        assert!(!conn.retain_after_drop(&mut engine, now));
+    }
+
+    #[test]
+    fn moving_commands_to_engine_does_not_restore_send_credit() {
+        let (tx, mut conn, mut engine) = fixture();
+        assert!(
+            tx.push(Command::Send(Bytes::from(vec![0; SEND_CAPACITY])))
+                .is_ok()
+        );
+        let Some(Command::Send(bytes)) = conn.cmd_rx.pop() else {
+            panic!()
+        };
+        conn.engine_bytes += bytes.len();
+        engine.send(conn.tuple, bytes);
+        conn.release_credit(&engine);
+        assert!(tx.is_empty());
+        assert_eq!(tx.available_bytes(), 0);
+        assert!(tx.push(Command::Send(Bytes::from_static(b"x"))).is_err());
+        // Control commands must still get through when byte credit is exhausted.
+        assert!(tx.push(Command::Flush).is_ok());
+        engine.abort(conn.tuple);
+        conn.release_credit(&engine);
+        assert_eq!(tx.available_bytes(), SEND_CAPACITY);
+    }
+
+    #[test]
+    fn full_command_ring_rolls_back_reserved_credit() {
+        let (tx, _rx, _) = command_channel();
+        for _ in 0..tx.capacity() {
+            assert!(tx.push(Command::Flush).is_ok());
+        }
+        assert!(tx.push(Command::Send(Bytes::from_static(b"x"))).is_err());
+        assert_eq!(tx.available_bytes(), SEND_CAPACITY);
+    }
+
     #[test]
     fn abort_notifies_both_connecting_and_established_readers() {
         for established in [false, true] {
-            let (_cmd_tx, cmd_rx) = spsc::channel::<Command, CMD_CAP>();
+            let (cmd_tx, cmd_rx, outstanding) = command_channel();
             let (inbound_tx, _inbound_rx) = spsc::channel::<Inbound, IN_CAP>();
             let mut conn = WorkerConn {
                 tuple: FourTuple {
@@ -443,6 +626,8 @@ mod tests {
                     remote_port: 80,
                 },
                 cmd_rx,
+                outstanding,
+                engine_bytes: 0,
                 inbound_tx,
                 pending_in: None,
                 established,
@@ -453,6 +638,12 @@ mod tests {
                 deadline: None,
             };
             conn.on_event(Event::Reset);
+            assert!(cmd_tx.failed());
+            assert!(
+                cmd_tx
+                    .push(Command::Send(Bytes::from_static(b"x")))
+                    .is_err()
+            );
             if established {
                 assert!(matches!(conn.terminal, Some(Inbound::Reset)));
             } else {

@@ -95,6 +95,7 @@ impl UnackedSegment {
 
 #[derive(Default)]
 pub struct RetransmitQueue {
+    payload_bytes: usize,
     pub segments: std::collections::VecDeque<UnackedSegment>,
 }
 
@@ -106,9 +107,11 @@ impl RetransmitQueue {
     /// silently dropped if the first transmission is lost (e.g. to an
     /// unresolved ARP entry).
     pub fn push(&mut self, seq: Seq, data: impl Into<Payload>, syn: bool, fin: bool, now: Instant) {
+        let data = data.into();
+        self.payload_bytes += data.len();
         self.segments.push_back(UnackedSegment {
             seq,
-            data: data.into(),
+            data,
             syn,
             fin,
             first_sent_at: now,
@@ -126,6 +129,7 @@ impl RetransmitQueue {
         while let Some(front) = self.segments.front() {
             if front.end_seq().leq(snd_una) {
                 let seg = self.segments.pop_front().unwrap();
+                self.payload_bytes -= seg.data.len();
                 if !seg.retransmitted && sample.is_none() {
                     sample = now.checked_duration_since(seg.first_sent_at);
                 }
@@ -134,6 +138,10 @@ impl RetransmitQueue {
             }
         }
         sample
+    }
+
+    pub fn payload_bytes(&self) -> usize {
+        self.payload_bytes
     }
 
     pub fn is_empty(&self) -> bool {

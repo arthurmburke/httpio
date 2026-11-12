@@ -217,6 +217,19 @@ impl TcpEngine {
         self.accept_queues.get_mut(&port)?.pop_front()
     }
 
+    pub(crate) fn buffered_send_bytes(&self, tuple: FourTuple) -> usize {
+        self.connections
+            .get(&tuple)
+            .map_or(0, Tcb::buffered_send_bytes)
+    }
+
+    /// Discards an abandoned connection and all its retained buffers.
+    pub(crate) fn abort(&mut self, tuple: FourTuple) {
+        self.connections.remove(&tuple);
+        self.active.remove(&tuple);
+        self.pending_accept.remove(&tuple);
+    }
+
     pub fn send(&mut self, tuple: FourTuple, data: Bytes) {
         if let Some(tcb) = self.connections.get_mut(&tuple) {
             tcb.send(data);

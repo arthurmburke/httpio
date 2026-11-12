@@ -180,30 +180,48 @@ impl TcpStream {
         poll_fn(|cx| self.poll_send(cx, &mut data)).await
     }
 
-    /// Poll form of [`send`](Self::send). On success `data` is taken; while
-    /// the command ring is full it is left in place for the next poll.
+    /// Poll form of [`send`](Self::send). On success `data` is taken.
+    /// On Pending it holds the unsent suffix; cancellation may leave a prefix sent.
     pub fn poll_send(
         &mut self,
         cx: &mut Context<'_>,
         data: &mut Option<Bytes>,
     ) -> Poll<io::Result<()>> {
         self.drain_inbound();
-        if self.got_reset {
+        if self.got_reset || self.cmd_tx.failed() {
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
-        let bytes = data.take().expect("poll_send polled without a payload");
-        match self.cmd_tx.push(Command::Send(bytes)) {
+        self.drain_flush();
+        if self.cmd_tx.is_closed() {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        let bytes = data.as_mut().expect("poll_send polled without a payload");
+        if bytes.is_empty() {
+            data.take();
+            return Poll::Ready(Ok(()));
+        }
+        let n = bytes.len().min(self.cmd_tx.available_bytes());
+        if n == 0 || self.cmd_tx.len() == self.cmd_tx.capacity() {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        // Retain the unsent suffix in the caller's Option across polls.
+        match self.cmd_tx.push(Command::Send(bytes.slice(..n))) {
             Ok(()) => {
-                self.drain_flush();
-                Poll::Ready(Ok(()))
+                bytes.advance(n);
+                if bytes.is_empty() {
+                    data.take();
+                    self.drain_flush();
+                    Poll::Ready(Ok(()))
+                } else {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
             }
-            // Ring full: recover the payload so the caller retries the move.
-            Err(Command::Send(bytes)) => {
-                *data = Some(bytes);
+            Err(_) => {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            Err(_) => unreachable!("only Command::Send is pushed here"),
         }
     }
 
@@ -267,7 +285,7 @@ impl TcpStream {
         }
     }
 
-    /// Drains all currently-available inbound messages into local state.
+    /// Processes control messages, staging at most one data chunk.
     fn drain_inbound(&mut self) {
         // Sample closed-ness *before* draining: the worker pushes its last
         // messages and only then drops its sender, so if the ring is closed
@@ -276,7 +294,10 @@ impl TcpStream {
         // pushed in between are still queued.) `is_closed()` is true when
         // either end is dropped; from the receiver that means the sender.
         let sender_gone = self.inbound_rx.is_closed();
-        while let Some(msg) = self.inbound_rx.pop() {
+        while self.read_queue.is_empty() {
+            let Some(msg) = self.inbound_rx.pop() else {
+                break;
+            };
             match msg {
                 Inbound::Established => self.established = true,
                 Inbound::Data(bytes) => {
@@ -299,7 +320,7 @@ impl TcpStream {
         // treat as EOF so a stuck reader unblocks -- but only because the
         // ring was already closed before the drain above, so it is now
         // known to be empty.
-        if sender_gone {
+        if sender_gone && self.inbound_rx.is_empty() {
             self.got_eof = true;
         }
     }
@@ -326,6 +347,10 @@ impl AsyncRead for TcpStream {
         let this = self.get_mut();
         this.drain_flush();
         this.drain_inbound();
+
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
 
         // Copy as much queued data as fits.
         let mut wrote = false;
@@ -365,26 +390,35 @@ impl AsyncWrite for TcpStream {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         this.drain_inbound();
-        if this.got_reset {
+        if this.got_reset || this.cmd_tx.failed() {
             return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
         }
 
-        // Only this producer can consume free slots. The consumer can
-        // only make more room, so no payload copy is needed on a full ring.
+        this.drain_flush();
+        if this.cmd_tx.is_closed() {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if data.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        // Check both limits before allocating or copying the payload.
         if this.cmd_tx.len() == this.cmd_tx.capacity() {
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-
-        // One command carries the whole write; the engine's send buffer is
-        // unbounded, so backpressure is only the command ring being full.
+        let n = data.len().min(this.cmd_tx.available_bytes());
+        if n == 0 {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        // Copy only the prefix covered by byte credit.
         match this
             .cmd_tx
-            .push(Command::Send(Bytes::copy_from_slice(data)))
+            .push(Command::Send(Bytes::copy_from_slice(&data[..n])))
         {
             Ok(()) => {
                 this.drain_flush();
-                Poll::Ready(Ok(data.len()))
+                Poll::Ready(Ok(n))
             }
             Err(_full) => {
                 cx.waker().wake_by_ref();
@@ -403,6 +437,9 @@ impl AsyncWrite for TcpStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.cmd_tx.is_closed() || this.cmd_tx.failed() {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
         // Half-close: enqueue a FIN. Reading may continue afterward.
         match this.cmd_tx.push(Command::Close) {
             Ok(()) => Poll::Ready(Ok(())),
@@ -417,3 +454,149 @@ impl AsyncWrite for TcpStream {
 // Dropping the stream drops its command sender; the worker observes the
 // closed ring and closes the engine-side connection (sending a FIN), so
 // no explicit teardown message is needed here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::spsc;
+    use crate::dpdk::tcp::worker::SendCredit;
+    use crate::dpdk::tcp::worker::{CmdRx, InboundTx, SEND_CAPACITY, command_channel};
+
+    fn fixture() -> (TcpStream, CmdRx, InboundTx, Arc<SendCredit>) {
+        let (cmd_tx, cmd_rx, credit) = command_channel();
+        let (inbound_tx, inbound_rx) = spsc::channel();
+        (
+            TcpStream {
+                cmd_tx,
+                inbound_rx,
+                flush: None,
+                established: true,
+                read_queue: VecDeque::new(),
+                got_eof: false,
+                got_reset: false,
+                addr_in_use: false,
+            },
+            cmd_rx,
+            inbound_tx,
+            credit,
+        )
+    }
+
+    #[test]
+    fn writes_stop_at_byte_limit_even_after_worker_drains_ring() {
+        let (mut stream, rx, _tx, credit) = fixture();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let data = vec![42; SEND_CAPACITY + 10];
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, &data),
+            Poll::Ready(Ok(SEND_CAPACITY))
+        ));
+        let Some(Command::Send(sent)) = rx.pop() else {
+            panic!()
+        };
+        assert_eq!(sent.len(), SEND_CAPACITY);
+        assert!(
+            Pin::new(&mut stream)
+                .poll_write(&mut cx, &data)
+                .is_pending()
+        );
+        // Simulate the worker publishing ACK credit.
+        credit.bytes.fetch_sub(10, Ordering::AcqRel);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, &data),
+            Poll::Ready(Ok(10))
+        ));
+    }
+
+    #[test]
+    fn owned_send_preserves_suffix_and_order_across_credit_stalls() {
+        let (mut stream, rx, _tx, credit) = fixture();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let original = Bytes::from(vec![7; SEND_CAPACITY + 3]);
+        let mut data = Some(original.clone());
+        assert!(stream.poll_send(&mut cx, &mut data).is_pending());
+        let Some(Command::Send(first)) = rx.pop() else {
+            panic!()
+        };
+        assert_eq!(first.len(), SEND_CAPACITY);
+        assert_eq!(first.as_ptr(), original.as_ptr());
+        assert_eq!(data.as_ref().unwrap().len(), 3);
+        assert!(stream.poll_send(&mut cx, &mut data).is_pending());
+        assert!(rx.is_empty());
+        credit.bytes.fetch_sub(SEND_CAPACITY, Ordering::AcqRel);
+        assert!(matches!(
+            stream.poll_send(&mut cx, &mut data),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(data.is_none());
+        let Some(Command::Send(last)) = rx.pop() else {
+            panic!()
+        };
+        assert_eq!(last, original.slice(SEND_CAPACITY..));
+    }
+
+    #[test]
+    fn repeated_writes_cannot_drain_unread_data_or_skip_terminal_message() {
+        let (mut stream, _rx, tx, _credit) = fixture();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for b in [b"first".as_slice(), b"second".as_slice()] {
+            assert!(tx.push(Inbound::Data(Bytes::copy_from_slice(b))).is_ok());
+        }
+        assert!(tx.push(Inbound::Reset).is_ok());
+        drop(tx);
+        for _ in 0..100 {
+            assert!(matches!(
+                Pin::new(&mut stream).poll_write(&mut cx, b""),
+                Poll::Ready(Ok(0))
+            ));
+        }
+        assert_eq!(stream.read_queue.len(), 1);
+        assert_eq!(stream.inbound_rx.len(), 2);
+        assert!(!stream.got_eof);
+        for expected in [b"first".as_slice(), b"second".as_slice()] {
+            match stream.poll_recv(&mut cx) {
+                Poll::Ready(Ok(Some(bytes))) => assert_eq!(&bytes[..], expected),
+                _ => panic!("data must precede reset"),
+            }
+        }
+        assert!(
+            matches!(stream.poll_recv(&mut cx), Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset)
+        );
+    }
+
+    #[test]
+    fn reset_unblocks_writer_even_with_unread_data() {
+        let (mut stream, _rx, tx, credit) = fixture();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            tx.push(Inbound::Data(Bytes::from_static(b"unread")))
+                .is_ok()
+        );
+        stream.drain_inbound();
+        credit.failed.store(true, Ordering::Release);
+        assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"x"),
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset));
+        let mut data = Some(Bytes::from_static(b"x"));
+        assert!(matches!(stream.poll_send(&mut cx, &mut data),
+            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset));
+        assert_eq!(stream.read_queue.front().unwrap(), b"unread".as_slice());
+    }
+
+    #[test]
+    fn partial_read_keeps_only_one_staged_chunk() {
+        let (mut stream, _rx, tx, _) = fixture();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(tx.push(Inbound::Data(Bytes::from_static(b"abcd"))).is_ok());
+        assert!(tx.push(Inbound::Data(Bytes::from_static(b"ef"))).is_ok());
+        let mut storage = [0; 2];
+        let mut buf = ReadBuf::new(&mut storage);
+        assert!(matches!(
+            Pin::new(&mut stream).poll_read(&mut cx, &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), b"ab");
+        stream.drain_inbound();
+        assert_eq!(stream.read_queue.front().unwrap(), b"cd".as_slice());
+        assert_eq!(stream.inbound_rx.len(), 1);
+    }
+}

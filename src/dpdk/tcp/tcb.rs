@@ -205,6 +205,10 @@ impl Tcb {
 
     // ---- application-facing operations ---------------------------------
 
+    pub(crate) fn buffered_send_bytes(&self) -> usize {
+        self.send_buffer.len() + self.retransmit.payload_bytes()
+    }
+
     pub fn send(&mut self, data: Bytes) {
         self.send_buffer.push(data);
     }
@@ -983,6 +987,30 @@ mod tests {
         let _ack = tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::Established);
         tcb
+    }
+
+    #[test]
+    fn send_credit_counts_buffered_and_unacknowledged_payload() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.send(Bytes::from(vec![0; 4096]));
+        assert_eq!(tcb.buffered_send_bytes(), 4096);
+        let output = tcb.poll_output(now);
+        assert!(!output.is_empty());
+        assert_eq!(tcb.buffered_send_bytes(), 4096);
+        // A partial ACK does not release the backing segment yet.
+        let first = &output[0];
+        let partial = header(tcb.rcv_nxt, first.seq + 1, flags::ACK, u16::MAX);
+        tcb.on_segment(&partial, Bytes::new(), now);
+        assert_eq!(tcb.buffered_send_bytes(), 4096);
+        let ack = header(
+            tcb.rcv_nxt,
+            first.seq + first.payload.len() as u32,
+            flags::ACK,
+            u16::MAX,
+        );
+        tcb.on_segment(&ack, Bytes::new(), now);
+        assert_eq!(tcb.buffered_send_bytes(), 4096 - first.payload.len());
     }
 
     #[test]
