@@ -45,12 +45,7 @@ pub fn checksum(data: &[u8]) -> u16 {
 /// TCP/UDP-over-IPv4 pseudo-header sum (RFC 793 §3.1 / RFC 9293 §3.1):
 /// src IP + dst IP + zero byte + protocol + segment length (header +
 /// payload, not including the pseudo-header itself).
-pub fn ipv4_pseudo_header_sum(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    protocol: u8,
-    segment_len: u16,
-) -> u32 {
+pub fn ipv4_pseudo_header_sum(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, segment_len: u16) -> u32 {
     let (src, dst) = (src.octets(), dst.octets());
     let mut sum = 0u32;
     sum += u16::from_be_bytes([src[0], src[1]]) as u32;

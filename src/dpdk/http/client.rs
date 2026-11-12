@@ -516,15 +516,8 @@ impl Client {
         let mut last = std::io::ErrorKind::AddrInUse;
         for _ in 0..DIAL_PORT_ATTEMPTS {
             let local_port = self.alloc_ephemeral_port();
-            match TcpStream::connect(
-                &self.worker,
-                ip,
-                port,
-                local_port,
-                options,
-                flush_handle,
-            )
-            .await
+            match TcpStream::connect(&self.worker, ip, port, local_port, options, flush_handle)
+                .await
             {
                 Ok(stream) => return Ok(stream),
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => last = e.kind(),

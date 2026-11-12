@@ -4,8 +4,8 @@ use std::ptr;
 
 use super::ffi;
 use super::mbuf::Mbuf;
-use super::net::eth::EthAddr;
 use super::mempool::Mempool;
+use super::net::eth::EthAddr;
 
 #[derive(Debug)]
 pub struct PortError {

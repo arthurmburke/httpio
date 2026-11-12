@@ -179,7 +179,13 @@ impl ArpTable {
     /// Everything else overheard on the segment is ignored, so the table is
     /// bounded by this host's own conversations rather than by the segment's
     /// traffic. Returns whether the mapping was stored.
-    pub fn learn(&mut self, ip: Ipv4Addr, mac: EthAddr, addressed_to_us: bool, now: Instant) -> bool {
+    pub fn learn(
+        &mut self,
+        ip: Ipv4Addr,
+        mac: EthAddr,
+        addressed_to_us: bool,
+        now: Instant,
+    ) -> bool {
         if ip.is_unspecified() {
             return false; // an ARP probe's sender; not a mapping
         }
