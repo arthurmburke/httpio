@@ -193,7 +193,12 @@ if "${RUN[@]}" https://test.local:8443/hello.txt --resolve test.local=10.9.0.2 >
     echo "FAIL unknown-CA rejection: request unexpectedly succeeded"
     exit 1
 fi
-grep -qi "certificate" "$WORK/nocaperr" || { echo "FAIL unknown-CA rejection: unexpected error:"; cat "$WORK/nocaperr"; exit 1; }
+# The client reports a handshake failure by its io::ErrorKind, not the TLS
+# alert, so the message names the handshake rather than the certificate.
+# The same server and URL succeed with --ca above, so the certificate is
+# the only thing that differs here.
+grep -qi "TLS handshake with the origin failed" "$WORK/nocaperr" \
+    || { echo "FAIL unknown-CA rejection: unexpected error:"; cat "$WORK/nocaperr"; exit 1; }
 echo "PASS unknown CA rejected"
 
 echo "ALL E2E TESTS PASSED"

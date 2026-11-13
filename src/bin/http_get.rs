@@ -167,6 +167,8 @@ mod dpdk_app {
         for (host, ip) in &app.resolves {
             builder = builder.resolve(host, *ip);
         }
+        // Kept to report how many connections the requests opened.
+        let opened = worker.clone();
         let client = builder.build(worker);
 
         for url in &app.urls {
@@ -227,6 +229,9 @@ mod dpdk_app {
             }
         }
 
+        // Reuse observability (read by scripts/e2e.sh): with h2 pooling, N
+        // same-origin https URLs should report 1 connection, not N.
+        eprintln!("connections_opened={}", opened.connections_opened());
         ExitCode::SUCCESS
     }
 
