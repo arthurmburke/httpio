@@ -213,16 +213,28 @@ impl DmaWriter {
         Some(out)
     }
 
-    /// [`fill_with`](Self::fill_with) for data that must stay in one piece
-    /// (an HTTP request head): the region is exactly `len` bytes, never a
-    /// shorter prefix. If the current block has less room left, the rest
-    /// of that block is skipped (it is reused with the block once its
-    /// slices drop). `None` if `len` is zero or larger than the largest
-    /// block, or no DMA memory could be allocated; `fill` is not called
-    /// then.
+    /// Lends `len` contiguous writable bytes of DMA memory to `fill`, which
+    /// writes a prefix of them and returns its length; that prefix comes
+    /// back as [`Bytes`] the stack attaches to packets without a copy.
+    ///
+    /// For producers that generate their output in place and only learn its
+    /// size by writing it (TLS encryption writes ciphertext straight into
+    /// the lent slice). The slice's contents on entry are unspecified
+    /// (zeroes or stale data from an earlier use of the block). Unlike
+    /// [`fill_with`](Self::fill_with) the region is never cut short: if the
+    /// current block has less than `len` bytes left, its tail is left
+    /// unused (it is reused with the block once its slices drop) and the
+    /// next block is taken. `None` if `len` is zero or larger than the
+    /// largest block, or no DMA memory could be allocated; `fill` is then
+    /// not called. `fill` returning 0 yields an empty `Bytes` and uses no
+    /// space.
     ///
     /// EAL must be initialised.
-    pub fn fill_exact(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Bytes> {
+    pub fn fill_prefix(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> usize,
+    ) -> Option<Bytes> {
         if len == 0 || len > MAX_BLOCK {
             return None;
         }
@@ -233,8 +245,35 @@ impl DmaWriter {
         {
             self.current = None;
         }
-        // A fresh block is at least `len` long, so nothing is cut short.
-        self.fill_with(len, fill)
+        if self.current.is_none() {
+            self.current = Some(self.next_block(len)?);
+        }
+        let block = self.current.as_mut()?;
+        // SAFETY: `used + len` is within the block (checked above, and a
+        // fresh block is at least `len` long since `len <= MAX_BLOCK`), and
+        // no slice covering these bytes has been handed out, so nothing
+        // else can read or write them while `fill` holds this slice. The
+        // memory is initialised (zeroed at allocation, or earlier data).
+        let lent = unsafe { slice::from_raw_parts_mut(block.base.as_ptr().add(block.used), len) };
+        let n = fill(lent).min(len);
+        let out = block.whole.slice(block.used..block.used + n);
+        block.used += n;
+        if block.used == block.whole.len() {
+            self.current = None;
+        }
+        Some(out)
+    }
+
+    /// [`fill_prefix`](Self::fill_prefix) for data whose exact size is
+    /// known up front and must stay in one piece (an HTTP request head):
+    /// `fill` must overwrite all `len` bytes, and all of them come back.
+    ///
+    /// EAL must be initialised.
+    pub fn fill_exact(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Bytes> {
+        self.fill_prefix(len, |out| {
+            fill(out);
+            out.len()
+        })
     }
 
     /// Takes back the bytes the last [`copy`](Self::copy) returned, when

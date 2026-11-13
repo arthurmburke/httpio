@@ -381,6 +381,14 @@ impl TcpStream {
         });
     }
 
+    /// Whether this connection's port attaches DMA-capable `Bytes` to
+    /// packets without copying them (see [`DmaWriter`]). A layer that
+    /// produces its own output, such as TLS encryption, writes it into DMA
+    /// memory exactly when this holds, else onto the ordinary heap.
+    pub(crate) fn dma_writes(&self) -> bool {
+        self.writer.is_some()
+    }
+
     /// Zero-copy write: hands owned `data` straight to the worker as a
     /// `Command::Send`, avoiding the copy the [`AsyncWrite`] path is forced to
     /// make from its borrowed `&[u8]`. Waits while the command ring or the
@@ -870,13 +878,13 @@ impl TcpStream {
 // no explicit teardown message is needed here.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::dpdk::tcp::worker::SendCredit;
     use crate::dpdk::tcp::worker::inbound_channel;
     use crate::dpdk::tcp::worker::{CmdRx, InboundTx, SEND_CAPACITY, command_channel};
 
-    fn fixture() -> (TcpStream, CmdRx, InboundTx, Arc<SendCredit>) {
+    pub(crate) fn fixture() -> (TcpStream, CmdRx, InboundTx, Arc<SendCredit>) {
         let (cmd_tx, cmd_rx, credit) = command_channel();
         let (inbound_tx, inbound_rx) = inbound_channel(credit.clone());
         (

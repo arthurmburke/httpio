@@ -29,7 +29,6 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_rustls::TlsConnector;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -38,6 +37,7 @@ use crate::core::hashmap::HashMap;
 use crate::dpdk::http::h1;
 use crate::dpdk::tcp::stream::{FlushHandle, TcpOptions, TcpStream};
 use crate::dpdk::tcp::worker::WorkerHandle;
+use crate::dpdk::tls::TlsConnector;
 use crate::http::codec::{self, ByteStream, Empty, EncodedBody};
 use crate::http::errors::HttpError;
 
@@ -124,12 +124,12 @@ pub mod builder {
 
     use rustls::RootCertStore;
     use tokio::sync::Mutex;
-    use tokio_rustls::TlsConnector;
 
     use super::Client;
 
     use crate::core::hashmap::HashMap;
     use crate::dpdk::tcp::worker::WorkerHandle;
+    use crate::dpdk::tls::TlsConnector;
     use crate::http::errors::BuilderError;
 
     pub struct Builder {
@@ -352,13 +352,13 @@ impl Client {
                 let server_name = ServerName::try_from(host.as_ref())
                     .map_err(|_| HttpError::InvalidHost)?
                     .to_owned();
-                let mut tls = self
+                let tls = self
                     .tls_h1
                     .connect(server_name, tcp)
                     .await
                     .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
                 // Cork only now that the TLS handshake has completed.
-                tls.get_mut().0.request_cork();
+                tls.tcp().request_cork();
                 return send_h1(tls, parts, Full::new(body), &host, port, is_https)
                     .await
                     .map(hyper_body);
@@ -380,7 +380,7 @@ impl Client {
                 .connect(server_name, tcp)
                 .await
                 .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
-            let negotiated_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+            let negotiated_h2 = tls.alpn_protocol() == Some(b"h2".as_slice());
             if negotiated_h2 {
                 let send_request = handshake_h2(tls).await?;
                 // Pool a clone; on a race where two tasks dialed the same
@@ -447,14 +447,14 @@ impl Client {
             let server_name = ServerName::try_from(host.as_ref())
                 .map_err(|_| HttpError::InvalidHost)?
                 .to_owned();
-            let mut tls = self
+            let tls = self
                 .tls_h1
                 .connect(server_name, tcp)
                 .await
                 .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
             if tcp_options.cork {
                 // Cork only now that the TLS handshake has completed.
-                tls.get_mut().0.request_cork();
+                tls.tcp().request_cork();
             }
             // Each chunk becomes one hyper data frame, by move -- no copy
             // here. A producer `Err` becomes a hyper body error, aborting
