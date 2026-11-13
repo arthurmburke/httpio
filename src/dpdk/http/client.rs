@@ -35,6 +35,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::core::hashmap::HashMap;
+use crate::dpdk::http::h1;
 use crate::dpdk::tcp::stream::{FlushHandle, TcpOptions, TcpStream};
 use crate::dpdk::tcp::worker::WorkerHandle;
 use crate::http::codec::{self, ByteStream, Empty, EncodedBody};
@@ -54,6 +55,18 @@ const EPHEMERAL_LAST: u16 = 65535;
 /// How many fresh local ports `dial` tries when the worker reports the
 /// 4-tuple already in use, before giving up with `Connect(AddrInUse)`.
 const DIAL_PORT_ATTEMPTS: usize = 64;
+
+/// A response body still on the wire: hyper's (https, h2, upgrades) or the
+/// zero-copy codec's (plain `http`, see [`h1`]). The h1 body owns its
+/// connection, so the connection lives exactly as long as the body is read.
+enum ResponseBody {
+    Hyper(Incoming),
+    H1(h1::Body<TcpStream>),
+}
+
+fn hyper_body(response: Response<Incoming>) -> Response<ResponseBody> {
+    response.map(ResponseBody::Hyper)
+}
 
 /// Atomically takes the next port from `cursor`, wrapping from
 /// `EPHEMERAL_LAST` back to `EPHEMERAL_FIRST`. A cursor value outside the
@@ -265,7 +278,13 @@ impl Client {
             EncodedBody::Stream(stream) => self.send_stream(parts, stream).await?,
         };
 
-        let (parts, incoming) = response.into_parts();
+        let (parts, body) = response.into_parts();
+        let incoming = match body {
+            ResponseBody::Hyper(incoming) => incoming,
+            ResponseBody::H1(body) => {
+                return h1::into_typed_response(Response::from_parts(parts, body)).await;
+            }
+        };
         // A ByteStream response target takes the body unbuffered: hand over
         // the chunk stream without collecting. Data frames pass through as
         // `Ok` chunks (trailer frames are skipped); a mid-body transport
@@ -306,7 +325,7 @@ impl Client {
     async fn send_buffered(
         &self,
         request: Request<Bytes>,
-    ) -> Result<Response<Incoming>, HttpError> {
+    ) -> Result<Response<ResponseBody>, HttpError> {
         let (mut parts, body) = request.into_parts();
         let tcp_options = parts.extensions.remove::<TcpOptions>().unwrap_or_default();
         let flush_handle = parts.extensions.remove::<FlushHandle>();
@@ -340,12 +359,14 @@ impl Client {
                     .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
                 // Cork only now that the TLS handshake has completed.
                 tls.get_mut().0.request_cork();
-                return send_h1(tls, parts, Full::new(body), &host, port, is_https).await;
+                return send_h1(tls, parts, Full::new(body), &host, port, is_https)
+                    .await
+                    .map(hyper_body);
             }
 
             // Fast path: multiplex onto an existing h2 connection.
             if let Some(send_request) = self.pooled_h2(&host, port).await {
-                return send_h2_on(send_request, parts, body).await;
+                return send_h2_on(send_request, parts, body).await.map(hyper_body);
             }
 
             let tcp = self
@@ -372,23 +393,21 @@ impl Client {
                     .entry(host.into_owned())
                     .or_default()
                     .insert(port, send_request.clone());
-                send_h2_on(send_request, parts, body).await
+                send_h2_on(send_request, parts, body).await.map(hyper_body)
             } else {
-                send_h1(tls, parts, Full::new(body), &host, port, is_https).await
+                send_h1(tls, parts, Full::new(body), &host, port, is_https)
+                    .await
+                    .map(hyper_body)
             }
         } else {
-            let mut tcp = self
+            let tcp = self
                 .dial(&host, port, tcp_options, flush_handle.as_ref())
                 .await?;
             // Plain HTTP has no handshake, so cork right away.
             if tcp_options.cork {
                 tcp.request_cork();
             }
-            // hyper writes the body vectored, straight from these `Bytes`:
-            // lent to the stream, they go out as slices, not copies -- when
-            // that helps (DMA memory, or a port that copies regardless).
-            tcp.lend_body(&body);
-            send_h1(tcp, parts, Full::new(body), &host, port, is_https).await
+            send_plain_h1(tcp, parts, EncodedBody::Full(body), &host, port).await
         }
     }
 
@@ -405,7 +424,7 @@ impl Client {
         &self,
         mut parts: Parts,
         body: ByteStream<'static>,
-    ) -> Result<Response<Incoming>, HttpError> {
+    ) -> Result<Response<ResponseBody>, HttpError> {
         let tcp_options = parts.extensions.remove::<TcpOptions>().unwrap_or_default();
         let flush_handle = parts.extensions.remove::<FlushHandle>();
 
@@ -420,13 +439,6 @@ impl Client {
             .uri
             .port_u16()
             .unwrap_or(if is_https { 443 } else { 80 });
-
-        // Each chunk becomes one hyper data frame, by move -- no copy here.
-        // A producer `Err` becomes a hyper body error, aborting the request.
-        let body = StreamBody::new(body.into_inner().map(|item| {
-            item.map(Frame::data)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-        }));
 
         let tcp = self
             .dial(&host, port, tcp_options, flush_handle.as_ref())
@@ -444,13 +456,22 @@ impl Client {
                 // Cork only now that the TLS handshake has completed.
                 tls.get_mut().0.request_cork();
             }
-            send_h1(tls, parts, body, &host, port, is_https).await
+            // Each chunk becomes one hyper data frame, by move -- no copy
+            // here. A producer `Err` becomes a hyper body error, aborting
+            // the request.
+            let body = StreamBody::new(body.into_inner().map(|item| {
+                item.map(Frame::data)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }));
+            send_h1(tls, parts, body, &host, port, is_https)
+                .await
+                .map(hyper_body)
         } else {
             // Plain HTTP has no handshake, so cork right away.
             if tcp_options.cork {
                 tcp.request_cork();
             }
-            send_h1(tcp, parts, body, &host, port, is_https).await
+            send_plain_h1(tcp, parts, EncodedBody::Stream(body), &host, port).await
         }
     }
 
@@ -600,6 +621,21 @@ fn rewrite_to_origin_form(
         parts.headers.insert(header::HOST, host_value);
     }
     Ok(())
+}
+
+/// Plain `http` over the zero-copy HTTP/1.1 codec ([`h1`]) instead of hyper:
+/// the head is built in place and body `Bytes` move to and from the
+/// connection without copies.
+async fn send_plain_h1(
+    tcp: TcpStream,
+    mut parts: Parts,
+    body: EncodedBody,
+    host: &str,
+    port: u16,
+) -> Result<Response<ResponseBody>, HttpError> {
+    rewrite_to_origin_form(&mut parts, host, port, 80)?;
+    let response = h1::send_over_tcp(tcp, parts, body).await?;
+    Ok(response.map(ResponseBody::H1))
 }
 
 async fn send_h1<T, B>(

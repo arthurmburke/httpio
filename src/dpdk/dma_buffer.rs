@@ -189,7 +189,7 @@ impl DmaWriter {
     /// loop -- lets `fill` write them in place, and returns them. The
     /// slice `fill` receives holds stale bytes from an earlier use and must
     /// be overwritten in full. `None` if `len` is zero or no DMA memory
-    /// could be allocated.
+    /// could be allocated; `fill` is not called then.
     ///
     /// EAL must be initialised.
     pub fn fill_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Bytes> {
@@ -204,13 +204,37 @@ impl DmaWriter {
         // SAFETY: as in `copy`: `used + n` is within the block (whose
         // memory is initialised: zeroed on allocation, then only ever
         // written), and no slice covering these bytes has been handed out.
-        fill(unsafe { std::slice::from_raw_parts_mut(block.base.as_ptr().add(block.used), n) });
+        fill(unsafe { slice::from_raw_parts_mut(block.base.as_ptr().add(block.used), n) });
         let out = block.whole.slice(block.used..block.used + n);
         block.used += n;
         if block.used == block.whole.len() {
             self.current = None;
         }
         Some(out)
+    }
+
+    /// [`fill_with`](Self::fill_with) for data that must stay in one piece
+    /// (an HTTP request head): the region is exactly `len` bytes, never a
+    /// shorter prefix. If the current block has less room left, the rest
+    /// of that block is skipped (it is reused with the block once its
+    /// slices drop). `None` if `len` is zero or larger than the largest
+    /// block, or no DMA memory could be allocated; `fill` is not called
+    /// then.
+    ///
+    /// EAL must be initialised.
+    pub fn fill_exact(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Bytes> {
+        if len == 0 || len > MAX_BLOCK {
+            return None;
+        }
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|block| block.whole.len() - block.used < len)
+        {
+            self.current = None;
+        }
+        // A fresh block is at least `len` long, so nothing is cut short.
+        self.fill_with(len, fill)
     }
 
     /// Takes back the bytes the last [`copy`](Self::copy) returned, when

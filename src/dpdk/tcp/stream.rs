@@ -859,6 +859,7 @@ impl TcpStream {
             state: StreamState::Open,
             read_queue: VecDeque::new(),
             writer: None,
+            lent: LentBody::Empty,
         };
         (stream, cmd_rx, inbound_tx, credit)
     }
