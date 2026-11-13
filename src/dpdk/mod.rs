@@ -2,7 +2,7 @@
 //! functions are declared directly and others go through `csrc/shim.c`.
 
 pub mod dma_buffer;
-pub use dma_buffer::DmaBuffer;
+pub use dma_buffer::{DmaBuffer, DmaWriter};
 pub mod eal;
 pub mod ffi;
 pub mod http;

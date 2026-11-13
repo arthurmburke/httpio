@@ -37,6 +37,7 @@ use crate::core::spsc;
 use crate::core::spsc::{SpscRx, SpscTx};
 use crate::dpdk::{self, EthPort, Mempool, WorkerJoin};
 
+use super::app_wake::{self, AppNotifier, AppReady, AppWake};
 use super::engine::TcpEngine;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple};
@@ -255,6 +256,7 @@ struct NewConn {
     cmd_rx: CmdRx,
     outstanding: Arc<SendCredit>,
     inbound_tx: InboundTx,
+    app_wake: Arc<AppWake>,
 }
 
 /// What the worker still owes the application on a connection's inbound
@@ -311,6 +313,14 @@ struct WorkerConn {
     pending_in: Option<Bytes>,
     delivery: Delivery,
     teardown: Teardown,
+    /// How the application is told this connection changed; absent only
+    /// in tests that drive a connection without a stream.
+    app_wake: Option<Arc<AppWake>>,
+    /// Something the application may be waiting for changed during this
+    /// iteration (inbound message, ring space, send credit, failure). The
+    /// loop turns it into one notification at the end of the iteration,
+    /// after the change is visible.
+    notify_app: bool,
 }
 
 impl WorkerConn {
@@ -329,7 +339,17 @@ impl WorkerConn {
             pending_in: None,
             delivery: Delivery::Connecting,
             teardown: Teardown::Open,
+            app_wake: None,
+            notify_app: false,
         }
+    }
+
+    /// Pushes to the application's inbound ring, noting on success that
+    /// the application has something to be woken for.
+    fn push_inbound(&mut self, msg: Inbound) -> Result<(), Inbound> {
+        let pushed = self.inbound_tx.push(msg);
+        self.notify_app |= pushed.is_ok();
+        pushed
     }
 
     /// `Command::Close`: half-close the engine side, once.
@@ -357,7 +377,7 @@ impl WorkerConn {
             self.delivery = Delivery::Terminal(Inbound::Eof);
         }
         self.delivery = match std::mem::replace(&mut self.delivery, Delivery::Ended) {
-            Delivery::Terminal(terminal) => match self.inbound_tx.push(terminal) {
+            Delivery::Terminal(terminal) => match self.push_inbound(terminal) {
                 Ok(()) => Delivery::Ended,
                 Err(returned) => Delivery::Terminal(returned),
             },
@@ -370,6 +390,7 @@ impl WorkerConn {
         let released = self.engine_bytes - remaining;
         if released != 0 {
             self.outstanding.bytes.fetch_sub(released, Ordering::AcqRel);
+            self.notify_app = true;
         }
         self.engine_bytes = remaining;
     }
@@ -408,7 +429,7 @@ impl WorkerConn {
                 // The ring is empty before the handshake completes, so
                 // this push cannot fail in practice.
                 if matches!(self.delivery, Delivery::Connecting)
-                    && self.inbound_tx.push(Inbound::Established).is_ok()
+                    && self.push_inbound(Inbound::Established).is_ok()
                 {
                     self.delivery = Delivery::Established;
                 }
@@ -420,6 +441,7 @@ impl WorkerConn {
             }
             Event::Reset => {
                 self.outstanding.failed.store(true, Ordering::Release);
+                self.notify_app = true;
                 // Distinguish a failed handshake from a reset of an
                 // established connection so the app reports the right
                 // error. A terminal already chosen stands.
@@ -439,6 +461,7 @@ impl WorkerConn {
                 // EOF via the `Draining` path.
                 if matches!(self.delivery, Delivery::Connecting) {
                     self.outstanding.failed.store(true, Ordering::Release);
+                    self.notify_app = true;
                     self.delivery = Delivery::Terminal(Inbound::ConnectFailed);
                 }
             }
@@ -457,6 +480,15 @@ impl WorkerConn {
 pub struct WorkerHandle {
     ctrl_tx: CtrlTx,
     ready: ReadySender,
+    /// Worker -> application wake-ups for this worker's streams.
+    app_ready: Arc<AppReady>,
+    /// Whether streams copy writes into DMA memory, for the engine to
+    /// attach to packets instead of copying again. On for ports with TSO,
+    /// where one attachment replaces copying a segment of tens of
+    /// kilobytes into a chain of mbufs (measured: about 160 ns against
+    /// 440 ns for 32 KB). Off otherwise: for a single MSS-sized segment
+    /// the attachment's extra mbufs cost slightly more than the copy.
+    dma_writes: bool,
     local_ip: Ipv4Addr,
     /// Shared only by application-side handles. Dropping the final clone drops
     /// `WorkerLifetime`, which signals the worker without a racy strong-count
@@ -483,6 +515,12 @@ impl Drop for WorkerLifetime {
 pub struct ConnEndpoints {
     pub cmd_tx: CmdTx,
     pub inbound_rx: InboundRx,
+    /// Where the stream stores its waker while it has nothing to do.
+    pub(crate) wake: Arc<AppWake>,
+    /// Whether writes should be copied into DMA memory (see
+    /// [`DmaWriter`](crate::dpdk::DmaWriter)): worthwhile when the port
+    /// segments large packets itself.
+    pub(crate) dma_writes: bool,
 }
 
 impl WorkerHandle {
@@ -507,6 +545,8 @@ impl WorkerHandle {
             overflow: overflow.clone(),
         };
         let local_ip = engine.local_ip();
+        let dma_writes = port.offloads().tso_max_payload > 0;
+        let (notifier, app_ready) = app_wake::channel();
 
         let join = dpdk::launch(worker_lcore, move || {
             run(
@@ -518,6 +558,7 @@ impl WorkerHandle {
                 worker_opened,
                 ready_rx,
                 overflow,
+                notifier,
             );
         })?;
 
@@ -525,6 +566,8 @@ impl WorkerHandle {
             WorkerHandle {
                 ctrl_tx,
                 ready,
+                app_ready,
+                dma_writes,
                 local_ip,
                 _lifetime: Arc::new(WorkerLifetime { stop }),
                 connections_opened,
@@ -558,6 +601,7 @@ impl WorkerHandle {
             queued: AtomicBool::new(false),
         }));
         let (inbound_tx, inbound_rx) = inbound_channel(outstanding.clone());
+        let wake = self.app_ready.wake_handle();
 
         let mut msg = NewConn {
             remote_ip,
@@ -567,13 +611,21 @@ impl WorkerHandle {
             cmd_rx,
             outstanding,
             inbound_tx,
+            app_wake: wake.clone(),
         };
         // Control-ring pushes only fail if the worker has stalled; a short
         // bounded spin covers a transient full ring without blocking the
         // async runtime indefinitely.
         for _ in 0..1024 {
             match self.ctrl_tx.push(msg) {
-                Ok(()) => return Some(ConnEndpoints { cmd_tx, inbound_rx }),
+                Ok(()) => {
+                    return Some(ConnEndpoints {
+                        cmd_tx,
+                        inbound_rx,
+                        wake,
+                        dma_writes: self.dma_writes,
+                    });
+                }
                 Err(returned) => {
                     msg = returned;
                     std::hint::spin_loop();
@@ -631,6 +683,7 @@ fn run(
     connections_opened: Arc<AtomicU64>,
     ready_rx: MpscRx<FourTuple, READY_CAP>,
     overflow: Arc<AtomicBool>,
+    mut notifier: AppNotifier,
 ) {
     let mut conns: HashMap<FourTuple, WorkerConn> = HashMap::default();
     // Mirror of the last value published to `connections_opened`, so the
@@ -642,6 +695,7 @@ fn run(
     let mut work = HashSet::default();
     let mut closing = HashSet::default();
     while !stop.load(Ordering::Acquire) {
+        notifier.retry();
         // 1. Register newly opened connections.
         while let Some(nc) = ctrl_rx.pop() {
             let candidate = FourTuple {
@@ -662,15 +716,15 @@ fn run(
             let Some(tuple) = tuple else {
                 // The ring is brand new (empty), so this push cannot fail.
                 let _ = nc.inbound_tx.push(Inbound::AddrInUse);
+                notifier.notify(&nc.app_wake);
                 continue;
             };
             engine.set_nodelay(tuple, nc.nodelay);
             work.insert(tuple);
             nc.outstanding.clear_notification();
-            conns.insert(
-                tuple,
-                WorkerConn::new(tuple, nc.cmd_rx, nc.outstanding, nc.inbound_tx),
-            );
+            let mut conn = WorkerConn::new(tuple, nc.cmd_rx, nc.outstanding, nc.inbound_tx);
+            conn.app_wake = Some(nc.app_wake);
+            conns.insert(tuple, conn);
             // A connection was just opened; publish the new count (only
             // here, since this is the only place it changes).
             let opened = engine.connections_opened();
@@ -691,6 +745,8 @@ fn run(
                 let Some(cmd) = conn.cmd_rx.pop() else {
                     break;
                 };
+                // Ring space: a writer may be waiting on a full ring.
+                conn.notify_app = true;
                 match cmd {
                     Command::Send(data) => {
                         conn.engine_bytes += data.len();
@@ -733,7 +789,7 @@ fn run(
             conn.release_credit(&engine);
             // Retry a previously un-pushable chunk first.
             if let Some(pending) = conn.pending_in.take()
-                && let Err(Inbound::Data(b)) = conn.inbound_tx.push(Inbound::Data(pending))
+                && let Err(Inbound::Data(b)) = conn.push_inbound(Inbound::Data(pending))
             {
                 conn.pending_in = Some(b);
             }
@@ -743,7 +799,7 @@ fn run(
                 if chunk.is_empty() {
                     break;
                 }
-                if let Err(Inbound::Data(b)) = conn.inbound_tx.push(Inbound::Data(chunk)) {
+                if let Err(Inbound::Data(b)) = conn.push_inbound(Inbound::Data(chunk)) {
                     conn.pending_in = Some(b);
                 }
             }
@@ -760,6 +816,13 @@ fn run(
             let Some(conn) = conns.get_mut(&tuple) else {
                 continue;
             };
+            // Everything this iteration changed for the connection is
+            // visible to the application by now; tell it once.
+            if std::mem::take(&mut conn.notify_app)
+                && let Some(wake) = &conn.app_wake
+            {
+                notifier.notify(wake);
+            }
             if !conn.retain_after_drop(&mut engine, now) {
                 conns.remove(&tuple);
                 closing.remove(&tuple);
@@ -768,6 +831,19 @@ fn run(
             }
         }
     }
+
+    // Stopping closes every ring, which is how a stream learns the worker
+    // is gone. Close them first, then wake the streams so they look:
+    // connections already running, and opens still queued.
+    let mut wakes: Vec<_> = conns.values().filter_map(|c| c.app_wake.clone()).collect();
+    drop(conns);
+    while let Some(nc) = ctrl_rx.pop() {
+        wakes.push(nc.app_wake.clone());
+    }
+    for wake in &wakes {
+        notifier.notify(wake);
+    }
+    notifier.flush();
 }
 
 #[cfg(test)]
@@ -1020,6 +1096,8 @@ mod tests {
                 tx,
                 overflow: Arc::new(AtomicBool::new(false)),
             },
+            app_ready: app_wake::channel().1,
+            dma_writes: false,
             _lifetime: Arc::new(WorkerLifetime { stop: stop.clone() }),
             connections_opened: Arc::new(AtomicU64::new(0)),
         };

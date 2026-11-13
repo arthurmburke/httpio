@@ -200,14 +200,22 @@ impl Payload {
 
     /// Checksum over fragmented payload, preserving odd-byte boundaries.
     pub(crate) fn checksum_sum(&self, mut sum: u32) -> u16 {
-        let mut high = None;
+        // A fragment of odd length leaves its last byte as the high half
+        // of a word that the next fragment's first byte completes.
+        let mut high: Option<u8> = None;
         for chunk in self.chunks() {
-            for &byte in chunk.iter() {
-                if let Some(first) = high.take() {
-                    sum += u16::from_be_bytes([first, byte]) as u32;
-                } else {
-                    high = Some(byte);
-                }
+            let mut data = &chunk[..];
+            if let Some(first) = high
+                && let Some((&second, rest)) = data.split_first()
+            {
+                sum += u16::from_be_bytes([first, second]) as u32;
+                high = None;
+                data = rest;
+            }
+            let even = data.len() & !1;
+            sum = crate::dpdk::net::checksum::sum16(&data[..even], sum);
+            if let Some(&last) = data.get(even) {
+                high = Some(last);
             }
         }
         if let Some(first) = high {

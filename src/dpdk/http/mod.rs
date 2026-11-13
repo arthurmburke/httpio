@@ -15,5 +15,4 @@
 //! hostname is still used for SNI and certificate validation.
 
 pub mod client;
-pub mod stream;
 pub mod websocket;

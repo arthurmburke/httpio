@@ -517,6 +517,77 @@ mod dpdk_parts {
             bench("dpdk", "Mbuf alloc + free", 20_000_000, 0, || {
                 black_box(Mbuf::alloc(&pool));
             });
+            // What a TSO-sized segment costs to hand to the port, by where
+            // the application's bytes are: on the heap they are copied
+            // into pool mbufs; in DMA memory they are attached.
+            const TSO_PAYLOAD: usize = 32 * 1024;
+            let heap = Bytes::from(vec![0xa5u8; TSO_PAYLOAD]);
+            bench(
+                "dpdk",
+                "32KB TSO payload from the heap: copy into chained mbufs",
+                500_000,
+                TSO_PAYLOAD,
+                || {
+                    let mut head = Mbuf::alloc(&pool).unwrap();
+                    head.append(54).unwrap();
+                    let mut data = &heap[..];
+                    while !data.is_empty() {
+                        let mut tail = Mbuf::alloc(&pool).unwrap();
+                        let n = data.len().min(tail.tailroom() as usize);
+                        tail.append(n as u16).unwrap().copy_from_slice(&data[..n]);
+                        data = &data[n..];
+                        head.chain(tail).ok().unwrap();
+                    }
+                    black_box(&head);
+                },
+            );
+            let mut dma = httpio::dpdk::DmaBuffer::new(TSO_PAYLOAD).expect("no DMA memory");
+            dma.as_mut_slice().fill(0xa5);
+            let dma = dma.freeze();
+            bench(
+                "dpdk",
+                "32KB TSO payload from DMA memory: attach (9 pieces, 4KB pages)",
+                500_000,
+                TSO_PAYLOAD,
+                || {
+                    let mut head = Mbuf::alloc(&pool).unwrap();
+                    head.append(54).unwrap();
+                    // One attachment per DMA-contiguous piece. Without
+                    // hugepages (as here) that is every 4 KB page, so nine
+                    // pieces; on hugepages the whole payload is one.
+                    let mut rest = dma.clone();
+                    while !rest.is_empty() {
+                        let to_page_end = 4096 - (rest.as_ptr() as usize & 4095);
+                        let piece = rest.split_to(to_page_end.min(rest.len()));
+                        let tail = Mbuf::from_external_bytes(&pool, piece).unwrap();
+                        head.chain(tail).ok().unwrap();
+                    }
+                    black_box(&head);
+                },
+            );
+            // The application's side of the two: its one copy of a 32 KB
+            // write, to the heap and into a recycled DMA block.
+            let source = vec![0xa5u8; TSO_PAYLOAD];
+            bench(
+                "dpdk",
+                "32KB write copied to the heap (Bytes::copy_from_slice)",
+                500_000,
+                TSO_PAYLOAD,
+                || {
+                    black_box(Bytes::copy_from_slice(black_box(&source)));
+                },
+            );
+            let mut writer = httpio::dpdk::DmaWriter::new();
+            bench(
+                "dpdk",
+                "32KB write copied into DMA memory (DmaWriter)",
+                500_000,
+                TSO_PAYLOAD,
+                || {
+                    black_box(writer.copy(black_box(&source)));
+                },
+            );
+
             bench(
                 "dpdk",
                 "net_ring tx_burst + rx_burst, 1 mbuf",
@@ -603,6 +674,33 @@ mod dpdk_parts {
                 MSS,
                 || {
                     engine.send(tuple, chunk.clone());
+                    engine.poll_into(&port, &pool, now, &mut events);
+                    drain(&port);
+                    ours = ours.wrapping_add(MSS as u32);
+                    inject(
+                        &port,
+                        &pool,
+                        &peer_header(peer_seq, ours, tcp::flags::ACK),
+                        &[],
+                    );
+                    engine.poll_into(&port, &pool, now, &mut events);
+                },
+            );
+
+            // The same segment with its payload already in DMA memory, as
+            // `TcpStream` writes arrive on a multi-segment port: attached
+            // to the frame, not copied into it. This port has no checksum
+            // offload, so the payload is still read once to sum it.
+            let mut staged = httpio::dpdk::DmaBuffer::new(MSS).expect("no DMA memory");
+            staged.as_mut_slice().fill(0xa5);
+            let staged = staged.freeze();
+            bench(
+                "engine",
+                "send 1460B from DMA memory: attached, not copied",
+                2_000_000,
+                MSS,
+                || {
+                    engine.send(tuple, staged.clone());
                     engine.poll_into(&port, &pool, now, &mut events);
                     drain(&port);
                     ours = ours.wrapping_add(MSS as u32);

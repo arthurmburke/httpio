@@ -120,6 +120,40 @@ fn external_payload_lives_through_ack_driver_clone_and_cross_thread_completion()
         assert!(Mbuf::from_external_bytes(&pool, Bytes::from(vec![1; 64])).is_none());
         assert_eq!(available(), baseline);
 
+        // Borrowed writes are copied once into DMA memory the port can
+        // attach, in order, and the block is reused once its slices drop.
+        let mut writer = httpio::dpdk::DmaWriter::new();
+        let first = writer.copy(&[1u8; 100]).unwrap();
+        let second = writer.copy(&[2u8; 200]).unwrap();
+        assert_eq!(&first[..], &[1u8; 100]);
+        assert_eq!(&second[..], &[2u8; 200]);
+        assert_eq!(second.as_ptr(), unsafe { first.as_ptr().add(100) });
+        let attached = Mbuf::from_external_bytes(&pool, second.clone()).unwrap();
+        assert_eq!(attached.data().as_ptr(), second.as_ptr());
+        drop(attached);
+        // An unsent copy is taken back; the next one lands in its place.
+        let unsent = writer.copy(&[3u8; 50]).unwrap();
+        let place = unsent.as_ptr();
+        writer.undo(unsent);
+        assert_eq!(writer.copy(&[4u8; 50]).unwrap().as_ptr(), place);
+        // A write larger than the block's remaining room is cut short.
+        let block_start = first.as_ptr();
+        let filled = writer.copy(&[5u8; 8192]).unwrap();
+        assert_eq!(filled.len(), 4096 - 350);
+        drop((first, second, filled));
+        let reused = writer.copy(&[6u8; 4096]).unwrap();
+        assert_eq!(
+            reused.as_ptr(),
+            block_start,
+            "an acknowledged block is reused"
+        );
+        assert_eq!(&reused[..], &[6u8; 4096]);
+        // Slices outlive the writer; the block is then freed, not kept.
+        drop(writer);
+        assert_eq!(&reused[..16], &[6u8; 16]);
+        drop(reused);
+        assert_eq!(available(), baseline);
+
         // Transmit ownership also survives the ethdev boundary; the loopback
         // driver returns the same external payload with no copying.
         let mut frame = Mbuf::alloc(&pool).unwrap();

@@ -21,7 +21,8 @@
 //! sleeping in `read()`, which takes the server's wake-up out of every
 //! round trip. `BENCH_WORKLOADS=latency` skips the bulk transfers and
 //! `BENCH_WORKLOADS=short` runs only the short fresh-connection uploads.
-//! `BENCH_WORKLOADS=bulk` runs only the bulk transfers, and `BENCH_BULK_MB`
+//! The last workload repeats the 64-byte round trip with 1000 idle
+//! connections open. `BENCH_WORKLOADS=bulk` runs only the bulk transfers, and `BENCH_BULK_MB`
 //! sets their size (default 64).
 //!
 //! Output is one tab-separated row per measurement:
@@ -38,6 +39,8 @@ const SINK_PORT: u16 = 7002;
 const SOURCE_PORT: u16 = 7003;
 
 const CONNECTS: usize = 300;
+/// Connections held open and idle for the last round-trip workload.
+const IDLE_CONNECTIONS: usize = 1000;
 /// Bytes per bulk transfer: 64 MB, or `BENCH_BULK_MB` megabytes.
 fn bulk_bytes() -> u64 {
     std::env::var("BENCH_BULK_MB")
@@ -239,7 +242,7 @@ where
 
 async fn run_async<S, C>(label: &str, mut connect: C) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + 'static,
     C: AsyncFnMut(u16) -> io::Result<S>,
 {
     if std::env::var("BENCH_WORKLOADS").is_ok_and(|v| v == "short") {
@@ -329,7 +332,61 @@ where
 
     rtt_async(label, "rtt_64B_after_300_closes", &mut connect, 64, 20_000).await?;
 
-    short_transfers(label, &mut connect).await
+    short_transfers(label, &mut connect).await?;
+
+    // The same round trip with idle connections held open beside it, each
+    // in its own task with a read outstanding (as a pooled HTTP connection
+    // has while it watches for the peer closing): what waiting streams
+    // cost the one that is busy.
+    let mut idle = Vec::with_capacity(IDLE_CONNECTIONS);
+    for _ in 0..IDLE_CONNECTIONS {
+        idle.push(connect(ECHO_PORT).await?);
+    }
+    let mut stream = connect(ECHO_PORT).await?;
+    let tasks = tokio::task::LocalSet::new();
+    let samples = tasks
+        .run_until(async move {
+            let idle: Vec<_> = idle
+                .into_iter()
+                .map(|mut stream| {
+                    tokio::task::spawn_local(async move {
+                        let mut byte = [0u8; 1];
+                        let _ = stream.read(&mut byte).await;
+                    })
+                })
+                .collect();
+            let busy = tokio::task::spawn_local(async move {
+                let msg = [0xa5u8; 64];
+                let mut reply = [0u8; 64];
+                let mut samples = Vec::with_capacity(20_000);
+                for round in 0..22_000 {
+                    let start = Instant::now();
+                    stream.write_all(&msg).await?;
+                    stream.read_exact(&mut reply).await?;
+                    if round >= 2_000 {
+                        samples.push(start.elapsed());
+                    }
+                }
+                stream.shutdown().await?;
+                io::Result::Ok(samples)
+            });
+            let samples = busy.await.expect("round-trip task panicked");
+            // Dropping the idle streams closes them; give the stack a
+            // moment to send the FINs before the process exits, so the
+            // server is not left holding a thousand dead connections.
+            for task in idle {
+                task.abort();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            samples
+        })
+        .await?;
+    report_latency(
+        label,
+        &format!("rtt_64B_with_{IDLE_CONNECTIONS}_idle"),
+        samples,
+    );
+    Ok(())
 }
 
 /// A short transfer on a fresh connection: handshake, slow start from the
@@ -437,7 +494,7 @@ mod dpdk_mode {
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicU16, Ordering};
 
-    use httpio::dpdk::http::stream::{TcpOptions, TcpStream};
+    use httpio::dpdk::tcp::stream::{TcpOptions, TcpStream};
     use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
     use httpio::dpdk::tcp::engine::{EngineConfig, TcpEngine};
     use httpio::dpdk::tcp::worker::WorkerHandle;

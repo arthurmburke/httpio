@@ -35,11 +35,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::core::hashmap::HashMap;
+use crate::dpdk::tcp::stream::{FlushHandle, TcpOptions, TcpStream};
 use crate::dpdk::tcp::worker::WorkerHandle;
 use crate::http::codec::{self, ByteStream, Empty, EncodedBody};
 use crate::http::errors::HttpError;
-
-use super::stream::{FlushHandle, TcpOptions, TcpStream};
 
 /// Origin key for the h2 pool: (host, port). Scheme is implicit (only
 /// `https` + ALPN produces an h2 connection), and corked requests never
