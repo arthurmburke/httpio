@@ -153,6 +153,45 @@ impl DmaWriter {
         Some(out)
     }
 
+    /// Hands `fill` a contiguous `len`-byte region to write in place and
+    /// returns it as [`Bytes`]. For data that is built rather than copied
+    /// (an HTTP request head), this saves the staging buffer that
+    /// [`copy`](Self::copy) would need. Unlike `copy`, the region is never
+    /// split: if the current block has less room left, the rest of that
+    /// block is skipped (it is reused with the block once its slices drop).
+    /// `None` if `len` is zero or larger than the largest block, or no DMA
+    /// memory could be allocated; `fill` is not called then.
+    ///
+    /// EAL must be initialised.
+    pub fn fill(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Bytes> {
+        if len == 0 || len > MAX_BLOCK {
+            return None;
+        }
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|block| block.whole.len() - block.used < len)
+        {
+            self.current = None;
+        }
+        if self.current.is_none() {
+            self.current = Some(self.next_block(len)?);
+        }
+        let block = self.current.as_mut()?;
+        // SAFETY: as in `copy`: `used + len` is within the block (a fresh
+        // block is at least `len` long), and no slice covering these bytes
+        // has been handed out. The memory is initialised (zeroed on
+        // allocation, or old data in a reused block).
+        let region = unsafe { slice::from_raw_parts_mut(block.base.as_ptr().add(block.used), len) };
+        fill(region);
+        let out = block.whole.slice(block.used..block.used + len);
+        block.used += len;
+        if block.used == block.whole.len() {
+            self.current = None;
+        }
+        Some(out)
+    }
+
     /// Takes back the bytes the last [`copy`](Self::copy) returned, when
     /// they turned out not to be needed, so the space is used again.
     pub fn undo(&mut self, bytes: Bytes) {

@@ -253,6 +253,14 @@ impl TcpStream {
         let _ = self.cmd_tx.push(Command::SetCork(true));
     }
 
+    /// The DMA writer when this connection's port attaches DMA memory to
+    /// packets without copying (the same decision `poll_write` follows),
+    /// else `None`. For callers that build outgoing data in place, such as
+    /// the h1 codec's request head (`crate::dpdk::http::h1`).
+    pub fn dma_writer(&mut self) -> Option<&mut DmaWriter> {
+        self.writer.as_mut()
+    }
+
     /// Zero-copy write: hands owned `data` straight to the worker as a
     /// `Command::Send`, avoiding the copy the [`AsyncWrite`] path is forced to
     /// make from its borrowed `&[u8]`. Waits while the command ring or the
