@@ -1,0 +1,13 @@
+HTTP benchmark server ready on 10.71.0.2:7080
+send_capacity=2097152 initial_window_segments=10
+connections_opened=1920
+send_capacity=2097152 initial_window_segments=10
+connections_opened=1920
+send_capacity=2097152 initial_window_segments=10
+connections_opened=1920
+send_capacity=2097152 initial_window_segments=10
+connections_opened=1920
+send_capacity=2097152 initial_window_segments=10
+connections_opened=1920
+send_capacity=2097152 initial_window_segments=10
+connections_opened=1920

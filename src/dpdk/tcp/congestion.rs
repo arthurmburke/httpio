@@ -23,12 +23,21 @@ pub struct CongestionControl {
 
 impl CongestionControl {
     pub fn new(mss: u16) -> Self {
+        Self::with_initial_window(mss, 10)
+    }
+
+    pub(crate) fn with_initial_window(mss: u16, segments: u16) -> Self {
+        assert!(segments > 0);
         let mss = mss as u32;
         Self {
             mss,
             // RFC 6928 initial window: ten segments, bounded in bytes for
             // large MSS values. This is what Linux uses.
-            cwnd: (10 * mss).min((2 * mss).max(14_600)),
+            cwnd: if segments == 10 {
+                (10 * mss).min((2 * mss).max(14_600))
+            } else {
+                u32::from(segments) * mss
+            },
             ssthresh: u32::MAX,
             phase: Phase::SlowStart,
             dup_ack_count: 0,
@@ -116,6 +125,19 @@ impl CongestionControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_window_still_reacts_to_loss() {
+        let mut cc = CongestionControl::with_initial_window(1460, 64);
+        assert_eq!(cc.cwnd(), 64 * 1460);
+        for _ in 0..3 {
+            cc.on_duplicate_ack(100);
+        }
+        cc.on_new_ack(1460, 101);
+        assert_eq!(cc.cwnd(), 32 * 1460);
+        cc.on_rto_timeout(cc.cwnd());
+        assert_eq!(cc.cwnd(), 1460);
+    }
 
     #[test]
     fn slow_start_saturates() {

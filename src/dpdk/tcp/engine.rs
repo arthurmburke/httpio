@@ -360,6 +360,12 @@ impl TcpEngine {
         }
     }
 
+    pub(crate) fn set_initial_window(&mut self, tuple: FourTuple, segments: u16) {
+        if let Some(conn) = self.connections.get_mut(&tuple) {
+            conn.tcb.set_initial_window(segments);
+        }
+    }
+
     /// TCP_NODELAY: disable (or re-enable) Nagle's algorithm for one
     /// connection.
     pub fn set_nodelay(&mut self, tuple: FourTuple, nodelay: bool) {

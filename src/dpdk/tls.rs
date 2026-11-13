@@ -1405,7 +1405,8 @@ mod tests {
     fn backpressure_keeps_encrypted_bytes_without_reencrypting() {
         run(async {
             let (mut client, mut server) = established(client_config(&[]), tls13(), &[1448]).await;
-            let payload = pattern(1 << 20, 3);
+            // Exceed the transport credit even when its default changes.
+            let payload = pattern(2 * crate::dpdk::tcp::worker::SEND_CAPACITY, 3);
             let mut data = Some(Bytes::from(payload.clone()));
             let mut cx = Context::from_waker(Waker::noop());
             assert!(client.poll_send(&mut cx, &mut data).is_pending());

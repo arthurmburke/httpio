@@ -1,0 +1,72 @@
+# repeat=1 backend=kernel-hyper
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+kernel-hyper	GET	64	300	59.54	95.50	60.51	16525.55	8.46
+kernel-hyper	GET	16384	300	58.67	85.50	60.80	16446.43	2155.67
+kernel-hyper	GET	1048576	300	608.08	785.12	621.74	1608.39	13492.15
+kernel-hyper	POST	64	300	40.29	60.46	41.41	24148.43	12.36
+kernel-hyper	POST	16384	300	48.29	64.92	49.08	20374.45	2670.52
+kernel-hyper	POST	1048576	300	872.29	1211.42	891.26	1122.01	9412.07
+# repeat=2 backend=kernel-hyper
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+kernel-hyper	GET	64	300	38.29	60.79	40.42	24738.51	12.67
+kernel-hyper	GET	16384	300	45.75	68.25	48.03	20820.98	2729.05
+kernel-hyper	GET	1048576	300	631.38	856.58	646.45	1546.91	12976.44
+kernel-hyper	POST	64	300	36.71	52.83	37.85	26417.85	13.53
+kernel-hyper	POST	16384	300	65.21	182.38	71.67	13952.65	1828.80
+kernel-hyper	POST	1048576	300	873.25	1029.42	884.37	1130.74	9485.35
+# repeat=3 backend=kernel-hyper
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+kernel-hyper	GET	64	300	41.29	62.75	42.48	23540.18	12.05
+kernel-hyper	GET	16384	300	46.50	65.46	47.59	21011.52	2754.02
+kernel-hyper	GET	1048576	300	592.29	713.21	586.01	1706.45	14314.74
+kernel-hyper	POST	64	300	41.71	57.92	42.73	23405.06	11.98
+kernel-hyper	POST	16384	300	48.33	68.17	49.72	20113.76	2636.35
+kernel-hyper	POST	1048576	300	818.25	939.71	827.95	1207.80	10131.79
+# repeat=1 backend=dpdk-h1
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+dpdk-h1	GET	64	300	27.12	38.17	27.90	35836.94	18.35
+dpdk-h1	GET	16384	300	34.42	53.83	36.19	27629.74	3621.49
+dpdk-h1	GET	1048576	300	367.33	486.42	371.17	2694.17	22600.36
+dpdk-h1	POST	64	300	26.33	36.92	26.77	37358.13	19.13
+dpdk-h1	POST	16384	300	43.38	53.38	43.37	23055.72	3021.96
+dpdk-h1	POST	1048576	300	1286.67	1346.58	1287.50	776.70	6515.41
+# repeat=1 backend=dpdk-hyper
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+dpdk-hyper	GET	64	300	28.75	42.21	29.11	34347.20	17.59
+dpdk-hyper	GET	16384	300	36.58	59.92	38.28	26121.20	3423.76
+dpdk-hyper	GET	1048576	300	537.04	771.42	548.14	1824.37	15303.90
+dpdk-hyper	POST	64	300	25.62	34.46	26.13	38262.90	19.59
+dpdk-hyper	POST	16384	300	49.08	146.96	55.13	18137.74	2377.35
+dpdk-hyper	POST	1048576	300	1296.17	1387.17	1297.91	770.47	6463.18
+# repeat=2 backend=dpdk-hyper
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+dpdk-hyper	GET	64	300	29.46	37.58	29.36	34063.34	17.44
+dpdk-hyper	GET	16384	300	35.33	52.83	36.93	27080.41	3549.48
+dpdk-hyper	GET	1048576	300	549.71	774.21	564.49	1771.51	14860.54
+dpdk-hyper	POST	64	300	26.38	34.54	26.89	37193.13	19.04
+dpdk-hyper	POST	16384	300	49.12	65.62	49.86	20055.60	2628.73
+dpdk-hyper	POST	1048576	300	1299.58	1448.12	1305.80	765.81	6424.10
+# repeat=2 backend=dpdk-h1
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+dpdk-h1	GET	64	300	30.46	47.38	30.98	32281.19	16.53
+dpdk-h1	GET	16384	300	34.12	45.79	35.08	28506.70	3736.43
+dpdk-h1	GET	1048576	300	372.58	407.04	374.57	2669.75	22395.45
+dpdk-h1	POST	64	300	27.08	36.00	27.50	36358.46	18.62
+dpdk-h1	POST	16384	300	43.83	53.12	43.88	22789.57	2987.08
+dpdk-h1	POST	1048576	300	1288.25	1399.62	1295.61	771.84	6474.62
+# repeat=3 backend=dpdk-h1
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+dpdk-h1	GET	64	300	30.42	49.29	30.84	32422.50	16.60
+dpdk-h1	GET	16384	300	35.58	65.67	37.42	26721.31	3502.42
+dpdk-h1	GET	1048576	300	366.12	573.33	379.14	2637.56	22125.44
+dpdk-h1	POST	64	300	26.25	35.67	26.82	37279.03	19.09
+dpdk-h1	POST	16384	300	43.71	89.71	45.29	22080.19	2894.10
+dpdk-h1	POST	1048576	300	1278.75	1386.42	1284.57	778.47	6530.26
+# repeat=3 backend=dpdk-hyper
+backend	method	bytes	samples	p50_us	p99_us	mean_us	req_s	payload_mbit_s
+dpdk-hyper	GET	64	300	29.08	42.88	29.28	34149.94	17.48
+dpdk-hyper	GET	16384	300	34.54	66.17	35.75	27973.21	3666.50
+dpdk-hyper	GET	1048576	300	550.33	694.71	559.88	1786.10	14982.90
+dpdk-hyper	POST	64	300	25.67	37.33	26.21	38157.42	19.54
+dpdk-hyper	POST	16384	300	47.75	57.67	47.86	20895.62	2738.83
+dpdk-hyper	POST	1048576	300	1301.29	1368.12	1301.75	768.20	6444.11

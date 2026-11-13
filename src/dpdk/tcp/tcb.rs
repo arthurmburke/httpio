@@ -131,6 +131,7 @@ pub struct Tcb {
 
     peer_mss: u16,
     local_mss: u16,
+    initial_window_segments: u16,
     tx_payload_limit: usize,
     peer_scale: Option<u8>,
 
@@ -202,6 +203,7 @@ impl Tcb {
             rcv_nxt: Seq::new(0),
             peer_mss: FALLBACK_PEER_MSS,
             local_mss: DEFAULT_MSS,
+            initial_window_segments: 10,
             tx_payload_limit: 0,
             peer_scale: None,
             retransmit: RetransmitQueue::default(),
@@ -293,6 +295,13 @@ impl Tcb {
     /// The engine applies this before the first SYN and every output poll.
     pub(crate) fn set_local_mss(&mut self, mss: u16) {
         self.local_mss = mss.min(DEFAULT_MSS);
+    }
+
+    pub(crate) fn set_initial_window(&mut self, segments: u16) {
+        assert!(segments > 0);
+        // Only configure active opens before the SYN/SYN-ACK exchange.
+        assert_eq!(self.state, TcpState::SynSent);
+        self.initial_window_segments = segments;
     }
 
     /// TCP_NODELAY. `true` disables Nagle's algorithm: sub-MSS segments
@@ -460,7 +469,8 @@ impl Tcb {
             .mss
             .unwrap_or(FALLBACK_PEER_MSS)
             .clamp(1, DEFAULT_MSS);
-        self.congestion = CongestionControl::new(self.peer_mss);
+        self.congestion =
+            CongestionControl::with_initial_window(self.send_mss(), self.initial_window_segments);
 
         if hdr.has_flag(flags::ACK) {
             self.snd_una = Seq::new(hdr.ack);
@@ -1159,6 +1169,36 @@ mod tests {
         let _ack = tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::Established);
         tcb
+    }
+
+    #[test]
+    fn configured_window_survives_handshake_and_respects_peer_window() {
+        let now = Instant::now();
+        for segments in [10, 64] {
+            for peer_window in [8000, u16::MAX] {
+                let mut tcb = Tcb::new_active(tuple());
+                tcb.set_initial_window(segments);
+                tcb.set_local_mss(1000);
+                tcb.poll_output(now);
+                let mut reply = header(
+                    Seq::new(1000),
+                    tcb.snd_nxt,
+                    flags::SYN | flags::ACK,
+                    peer_window,
+                );
+                reply.options.mss = Some(1460);
+                tcb.on_segment(&reply, Bytes::new(), now);
+                let window = u32::from(segments) * 1000;
+                assert_eq!(tcb.congestion.cwnd(), window);
+                tcb.send(Bytes::from(vec![0; 100_000]));
+                let sent: usize = tcb
+                    .poll_output(now)
+                    .iter()
+                    .map(|seg| seg.payload.len())
+                    .sum();
+                assert_eq!(sent, window.min(u32::from(peer_window)) as usize);
+            }
+        }
     }
 
     #[test]

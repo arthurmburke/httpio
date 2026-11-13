@@ -55,8 +55,30 @@ const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // Per-connection rings stay SPSC: exactly one thread owns each end (the
 // thread driving that connection's `TcpStream`, and the worker lcore).
-/// Maximum queued plus unacknowledged application bytes per connection.
+/// Default limit on queued plus unacknowledged application bytes per connection.
 pub const SEND_CAPACITY: usize = 256 * 1024;
+
+/// Send-side limits for connections opened through a worker handle.
+/// Credit bounds queued plus unacknowledged bytes; it does not preallocate
+/// payload memory or override congestion control or the peer's receive window.
+#[derive(Debug, Clone, Copy)]
+pub struct SendConfig {
+    /// Logical byte credit per connection, allocated only as data is queued.
+    pub capacity: std::num::NonZeroUsize,
+    /// Initial congestion window in segments. The default is ten; larger
+    /// values are an explicit opt-in for provisioned, controlled networks.
+    /// Loss recovery still reduces the window, including to one MSS on RTO.
+    pub initial_window_segments: std::num::NonZeroU16,
+}
+
+impl Default for SendConfig {
+    fn default() -> Self {
+        Self {
+            capacity: std::num::NonZeroUsize::new(SEND_CAPACITY).unwrap(),
+            initial_window_segments: std::num::NonZeroU16::new(10).unwrap(),
+        }
+    }
+}
 
 const READY_CAP: usize = 4096;
 #[derive(Clone)]
@@ -72,6 +94,7 @@ struct Wake {
 
 pub(crate) struct SendCredit {
     wake: Option<Wake>,
+    capacity: usize,
     app_gone: AtomicBool,
     pub(crate) bytes: AtomicUsize,
     pub(crate) failed: AtomicBool,
@@ -104,7 +127,9 @@ impl CmdTx {
         self.outstanding.failed.load(Ordering::Acquire)
     }
     pub fn available_bytes(&self) -> usize {
-        SEND_CAPACITY.saturating_sub(self.outstanding.bytes.load(Ordering::Acquire))
+        self.outstanding
+            .capacity
+            .saturating_sub(self.outstanding.bytes.load(Ordering::Acquire))
     }
     pub fn len(&self) -> usize {
         self.ring.len()
@@ -155,13 +180,17 @@ impl Drop for CmdTx {
 
 #[cfg(test)]
 pub(crate) fn command_channel() -> (CmdTx, CmdRx, Arc<SendCredit>) {
-    command_channel_with_wake(None)
+    command_channel_with_wake(None, SEND_CAPACITY)
 }
 
-fn command_channel_with_wake(wake: Option<Wake>) -> (CmdTx, CmdRx, Arc<SendCredit>) {
+fn command_channel_with_wake(
+    wake: Option<Wake>,
+    capacity: usize,
+) -> (CmdTx, CmdRx, Arc<SendCredit>) {
     let (ring, rx) = spsc::channel();
     let outstanding = Arc::new(SendCredit {
         wake,
+        capacity,
         app_gone: AtomicBool::new(false),
         bytes: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
@@ -253,6 +282,7 @@ struct NewConn {
     remote_port: u16,
     local_port: u16,
     nodelay: bool,
+    initial_window_segments: u16,
     cmd_rx: CmdRx,
     outstanding: Arc<SendCredit>,
     inbound_tx: InboundTx,
@@ -478,6 +508,7 @@ impl WorkerConn {
 /// number of application threads all opening connections concurrently.
 #[derive(Clone)]
 pub struct WorkerHandle {
+    send_config: SendConfig,
     ctrl_tx: CtrlTx,
     ready: ReadySender,
     /// Worker -> application wake-ups for this worker's streams.
@@ -524,6 +555,13 @@ pub struct ConnEndpoints {
 }
 
 impl WorkerHandle {
+    /// Configures future connections opened through this handle. Existing
+    /// connections and previously cloned handles retain their settings.
+    pub fn with_send_config(mut self, config: SendConfig) -> Self {
+        self.send_config = config;
+        self
+    }
+
     /// Launches the engine loop on `worker_lcore` and returns the app-side
     /// handle plus the lcore join handle. The engine/port/pool are moved to
     /// the worker lcore and owned there for the loop's lifetime.
@@ -564,6 +602,7 @@ impl WorkerHandle {
 
         Ok((
             WorkerHandle {
+                send_config: SendConfig::default(),
                 ctrl_tx,
                 ready,
                 app_ready,
@@ -595,11 +634,14 @@ impl WorkerHandle {
             remote_ip,
             remote_port,
         };
-        let (cmd_tx, cmd_rx, outstanding) = command_channel_with_wake(Some(Wake {
-            tuple,
-            sender: self.ready.clone(),
-            queued: AtomicBool::new(false),
-        }));
+        let (cmd_tx, cmd_rx, outstanding) = command_channel_with_wake(
+            Some(Wake {
+                tuple,
+                sender: self.ready.clone(),
+                queued: AtomicBool::new(false),
+            }),
+            self.send_config.capacity.get(),
+        );
         let (inbound_tx, inbound_rx) = inbound_channel(outstanding.clone());
         let wake = self.app_ready.wake_handle();
 
@@ -608,6 +650,7 @@ impl WorkerHandle {
             remote_port,
             local_port,
             nodelay,
+            initial_window_segments: self.send_config.initial_window_segments.get(),
             cmd_rx,
             outstanding,
             inbound_tx,
@@ -720,6 +763,7 @@ fn run(
                 continue;
             };
             engine.set_nodelay(tuple, nc.nodelay);
+            engine.set_initial_window(tuple, nc.initial_window_segments);
             work.insert(tuple);
             nc.outstanding.clear_notification();
             let mut conn = WorkerConn::new(tuple, nc.cmd_rx, nc.outstanding, nc.inbound_tx);
@@ -855,7 +899,7 @@ mod tests {
     }
 
     fn fixture_with_wake(wake: Option<Wake>) -> (CmdTx, WorkerConn, TcpEngine) {
-        let (tx, cmd_rx, outstanding) = command_channel_with_wake(wake);
+        let (tx, cmd_rx, outstanding) = command_channel_with_wake(wake, SEND_CAPACITY);
         let (inbound_tx, _rx) = spsc::channel();
         let mut engine = TcpEngine::new(super::super::engine::EngineConfig::default());
         let tuple = engine
@@ -1051,6 +1095,26 @@ mod tests {
     }
 
     #[test]
+    fn configured_credit_is_bounded_and_replenished() {
+        for capacity in [1024, 256 * 1024, 2 * 1024 * 1024] {
+            let (tx, rx, credit) = command_channel_with_wake(None, capacity);
+            assert_eq!(tx.available_bytes(), capacity);
+            assert!(
+                tx.push(Command::Send(Bytes::from(vec![0; capacity])))
+                    .is_ok()
+            );
+            assert!(tx.push(Command::Send(Bytes::from_static(b"x"))).is_err());
+            // Consuming commands alone does not release their byte reservation.
+            rx.pop().unwrap();
+            assert_eq!(tx.available_bytes(), 0);
+            credit.bytes.fetch_sub(100, Ordering::AcqRel);
+            assert_eq!(tx.available_bytes(), 100);
+            assert!(tx.push(Command::Send(Bytes::from(vec![0; 100]))).is_ok());
+            assert_eq!(tx.available_bytes(), 0);
+        }
+    }
+
+    #[test]
     fn abort_notifies_both_connecting_and_established_readers() {
         for established in [false, true] {
             let (cmd_tx, cmd_rx, outstanding) = command_channel();
@@ -1090,6 +1154,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = mpsc::channel();
         let handle = WorkerHandle {
+            send_config: SendConfig::default(),
             ctrl_tx,
             local_ip: Ipv4Addr::UNSPECIFIED,
             ready: ReadySender {
