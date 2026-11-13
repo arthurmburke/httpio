@@ -828,6 +828,42 @@ impl AsyncWrite for TcpStream {
     }
 }
 
+impl TcpStream {
+    /// The stream's DMA writer, when the port attaches DMA memory to
+    /// packets without copying (the same condition `poll_write` uses);
+    /// `None` otherwise, and owned data sent with
+    /// [`poll_send`](Self::poll_send) should come from the ordinary heap.
+    /// For callers that generate their bytes (e.g. masking) and want to
+    /// write them once, straight into memory the engine can transmit.
+    pub(crate) fn dma_writer(&mut self) -> Option<&mut DmaWriter> {
+        self.writer.as_mut()
+    }
+
+    /// An open stream with no worker behind it, plus the worker's ends of
+    /// its rings, for tests elsewhere in the crate. Writes have no DMA
+    /// writer (no EAL in unit tests).
+    #[cfg(test)]
+    pub(crate) fn test_stream() -> (
+        TcpStream,
+        crate::dpdk::tcp::worker::CmdRx,
+        crate::dpdk::tcp::worker::InboundTx,
+        Arc<crate::dpdk::tcp::worker::SendCredit>,
+    ) {
+        let (cmd_tx, cmd_rx, credit) = crate::dpdk::tcp::worker::command_channel();
+        let (inbound_tx, inbound_rx) = crate::dpdk::tcp::worker::inbound_channel(credit.clone());
+        let stream = TcpStream {
+            cmd_tx,
+            inbound_rx,
+            flush: None,
+            wake: None,
+            state: StreamState::Open,
+            read_queue: VecDeque::new(),
+            writer: None,
+        };
+        (stream, cmd_rx, inbound_tx, credit)
+    }
+}
+
 // Dropping the stream drops its command sender; the worker observes the
 // closed ring and closes the engine-side connection (sending a FIN), so
 // no explicit teardown message is needed here.

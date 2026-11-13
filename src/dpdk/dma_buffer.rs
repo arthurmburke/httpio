@@ -183,6 +183,36 @@ impl DmaWriter {
         Some(out)
     }
 
+    /// Like [`copy`](Self::copy), but for data that is generated rather
+    /// than copied from somewhere (e.g. masked): reserves the next `len`
+    /// bytes of the current block -- fewer if it has less room; callers
+    /// loop -- lets `fill` write them in place, and returns them. The
+    /// slice `fill` receives holds stale bytes from an earlier use and must
+    /// be overwritten in full. `None` if `len` is zero or no DMA memory
+    /// could be allocated.
+    ///
+    /// EAL must be initialised.
+    pub fn fill_with(&mut self, len: usize, fill: impl FnOnce(&mut [u8])) -> Option<Bytes> {
+        if len == 0 {
+            return None;
+        }
+        if self.current.is_none() {
+            self.current = Some(self.next_block(len)?);
+        }
+        let block = self.current.as_mut()?;
+        let n = len.min(block.whole.len() - block.used);
+        // SAFETY: as in `copy`: `used + n` is within the block (whose
+        // memory is initialised: zeroed on allocation, then only ever
+        // written), and no slice covering these bytes has been handed out.
+        fill(unsafe { std::slice::from_raw_parts_mut(block.base.as_ptr().add(block.used), n) });
+        let out = block.whole.slice(block.used..block.used + n);
+        block.used += n;
+        if block.used == block.whole.len() {
+            self.current = None;
+        }
+        Some(out)
+    }
+
     /// Takes back the bytes the last [`copy`](Self::copy) returned, when
     /// they turned out not to be needed, so the space is used again.
     pub fn undo(&mut self, bytes: Bytes) {
