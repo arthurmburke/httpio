@@ -1,6 +1,7 @@
 //! The HTTP client: HTTPS via rustls (webpki roots + custom CAs, ALPN),
-//! HTTP/1.1 and HTTP/2 via hyper's low-level `client::conn` API, over
-//! `TcpStream`.
+//! HTTP/1.1 via the zero-copy codec in [`h1`] (plain and over TLS),
+//! HTTP/2 and protocol upgrades via hyper's low-level `client::conn` API,
+//! all over `TcpStream`.
 //!
 //! The request/response API uses the `http` crate's types directly:
 //! `http::Request<Bytes>` in, `http::Response<Bytes>` out (the response
@@ -22,8 +23,8 @@ use futures::StreamExt;
 use futures::future::ready;
 use http::request::Parts;
 use http::{HeaderValue, Method, Request, Response, Uri, Version, header};
-use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use http_body_util::{BodyExt, BodyStream, Full};
+use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::pki_types::ServerName;
@@ -37,7 +38,7 @@ use crate::core::hashmap::HashMap;
 use crate::dpdk::http::h1;
 use crate::dpdk::tcp::stream::{FlushHandle, TcpOptions, TcpStream};
 use crate::dpdk::tcp::worker::WorkerHandle;
-use crate::dpdk::tls::TlsConnector;
+use crate::dpdk::tls::{TlsConnector, TlsStream};
 use crate::http::codec::{self, ByteStream, Empty, EncodedBody};
 use crate::http::errors::HttpError;
 
@@ -56,12 +57,14 @@ const EPHEMERAL_LAST: u16 = 65535;
 /// 4-tuple already in use, before giving up with `Connect(AddrInUse)`.
 const DIAL_PORT_ATTEMPTS: usize = 64;
 
-/// A response body still on the wire: hyper's (https, h2, upgrades) or the
-/// zero-copy codec's (plain `http`, see [`h1`]). The h1 body owns its
-/// connection, so the connection lives exactly as long as the body is read.
+/// A response body still on the wire: hyper's (h2) or the zero-copy
+/// HTTP/1.1 codec's (see [`h1`]), over plain TCP or over TLS. An h1 body
+/// owns its connection, so the connection lives exactly as long as the
+/// body is read.
 enum ResponseBody {
     Hyper(Incoming),
     H1(h1::Body<TcpStream>),
+    H1Tls(h1::Body<TlsStream>),
 }
 
 fn hyper_body(response: Response<Incoming>) -> Response<ResponseBody> {
@@ -284,6 +287,9 @@ impl Client {
             ResponseBody::H1(body) => {
                 return h1::into_typed_response(Response::from_parts(parts, body)).await;
             }
+            ResponseBody::H1Tls(body) => {
+                return h1::into_typed_response(Response::from_parts(parts, body)).await;
+            }
         };
         // A ByteStream response target takes the body unbuffered: hand over
         // the chunk stream without collecting. Data frames pass through as
@@ -359,9 +365,7 @@ impl Client {
                     .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
                 // Cork only now that the TLS handshake has completed.
                 tls.tcp().request_cork();
-                return send_h1(tls, parts, Full::new(body), &host, port, is_https)
-                    .await
-                    .map(hyper_body);
+                return send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port).await;
             }
 
             // Fast path: multiplex onto an existing h2 connection.
@@ -395,9 +399,7 @@ impl Client {
                     .insert(port, send_request.clone());
                 send_h2_on(send_request, parts, body).await.map(hyper_body)
             } else {
-                send_h1(tls, parts, Full::new(body), &host, port, is_https)
-                    .await
-                    .map(hyper_body)
+                send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port).await
             }
         } else {
             let tcp = self
@@ -412,7 +414,7 @@ impl Client {
     }
 
     /// Sends a request whose body is a [`ByteStream`], chunk-by-chunk as the
-    /// stream yields (hyper uses chunked transfer-encoding, since the total
+    /// stream yields (with chunked transfer-encoding, since the total
     /// length is unknown).
     ///
     /// Streaming is HTTP/1.1-only: the h2 pool multiplexes `Full<Bytes>`
@@ -456,16 +458,7 @@ impl Client {
                 // Cork only now that the TLS handshake has completed.
                 tls.tcp().request_cork();
             }
-            // Each chunk becomes one hyper data frame, by move -- no copy
-            // here. A producer `Err` becomes a hyper body error, aborting
-            // the request.
-            let body = StreamBody::new(body.into_inner().map(|item| {
-                item.map(Frame::data)
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-            }));
-            send_h1(tls, parts, body, &host, port, is_https)
-                .await
-                .map(hyper_body)
+            send_tls_h1(tls, parts, EncodedBody::Stream(body), &host, port).await
         } else {
             // Plain HTTP has no handshake, so cork right away.
             if tcp_options.cork {
@@ -638,40 +631,23 @@ async fn send_plain_h1(
     Ok(response.map(ResponseBody::H1))
 }
 
-async fn send_h1<T, B>(
-    io: T,
+/// `https` HTTP/1.1 over the same codec, exchanging plaintext `Bytes` with
+/// the TLS stream. The connection ends when the response body does; no
+/// `close_notify` is sent first, the request having asked the server to
+/// close (`Connection: close`).
+async fn send_tls_h1(
+    tls: TlsStream,
     mut parts: Parts,
-    body: B,
+    body: EncodedBody,
     host: &str,
     port: u16,
-    is_https: bool,
-) -> Result<Response<Incoming>, HttpError>
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: hyper::body::Body + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    let (mut send_request, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
-        .await
-        .map_err(|_| HttpError::Protocol)?;
-    // The connection task owns the transport and must be polled for the
-    // request/response to make progress.
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
-    let default_port = if is_https { 443 } else { 80 };
-    rewrite_to_origin_form(&mut parts, host, port, default_port)?;
-    let request = Request::from_parts(parts, body);
-
-    send_request
-        .send_request(request)
-        .await
-        .map_err(|_| HttpError::Protocol)
+) -> Result<Response<ResponseBody>, HttpError> {
+    rewrite_to_origin_form(&mut parts, host, port, 443)?;
+    let response = h1::send_over_tls(tls, parts, body).await?;
+    Ok(response.map(ResponseBody::H1Tls))
 }
 
-/// Like [`send_h1`] but for protocol upgrades: the connection task is
+/// HTTP/1.1 through hyper, for protocol upgrades only: the connection task is
 /// driven with `with_upgrades()` (so a `101 Switching Protocols` response
 /// can hand the underlying connection to `hyper::upgrade::on`) and the
 /// response is returned raw, body uncollected.

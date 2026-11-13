@@ -1703,6 +1703,49 @@ mod tests {
         });
     }
 
+    /// The zero-copy HTTP/1.1 codec over this stream's owned-`Bytes` face,
+    /// against a real HTTP/1.1 server: a buffered body and a streamed
+    /// (chunked) one, each on its own connection, as the client sends them.
+    #[test]
+    fn h1_codec_end_to_end() {
+        use crate::dpdk::http::h1;
+        use crate::http::codec::{ByteStream, EncodedBody};
+
+        run(async {
+            for (path, len, streamed) in [
+                ("/a", 0, false),
+                ("/b", 70_000, false),
+                ("/c", 50_000, true),
+            ] {
+                let server = server_config(&[&rustls::version::TLS13], &[b"http/1.1"]);
+                let (client, server) =
+                    established(client_config(&[b"http/1.1"]), server, &[1448, 3, 9000]).await;
+                let server = tokio::spawn(serve(server, false));
+                let payload = Bytes::from(pattern(len, 7));
+                let body = if streamed {
+                    let chunks: Vec<Bytes> =
+                        payload.chunks(7_000).map(Bytes::copy_from_slice).collect();
+                    EncodedBody::Stream(ByteStream::from(futures::stream::iter(chunks)))
+                } else {
+                    EncodedBody::Full(payload)
+                };
+                let parts = hyper::Request::post(path)
+                    .header("host", "test.local")
+                    .body(())
+                    .unwrap()
+                    .into_parts()
+                    .0;
+                let response = h1::send_over_tls(client, parts, body).await.unwrap();
+                assert_eq!(response.status(), 200);
+                let body = response.into_body().collect().await.unwrap();
+                assert_eq!(&body[..], &expected_reply(path, len)[..]);
+                // The request asked the server to close; it must finish
+                // cleanly once the response is out.
+                server.await.unwrap();
+            }
+        });
+    }
+
     #[test]
     fn hyper_http2_end_to_end() {
         run(async {

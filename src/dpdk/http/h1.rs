@@ -1,5 +1,5 @@
-//! A hand-rolled, zero-copy HTTP/1.1 client codec, used for plain `http://`
-//! requests in place of hyper.
+//! A hand-rolled, zero-copy HTTP/1.1 client codec, used for `http://` and
+//! `https://` HTTP/1.1 requests in place of hyper.
 //!
 //! Why: hyper speaks through `AsyncRead`/`AsyncWrite`, which forces a copy
 //! in each direction at the [`TcpStream`] boundary (a borrowed write slice
@@ -8,7 +8,7 @@
 //!
 //! - **Requests**: the request line and headers are serialised once, in
 //!   place, into one buffer -- DMA memory when the port attaches it to
-//!   packets without copying (see [`DmaWriter::fill`]), else the heap. The
+//!   packets without copying (see [`DmaWriter::fill_exact`]), else the heap. The
 //!   body `Bytes` are then sent untouched. Streamed bodies get chunked
 //!   framing as small separate buffers around each untouched chunk.
 //! - **Responses**: the head is parsed with `httparse` directly over the
@@ -18,8 +18,9 @@
 //!   of NIC packet buffers), never copied.
 //!
 //! The codec runs over any [`Transport`], a two-method owned-`Bytes` I/O
-//! trait, so it can run over TLS by adding one impl, and is unit tested
-//! here over an in-memory transport.
+//! trait: plain [`TcpStream`], [`TlsStream`] (where the `Bytes` are
+//! plaintext and the copies that remain are the TLS layer's), and an
+//! in-memory transport for the unit tests here.
 //!
 //! Scope: one request per connection (`Connection: close` unless the caller
 //! chose otherwise); the connection is dropped when the response body ends.
@@ -45,6 +46,7 @@ use serde::de::DeserializeOwned;
 
 use crate::dpdk::DmaWriter;
 use crate::dpdk::tcp::stream::TcpStream;
+use crate::dpdk::tls::TlsStream;
 use crate::http::codec::{self, EncodedBody};
 use crate::http::errors::HttpError;
 
@@ -89,6 +91,23 @@ impl Transport for TcpStream {
 
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
         TcpStream::poll_recv(self, cx)
+    }
+}
+
+/// Over TLS the codec exchanges plaintext `Bytes` with the TLS stream,
+/// which encrypts each buffer it is sent straight into the memory it
+/// transmits from and hands decrypted records back as owned `Bytes`.
+impl Transport for TlsStream {
+    fn poll_send(
+        &mut self,
+        cx: &mut Context<'_>,
+        data: &mut Option<Bytes>,
+    ) -> Poll<io::Result<()>> {
+        TlsStream::poll_send(self, cx, data)
+    }
+
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+        TlsStream::poll_recv(self, cx)
     }
 }
 
@@ -375,6 +394,19 @@ pub async fn send_over_tcp(
     let request = PreparedRequest::new(parts, body)?;
     let head = request.encode_head(tcp.dma_writer());
     request.exchange(tcp, head).await
+}
+
+/// Sends one request over a fresh TLS connection. The head is built on the
+/// heap: it is plaintext, which the TLS stream encrypts into the memory it
+/// transmits from, so DMA memory would buy nothing here.
+pub async fn send_over_tls(
+    tls: TlsStream,
+    parts: request::Parts,
+    body: EncodedBody,
+) -> Result<Response<Body<TlsStream>>, HttpError> {
+    let request = PreparedRequest::new(parts, body)?;
+    let head = request.encode_head(None);
+    request.exchange(tls, head).await
 }
 
 /// Turns a codec response into the typed response `Client::request`
