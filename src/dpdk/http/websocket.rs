@@ -8,6 +8,21 @@
 //! validated `101 Switching Protocols`, the connection is taken over via
 //! `hyper::upgrade` and spoken as WebSocket frames.
 //!
+//! Two transports carry the frames (see [`Transport`]):
+//!
+//! - `ws://` recovers the raw [`TcpStream`] from hyper's `Upgraded` and
+//!   runs on its owned-`Bytes` API. Received payloads are slices of the
+//!   received chunks (views of the NIC's packet buffers) whenever a frame's
+//!   payload lies within one chunk; only what straddles chunks is copied to
+//!   make it contiguous. Outgoing frames are masked in one pass straight
+//!   into DMA memory the engine attaches to packets without another copy.
+//! - `wss://` (anything that isn't a bare `TcpStream`) stays on the
+//!   copying `AsyncRead`/`AsyncWrite` of hyper's `Upgraded`: the bytes
+//!   there are TLS plaintext, which rustls copies anyway.
+//!
+//! The frame logic (parsing rules, Ping/Close handling, ordering) is the
+//! same for both; only where bytes come from and go to differs.
+//!
 //! Corking is not allowed for WebSocket connections: a corked connection
 //! holds its sub-MSS tail for a manual flush, which would stall every
 //! small frame of an interactive protocol. The upgrade path structurally
@@ -22,6 +37,7 @@
 
 use std::{
     collections::VecDeque,
+    mem::MaybeUninit,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -35,6 +51,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::client::Client;
+use crate::dpdk::tcp::stream::TcpStream;
 use crate::http::errors::{
     HttpError::{self, InvalidHeaderValue},
     WebSocketError,
@@ -46,6 +63,12 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 /// Minimum free space offered to each socket read.
 const READ_CHUNK: usize = 8 * 1024;
+/// Longest inbound (server) frame header: 2 bytes plus an 8-byte extended
+/// length. Server frames carry no masking key.
+const MAX_INBOUND_HEADER: usize = 10;
+/// Longest outbound (client) frame header: 2 bytes, an 8-byte extended
+/// length, and the 4-byte masking key.
+const MAX_OUTBOUND_HEADER: usize = 14;
 
 const OP_CONTINUATION: u8 = 0x0;
 const OP_TEXT: u8 = 0x1;
@@ -54,8 +77,8 @@ const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
 const OP_PONG: u8 = 0xA;
 
-/// The IO the frames run over: the connection hyper handed back after the
-/// 101, re-wrapped for tokio.
+/// The IO the frames run over on the copying path: the connection hyper
+/// handed back after the 101, re-wrapped for tokio.
 type WsIo = TokioIo<Upgraded>;
 
 // The message types are the generic ones from the transport-agnostic
@@ -78,10 +101,8 @@ enum CloseState {
 
 /// An established WebSocket connection.
 pub struct WebSocketClient {
-    io: WsIo,
+    io: Transport,
     rng: SystemRandom,
-    /// Raw inbound bytes not yet parsed into frames.
-    read_buf: BytesMut,
     /// In-progress fragmented message: (data opcode, accumulated payload).
     fragment: Option<(u8, BytesMut)>,
     close: CloseState,
@@ -90,13 +111,11 @@ pub struct WebSocketClient {
     /// The `101 Switching Protocols` response parts (status, headers,
     /// extensions), kept for callers that need e.g. `Set-Cookie`.
     handshake: http::response::Parts,
-    /// Outgoing frames, already masked and encoded, in wire order: Sink
+    /// Outgoing bytes, already masked and encoded, in wire order: Sink
     /// messages plus automatic replies (Pong, Close echo) queued while
-    /// reading. Only the front frame may be partly written.
+    /// reading. A frame may span several entries (one per DMA block it was
+    /// written into); only the front entry may be partly written.
     write_queue: VecDeque<Bytes>,
-    write_buffer: BytesMut,
-    /// Bytes of the front frame already written.
-    write_pos: usize,
     /// A received message held back until the automatic reply it triggered
     /// has been written and flushed (see [`Self::poll_recv`]).
     ready_message: Option<Message>,
@@ -238,24 +257,31 @@ impl WebSocketClient {
         ))
     }
 
-    /// Wraps a connection whose opening handshake has been validated.
+    /// Wraps a connection whose opening handshake has been validated, on
+    /// the zero-copy transport when it is a plain [`TcpStream`].
     fn from_upgraded(
         upgraded: Upgraded,
         rng: SystemRandom,
         protocol: Option<String>,
         handshake: http::response::Parts,
     ) -> Self {
+        Self::with_transport(Transport::from_upgraded(upgraded), rng, protocol, handshake)
+    }
+
+    fn with_transport(
+        io: Transport,
+        rng: SystemRandom,
+        protocol: Option<String>,
+        handshake: http::response::Parts,
+    ) -> Self {
         WebSocketClient {
-            io: TokioIo::new(upgraded),
+            io,
             rng,
-            read_buf: BytesMut::with_capacity(8 * 1024),
             fragment: None,
             close: CloseState::Open,
             protocol,
             handshake,
             write_queue: VecDeque::new(),
-            write_buffer: BytesMut::new(),
-            write_pos: 0,
             ready_message: None,
         }
     }
@@ -314,41 +340,23 @@ impl WebSocketClient {
                 return Poll::Ready(Ok(self.ready_message.take()));
             }
 
-            if let Some(frame) = try_parse_frame(&mut self.read_buf)? {
-                let queued = self.write_queue.len();
-                match self.handle_frame(frame)? {
-                    Some(message) if self.write_queue.len() > queued => {
-                        self.ready_message = Some(message);
-                    }
-                    Some(message) => return Poll::Ready(Ok(Some(message))),
-                    None => {}
-                }
-                continue;
-            }
-
-            if ready!(self.poll_fill_read_buf(cx))? == 0 {
+            let Some(frame) = ready!(self.io.poll_frame(cx))? else {
                 // EOF. Clean only if the close handshake got at least our
                 // half out (some peers close TCP without echoing Close).
                 if self.close != CloseState::Open {
                     return Poll::Ready(Ok(None));
                 }
                 return Poll::Ready(Err(WebSocketError::UncleanClose));
+            };
+            let queued = self.write_queue.len();
+            match self.handle_frame(frame)? {
+                Some(message) if self.write_queue.len() > queued => {
+                    self.ready_message = Some(message);
+                }
+                Some(message) => return Poll::Ready(Ok(Some(message))),
+                None => {}
             }
         }
-    }
-
-    /// Reads more inbound bytes onto the end of `read_buf`; `Ok(0)` at EOF.
-    fn poll_fill_read_buf(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, WebSocketError>> {
-        self.read_buf.reserve(READ_CHUNK);
-        let n = {
-            let mut buf = ReadBuf::uninit(self.read_buf.spare_capacity_mut());
-            ready!(Pin::new(&mut self.io).poll_read(cx, &mut buf))
-                .map_err(|e| WebSocketError::Io(e.kind()))?;
-            buf.filled().len()
-        };
-        // SAFETY: `poll_read` initialized the first `n` spare bytes.
-        unsafe { self.read_buf.set_len(self.read_buf.len() + n) };
-        Poll::Ready(Ok(n))
     }
 
     /// Applies one parsed frame; returns a `Message` when one is complete.
@@ -362,7 +370,14 @@ impl WebSocketClient {
                 if frame.fin {
                     return Ok(Some(into_data_message(frame.opcode, frame.payload)?));
                 }
-                self.fragment = Some((frame.opcode, BytesMut::from(&frame.payload[..])));
+                // A payload this side assembled (it straddled chunks) is
+                // uniquely owned and grows in place; one that is a view of
+                // received data is copied into an owned buffer.
+                let buffered = frame
+                    .payload
+                    .try_into_mut()
+                    .unwrap_or_else(|shared| BytesMut::from(&shared[..]));
+                self.fragment = Some((frame.opcode, buffered));
                 Ok(None)
             }
             OP_CONTINUATION => {
@@ -415,82 +430,22 @@ impl WebSocketClient {
     /// Encodes one masked frame (client frames must be masked, RFC 6455
     /// §5.3) onto the end of the outgoing queue.
     fn queue_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), WebSocketError> {
-        let frame = self.encode_frame(opcode, payload)?;
-        self.write_queue.push_back(frame);
-        Ok(())
-    }
-
-    fn encode_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<Bytes, WebSocketError> {
         let mut mask = [0u8; 4];
         self.rng.fill(&mut mask).map_err(|_| WebSocketError::Rng)?;
-
-        let n = payload.len();
-        let mut out = std::mem::take(&mut self.write_buffer);
-        out.clear();
-        out.reserve(14 + n);
-
-        // FIN | opcode
-        out.put_u8(0x80 | opcode);
-
-        if n <= 125 {
-            out.put_u8(0x80 | n as u8);
-        } else if n <= u16::MAX as usize {
-            out.put_u8(0x80 | 126);
-            out.put_u16(n as u16);
-        } else {
-            out.put_u8(0x80 | 127);
-            out.put_u64(n as u64);
-        }
-
-        out.put_slice(&mask);
-
-        // Initialize the reserved payload once, already masked.
-        let start = out.len();
-        for (i, (dst, byte)) in out.spare_capacity_mut()[..n]
-            .iter_mut()
-            .zip(payload)
-            .enumerate()
-        {
-            dst.write(*byte ^ mask[i & 3]);
-        }
-        // SAFETY: the loop initialized exactly n bytes of spare capacity.
-        unsafe { out.set_len(start + n) };
-
-        Ok(out.freeze())
+        let head = OutboundHeader::new(opcode, payload.len(), mask);
+        self.io.encode(&head, payload, &mut self.write_queue);
+        Ok(())
     }
 
     /// Writes the queued frames out, whole and in order (no flush).
     fn poll_write_queue(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
-        while let Some(frame) = self.write_queue.front() {
-            if self.write_pos == frame.len() {
-                let frame = self.write_queue.pop_front().unwrap();
-                if let Ok(mut buffer) = frame.try_into_mut() {
-                    buffer.clear();
-                    if buffer.capacity() > self.write_buffer.capacity() {
-                        self.write_buffer = buffer;
-                    }
-                }
-                self.write_pos = 0;
-                continue;
-            }
-            let n = match ready!(Pin::new(&mut self.io).poll_write(cx, &frame[self.write_pos..])) {
-                Ok(0) => {
-                    return Poll::Ready(Err(WebSocketError::Io(std::io::ErrorKind::WriteZero)));
-                }
-                Ok(n) => n,
-                Err(e) => return Poll::Ready(Err(WebSocketError::Io(e.kind()))),
-            };
-            self.write_pos += n;
-        }
-        Poll::Ready(Ok(()))
+        self.io.poll_write_queue(cx, &mut self.write_queue)
     }
 
     /// Writes every queued frame, then flushes the transport.
     fn poll_flush_writes(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
         ready!(self.poll_write_queue(cx))?;
-        Pin::new(&mut self.io)
-            .poll_flush(cx)
-            .map_err(|e| WebSocketError::Io(e.kind()))
+        self.io.poll_flush(cx)
     }
 }
 
@@ -585,16 +540,400 @@ impl Sink<Message> for WebSocketClient {
     }
 }
 
+/// What the frames run over once the handshake is done. The frame logic in
+/// [`WebSocketClient`] is shared; each variant only supplies parsed frames
+/// and takes encoded ones.
+enum Transport {
+    /// `ws://`: the raw TCP stream, spoken through its owned-`Bytes` API so
+    /// neither direction copies at the stream boundary.
+    Tcp(TcpTransport),
+    /// Anything else hyper hands back (i.e. `wss://`, where rustls sits
+    /// between us and the stream): the copying tokio IO traits.
+    Upgraded(UpgradedTransport),
+}
+
+/// The zero-copy transport over a plain [`TcpStream`].
+struct TcpTransport {
+    stream: TcpStream,
+    reader: ChunkReader,
+}
+
+/// The copying transport over hyper's `Upgraded`.
+struct UpgradedTransport {
+    io: WsIo,
+    /// Raw inbound bytes not yet parsed into frames.
+    read_buf: BytesMut,
+    /// A spare encode buffer, recycled from fully written frames.
+    write_buffer: BytesMut,
+    /// Bytes of the front queue entry already written.
+    write_pos: usize,
+}
+
+impl Transport {
+    /// Recovers the raw [`TcpStream`] from a plaintext upgrade, keeping the
+    /// bytes hyper read past the 101 head as the first input. Any other
+    /// connection (TLS) stays wrapped.
+    fn from_upgraded(upgraded: Upgraded) -> Self {
+        match upgraded.downcast::<TokioIo<TcpStream>>() {
+            Ok(parts) => Transport::Tcp(TcpTransport {
+                stream: parts.io.into_inner(),
+                reader: ChunkReader::new(parts.read_buf),
+            }),
+            Err(upgraded) => Transport::Upgraded(UpgradedTransport {
+                io: TokioIo::new(upgraded),
+                read_buf: BytesMut::with_capacity(8 * 1024),
+                write_buffer: BytesMut::new(),
+                write_pos: 0,
+            }),
+        }
+    }
+
+    /// The next complete inbound frame; `Ok(None)` at EOF.
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<RawFrame>, WebSocketError>> {
+        match self {
+            Transport::Tcp(tcp) => tcp.poll_frame(cx),
+            Transport::Upgraded(upgraded) => upgraded.poll_frame(cx),
+        }
+    }
+
+    /// Appends one encoded frame to `queue`.
+    fn encode(&mut self, head: &OutboundHeader, payload: &[u8], queue: &mut VecDeque<Bytes>) {
+        match self {
+            Transport::Tcp(tcp) => tcp.encode(head, payload, queue),
+            Transport::Upgraded(upgraded) => upgraded.encode(head, payload, queue),
+        }
+    }
+
+    /// Writes `queue` out, whole and in order (no flush).
+    fn poll_write_queue(
+        &mut self,
+        cx: &mut Context<'_>,
+        queue: &mut VecDeque<Bytes>,
+    ) -> Poll<Result<(), WebSocketError>> {
+        match self {
+            Transport::Tcp(tcp) => tcp.poll_write_queue(cx, queue),
+            Transport::Upgraded(upgraded) => upgraded.poll_write_queue(cx, queue),
+        }
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), WebSocketError>> {
+        match self {
+            // `poll_send` hands each chunk to the worker as it goes; there
+            // is no buffer on this side to flush (and the connection is
+            // never corked).
+            Transport::Tcp(_) => Poll::Ready(Ok(())),
+            Transport::Upgraded(upgraded) => Pin::new(&mut upgraded.io)
+                .poll_flush(cx)
+                .map_err(|e| WebSocketError::Io(e.kind())),
+        }
+    }
+}
+
+impl TcpTransport {
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<RawFrame>, WebSocketError>> {
+        loop {
+            if let Some(frame) = self.reader.next_frame()? {
+                return Poll::Ready(Ok(Some(frame)));
+            }
+            match ready!(self.stream.poll_recv(cx)) {
+                Ok(Some(chunk)) => self.reader.push(chunk),
+                Ok(None) => return Poll::Ready(Ok(None)),
+                Err(e) => return Poll::Ready(Err(WebSocketError::Io(e.kind()))),
+            }
+        }
+    }
+
+    /// Writes header and masked payload in one pass straight into DMA
+    /// memory, one entry per block the frame lands in, so the engine
+    /// attaches them to packets as they are. A port without multi-segment
+    /// transmit has no DMA writer (and the worker copies into an mbuf
+    /// regardless); then, or if DMA memory runs out, the rest of the frame
+    /// goes to the heap -- still in one pass.
+    fn encode(&mut self, head: &OutboundHeader, payload: &[u8], queue: &mut VecDeque<Bytes>) {
+        let total = head.len() + payload.len();
+        let mut done = 0;
+        if let Some(writer) = self.stream.dma_writer() {
+            while done < total {
+                let Some(chunk) = writer.fill_with(total - done, |dst| {
+                    write_frame_range(as_uninit(dst), done, head, payload)
+                }) else {
+                    break;
+                };
+                done += chunk.len();
+                queue.push_back(chunk);
+            }
+        }
+        if done < total {
+            let mut out = BytesMut::new();
+            append_frame_range(&mut out, done, head, payload);
+            queue.push_back(out.freeze());
+        }
+    }
+
+    fn poll_write_queue(
+        &mut self,
+        cx: &mut Context<'_>,
+        queue: &mut VecDeque<Bytes>,
+    ) -> Poll<Result<(), WebSocketError>> {
+        while let Some(front) = queue.pop_front() {
+            let mut unsent = Some(front);
+            let result = self.stream.poll_send(cx, &mut unsent);
+            // On `Pending` (or an error) the unsent suffix stays at the
+            // front, so the next poll resumes exactly there.
+            if let Some(rest) = unsent {
+                queue.push_front(rest);
+            }
+            match result {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(WebSocketError::Io(e.kind()))),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl UpgradedTransport {
+    fn poll_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<RawFrame>, WebSocketError>> {
+        loop {
+            if let Some(frame) = try_parse_frame(&mut self.read_buf)? {
+                return Poll::Ready(Ok(Some(frame)));
+            }
+            if ready!(self.poll_fill_read_buf(cx))? == 0 {
+                return Poll::Ready(Ok(None));
+            }
+        }
+    }
+
+    /// Reads more inbound bytes onto the end of `read_buf`; `Ok(0)` at EOF.
+    fn poll_fill_read_buf(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, WebSocketError>> {
+        self.read_buf.reserve(READ_CHUNK);
+        let n = {
+            let mut buf = ReadBuf::uninit(self.read_buf.spare_capacity_mut());
+            ready!(Pin::new(&mut self.io).poll_read(cx, &mut buf))
+                .map_err(|e| WebSocketError::Io(e.kind()))?;
+            buf.filled().len()
+        };
+        // SAFETY: `poll_read` initialized the first `n` spare bytes.
+        unsafe { self.read_buf.set_len(self.read_buf.len() + n) };
+        Poll::Ready(Ok(n))
+    }
+
+    /// Encodes into the recycled heap buffer; `poll_write` copies it on.
+    fn encode(&mut self, head: &OutboundHeader, payload: &[u8], queue: &mut VecDeque<Bytes>) {
+        let mut out = std::mem::take(&mut self.write_buffer);
+        out.clear();
+        append_frame_range(&mut out, 0, head, payload);
+        queue.push_back(out.freeze());
+    }
+
+    fn poll_write_queue(
+        &mut self,
+        cx: &mut Context<'_>,
+        queue: &mut VecDeque<Bytes>,
+    ) -> Poll<Result<(), WebSocketError>> {
+        while let Some(frame) = queue.front() {
+            if self.write_pos == frame.len() {
+                let frame = queue.pop_front().unwrap();
+                if let Ok(mut buffer) = frame.try_into_mut() {
+                    buffer.clear();
+                    if buffer.capacity() > self.write_buffer.capacity() {
+                        self.write_buffer = buffer;
+                    }
+                }
+                self.write_pos = 0;
+                continue;
+            }
+            let n = match ready!(Pin::new(&mut self.io).poll_write(cx, &frame[self.write_pos..])) {
+                Ok(0) => {
+                    return Poll::Ready(Err(WebSocketError::Io(std::io::ErrorKind::WriteZero)));
+                }
+                Ok(n) => n,
+                Err(e) => return Poll::Ready(Err(WebSocketError::Io(e.kind()))),
+            };
+            self.write_pos += n;
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Frame parsing over a sequence of received chunks, without first copying
+/// them into one buffer.
+///
+/// A frame whose payload lies within one chunk is returned as a slice of
+/// that chunk. Only bytes that straddle a chunk boundary are copied: a
+/// split header (at most [`MAX_INBOUND_HEADER`] bytes) into `head`, a split
+/// payload into one buffer of exactly its size. The copy is made as the
+/// chunks arrive, so a large payload never pins more than one received
+/// packet buffer at a time.
+struct ChunkReader {
+    /// The unparsed rest of the latest chunk. Empty whenever
+    /// [`next_frame`](Self::next_frame) returns `None`.
+    chunk: Bytes,
+    state: RecvState,
+}
+
+/// Where [`ChunkReader`] stands within the current frame.
+enum RecvState {
+    /// Expecting a frame header. `head[..filled]` is the start of a header
+    /// that straddles a chunk boundary; `filled == 0` means none is pending
+    /// and the next header is parsed in place from the chunk.
+    Header {
+        head: [u8; MAX_INBOUND_HEADER],
+        filled: usize,
+    },
+    /// The header is parsed and the payload straddles chunks: it is being
+    /// assembled in `payload`, with `remaining` bytes still to come.
+    Payload {
+        fin: bool,
+        opcode: u8,
+        payload: BytesMut,
+        remaining: usize,
+    },
+}
+
+impl RecvState {
+    const START: RecvState = RecvState::Header {
+        head: [0; MAX_INBOUND_HEADER],
+        filled: 0,
+    };
+}
+
+impl ChunkReader {
+    /// A reader whose first input is `leftover`: what hyper read past the
+    /// 101 response head.
+    fn new(leftover: Bytes) -> Self {
+        ChunkReader {
+            chunk: leftover,
+            state: RecvState::START,
+        }
+    }
+
+    /// Supplies the next received chunk, once `next_frame` has asked for
+    /// more input.
+    fn push(&mut self, chunk: Bytes) {
+        debug_assert!(
+            self.chunk.is_empty(),
+            "chunk pushed before the last was used"
+        );
+        self.chunk = chunk;
+    }
+
+    /// The next complete frame, or `None` once the current chunk is used up
+    /// and more input is needed. Enforces the same rules as
+    /// [`try_parse_frame`].
+    fn next_frame(&mut self) -> Result<Option<RawFrame>, WebSocketError> {
+        let header = match &mut self.state {
+            RecvState::Payload {
+                payload, remaining, ..
+            } => {
+                let n = (*remaining).min(self.chunk.len());
+                payload.extend_from_slice(&self.chunk[..n]);
+                self.chunk.advance(n);
+                *remaining -= n;
+                if *remaining > 0 {
+                    return Ok(None);
+                }
+                let RecvState::Payload {
+                    fin,
+                    opcode,
+                    payload,
+                    ..
+                } = std::mem::replace(&mut self.state, RecvState::START)
+                else {
+                    unreachable!("matched Payload above");
+                };
+                return Ok(Some(RawFrame {
+                    fin,
+                    opcode,
+                    payload: payload.freeze(),
+                }));
+            }
+            RecvState::Header { head, filled } if *filled == 0 => {
+                match parse_header(&self.chunk)? {
+                    Some(header) => {
+                        self.chunk.advance(header.header_len);
+                        header
+                    }
+                    None => {
+                        // Too short for a header (so under
+                        // MAX_INBOUND_HEADER bytes): keep it for the next
+                        // chunk to complete.
+                        let n = self.chunk.len();
+                        head[..n].copy_from_slice(&self.chunk);
+                        *filled = n;
+                        self.chunk = Bytes::new();
+                        return Ok(None);
+                    }
+                }
+            }
+            RecvState::Header { head, filled } => loop {
+                if let Some(header) = parse_header(&head[..*filled])? {
+                    break header;
+                }
+                if self.chunk.is_empty() {
+                    return Ok(None);
+                }
+                // Take just the header's bytes, so the payload that follows
+                // stays in the chunk to be sliced.
+                let n = (header_len_hint(&head[..*filled]) - *filled).min(self.chunk.len());
+                head[*filled..*filled + n].copy_from_slice(&self.chunk[..n]);
+                self.chunk.advance(n);
+                *filled += n;
+            },
+        };
+        self.state = RecvState::START;
+
+        if self.chunk.len() >= header.payload_len {
+            return Ok(Some(RawFrame {
+                fin: header.fin,
+                opcode: header.opcode,
+                payload: self.chunk.split_to(header.payload_len),
+            }));
+        }
+        let mut payload = BytesMut::with_capacity(header.payload_len);
+        payload.extend_from_slice(&self.chunk);
+        let remaining = header.payload_len - self.chunk.len();
+        self.chunk = Bytes::new();
+        self.state = RecvState::Payload {
+            fin: header.fin,
+            opcode: header.opcode,
+            payload,
+            remaining,
+        };
+        Ok(None)
+    }
+}
+
 struct RawFrame {
     fin: bool,
     opcode: u8,
     payload: Bytes,
 }
 
-/// Parses one complete frame off the front of `buf`, or `Ok(None)` if more
+/// A parsed inbound frame header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InboundHeader {
+    fin: bool,
+    opcode: u8,
+    header_len: usize,
+    payload_len: usize,
+}
+
+/// Parses the frame header at the front of `buf`, or `Ok(None)` if more
 /// bytes are needed. Enforces client-side rules: RSV bits clear (no
-/// extensions were negotiated) and server frames unmasked.
-fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, WebSocketError> {
+/// extensions were negotiated), server frames unmasked, and the frame size
+/// limit -- each as soon as the bytes that decide it are present.
+fn parse_header(buf: &[u8]) -> Result<Option<InboundHeader>, WebSocketError> {
     if buf.len() < 2 {
         return Ok(None);
     }
@@ -629,27 +968,170 @@ fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, WebSocketErro
     if payload_len > MAX_FRAME {
         return Err(WebSocketError::FrameTooLarge);
     }
-    if buf.len() < header_len + payload_len {
+    Ok(Some(InboundHeader {
+        fin: b0 & 0x80 != 0,
+        opcode: b0 & 0x0F,
+        header_len,
+        payload_len,
+    }))
+}
+
+/// The full length of the header that `head` begins, as far as its bytes
+/// tell: 2 until the length byte is known.
+fn header_len_hint(head: &[u8]) -> usize {
+    match head.get(1).map(|b1| b1 & 0x7F) {
+        Some(126) => 4,
+        Some(127) => 10,
+        _ => 2,
+    }
+}
+
+/// Parses one complete frame off the front of `buf`, or `Ok(None)` if more
+/// bytes are needed (leaving `buf` untouched). See [`parse_header`] for the
+/// rules enforced.
+fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, WebSocketError> {
+    let Some(header) = parse_header(buf)? else {
+        return Ok(None);
+    };
+    if buf.len() < header.header_len + header.payload_len {
         return Ok(None);
     }
-
-    let fin = b0 & 0x80 != 0;
-    let opcode = b0 & 0x0F;
-    buf.advance(header_len);
-    let payload = buf.split_to(payload_len).freeze();
+    buf.advance(header.header_len);
+    let payload = buf.split_to(header.payload_len).freeze();
     Ok(Some(RawFrame {
-        fin,
-        opcode,
+        fin: header.fin,
+        opcode: header.opcode,
         payload,
     }))
+}
+
+/// An encoded outbound frame header, with its masking key.
+struct OutboundHeader {
+    bytes: [u8; MAX_OUTBOUND_HEADER],
+    len: usize,
+    mask: [u8; 4],
+}
+
+impl OutboundHeader {
+    /// FIN set (messages are never fragmented on the wire), the MASK bit
+    /// and key (client frames must be masked, RFC 6455 §5.3).
+    fn new(opcode: u8, payload_len: usize, mask: [u8; 4]) -> Self {
+        let mut bytes = [0u8; MAX_OUTBOUND_HEADER];
+        bytes[0] = 0x80 | opcode;
+        let mut len = 2;
+        if payload_len <= 125 {
+            bytes[1] = 0x80 | payload_len as u8;
+        } else if payload_len <= u16::MAX as usize {
+            bytes[1] = 0x80 | 126;
+            bytes[2..4].copy_from_slice(&(payload_len as u16).to_be_bytes());
+            len = 4;
+        } else {
+            bytes[1] = 0x80 | 127;
+            bytes[2..10].copy_from_slice(&(payload_len as u64).to_be_bytes());
+            len = 10;
+        }
+        bytes[len..len + 4].copy_from_slice(&mask);
+        OutboundHeader {
+            bytes,
+            len: len + 4,
+            mask,
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Writes bytes `offset..offset + dst.len()` of the encoded frame (header,
+/// then masked payload) into `dst`, initializing all of it. Producing any
+/// range lets a frame be written block by block into DMA memory, each byte
+/// written once.
+fn write_frame_range(
+    dst: &mut [MaybeUninit<u8>],
+    offset: usize,
+    head: &OutboundHeader,
+    payload: &[u8],
+) {
+    let head_bytes = head.as_slice();
+    let mut dst = dst;
+    let mut pos = offset;
+    if pos < head_bytes.len() {
+        let n = (head_bytes.len() - pos).min(dst.len());
+        for (d, &b) in dst[..n].iter_mut().zip(&head_bytes[pos..pos + n]) {
+            d.write(b);
+        }
+        dst = &mut dst[n..];
+        pos += n;
+        if dst.is_empty() {
+            // The range ends within the header (e.g. a DMA block with only
+            // a few bytes of room left).
+            return;
+        }
+    }
+    let at = pos - head_bytes.len();
+    let len = dst.len();
+    mask_into(dst, &payload[at..at + len], head.mask, at);
+}
+
+/// Appends bytes `offset..` of the encoded frame to `out`, in one pass.
+fn append_frame_range(out: &mut BytesMut, offset: usize, head: &OutboundHeader, payload: &[u8]) {
+    let n = head.len() + payload.len() - offset;
+    out.reserve(n);
+    let start = out.len();
+    write_frame_range(&mut out.spare_capacity_mut()[..n], offset, head, payload);
+    // SAFETY: `write_frame_range` initialized all `n` reserved bytes.
+    unsafe { out.set_len(start + n) };
+}
+
+/// `dst[i] = src[i] ^ mask[(phase + i) % 4]`: the masking transform
+/// (RFC 6455 §5.3) for a payload range starting at payload offset `phase`.
+/// Eight bytes at a time; 8 is a multiple of the 4-byte key, so the key's
+/// phase is the same at the start of every word.
+fn mask_into(dst: &mut [MaybeUninit<u8>], src: &[u8], mask: [u8; 4], phase: usize) {
+    debug_assert_eq!(dst.len(), src.len());
+    let key: [u8; 4] = std::array::from_fn(|i| mask[(phase + i) & 3]);
+    let word = u64::from_ne_bytes([
+        key[0], key[1], key[2], key[3], key[0], key[1], key[2], key[3],
+    ]);
+    let mut dst_words = dst.chunks_exact_mut(8);
+    let mut src_words = src.chunks_exact(8);
+    for (d, s) in (&mut dst_words).zip(&mut src_words) {
+        let masked = u64::from_ne_bytes(s.try_into().expect("8-byte chunk")) ^ word;
+        for (d, b) in d.iter_mut().zip(masked.to_ne_bytes()) {
+            d.write(b);
+        }
+    }
+    for (i, (d, &b)) in dst_words
+        .into_remainder()
+        .iter_mut()
+        .zip(src_words.remainder())
+        .enumerate()
+    {
+        d.write(b ^ key[i & 3]);
+    }
+}
+
+/// Views initialized memory as possibly-uninitialized, for the writers
+/// above.
+fn as_uninit(bytes: &mut [u8]) -> &mut [MaybeUninit<u8>] {
+    // SAFETY: same layout; the writers above only ever store initialized
+    // bytes through the view, so `bytes` stays initialized.
+    unsafe { &mut *(bytes as *mut [u8] as *mut [MaybeUninit<u8>]) }
 }
 
 fn into_data_message(opcode: u8, payload: Bytes) -> Result<Message, WebSocketError> {
     if opcode == OP_TEXT {
         // Text messages must be valid UTF-8 (RFC 6455 §5.6); invalid data
-        // fails the connection.
+        // fails the connection. `Message::Text` owns a `String`, so a view
+        // of received data is copied here; a payload this side assembled
+        // (uniquely owned) becomes the String's buffer as-is.
         let text =
-            String::from_utf8(payload.to_vec()).map_err(|_| WebSocketError::InvalidUtf8Text)?;
+            String::from_utf8(Vec::from(payload)).map_err(|_| WebSocketError::InvalidUtf8Text)?;
         Ok(Message::Text(text))
     } else {
         Ok(Message::Binary(payload))
@@ -1001,6 +1483,506 @@ mod tests {
         assert_eq!(
             ws.send(Message::Text("late".into())).await,
             Err(WebSocketError::SendAfterClose)
+        );
+    }
+
+    // ---- The upgraded (TLS) fallback is what in-memory pipes get. ----
+
+    #[tokio::test]
+    async fn non_tcp_upgrades_fall_back_to_the_copying_transport() {
+        let (ws, _server) = pair(64).await;
+        assert!(matches!(ws.io, Transport::Upgraded(_)));
+    }
+
+    // ---- Frame encoding. ----
+
+    /// The straightforward masking transform, to check the word-wise one.
+    fn naive_mask(src: &[u8], mask: [u8; 4], phase: usize) -> Vec<u8> {
+        src.iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[(phase + i) % 4])
+            .collect()
+    }
+
+    fn masked(src: &[u8], mask: [u8; 4], phase: usize) -> Vec<u8> {
+        let mut out = vec![0u8; src.len()];
+        mask_into(as_uninit(&mut out), src, mask, phase);
+        out
+    }
+
+    #[test]
+    fn word_wise_masking_matches_the_rfc_transform() {
+        let mask = [0x37, 0xFA, 0x21, 0x3D];
+        let src: Vec<u8> = (0..64u8).collect();
+        for phase in 0..8 {
+            for len in 0..src.len() {
+                assert_eq!(
+                    masked(&src[..len], mask, phase),
+                    naive_mask(&src[..len], mask, phase),
+                    "phase {phase} len {len}"
+                );
+            }
+        }
+        // RFC 6455 §5.7: "Hello" masked with 37 fa 21 3d.
+        assert_eq!(masked(b"Hello", mask, 0), [0x7f, 0x9f, 0x4d, 0x51, 0x58]);
+    }
+
+    /// The whole frame, encoded in one go.
+    fn encode_whole(head: &OutboundHeader, payload: &[u8]) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        append_frame_range(&mut out, 0, head, payload);
+        out.to_vec()
+    }
+
+    #[test]
+    fn frame_written_in_pieces_equals_frame_written_whole() {
+        // As when a frame spans DMA blocks: every split point, for each
+        // header size, gives the same bytes as writing it whole.
+        let mask = [1, 2, 3, 4];
+        for len in [0usize, 5, 125, 126, 300, 65_535, 65_536] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+            let head = OutboundHeader::new(OP_BINARY, len, mask);
+            let whole = encode_whole(&head, &payload);
+            let total = whole.len();
+            let splits: Vec<usize> = if total < 400 {
+                (0..=total).collect()
+            } else {
+                (0..20).chain([total / 2, total - 3, total]).collect()
+            };
+            for split in splits {
+                let mut pieces = vec![0u8; total];
+                let (a, b) = pieces.split_at_mut(split);
+                write_frame_range(as_uninit(a), 0, &head, &payload);
+                write_frame_range(as_uninit(b), split, &head, &payload);
+                assert!(pieces == whole, "len {len} split {split}");
+            }
+        }
+    }
+
+    // ---- The zero-copy TCP transport. ----
+
+    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundTx};
+
+    /// The worker's ends of a test [`TcpStream`]'s rings.
+    struct Wire {
+        cmd_rx: CmdRx,
+        inbound_tx: InboundTx,
+    }
+
+    impl Wire {
+        fn push(&self, chunk: Bytes) {
+            assert!(self.inbound_tx.push(Inbound::Data(chunk)).is_ok());
+        }
+
+        /// Everything the client has sent so far, concatenated.
+        fn sent(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            while let Some(cmd) = self.cmd_rx.pop() {
+                if let Command::Send(bytes) = cmd {
+                    out.extend_from_slice(&bytes);
+                }
+            }
+            out
+        }
+    }
+
+    /// Decodes masked client frames (any length) into (opcode, payload),
+    /// checking FIN and the MASK bit.
+    fn decode_client_frames(mut wire: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        while !wire.is_empty() {
+            assert_eq!(wire[0] & 0x80, 0x80, "FIN set");
+            assert_eq!(wire[1] & 0x80, 0x80, "client frames are masked");
+            let (len, at) = match wire[1] & 0x7F {
+                126 => (u16::from_be_bytes([wire[2], wire[3]]) as usize, 4),
+                127 => (
+                    u64::from_be_bytes(wire[2..10].try_into().unwrap()) as usize,
+                    10,
+                ),
+                n => (n as usize, 2),
+            };
+            let mask: [u8; 4] = wire[at..at + 4].try_into().unwrap();
+            let payload = naive_mask(&wire[at + 4..at + 4 + len], mask, 0);
+            frames.push((wire[0] & 0x0F, payload));
+            wire = &wire[at + 4 + len..];
+        }
+        frames
+    }
+
+    fn handshake_parts() -> http::response::Parts {
+        http::Response::new(()).into_parts().0
+    }
+
+    /// A client on the TCP transport with no worker behind it; `leftover`
+    /// plays the bytes hyper read past the 101 head.
+    fn tcp_client(leftover: Bytes) -> (WebSocketClient, Wire) {
+        let (stream, cmd_rx, inbound_tx, _credit) = TcpStream::test_stream();
+        let io = Transport::Tcp(TcpTransport {
+            stream,
+            reader: ChunkReader::new(leftover),
+        });
+        let ws = WebSocketClient::with_transport(io, SystemRandom::new(), None, handshake_parts());
+        (ws, Wire { cmd_rx, inbound_tx })
+    }
+
+    fn poll_message(ws: &mut WebSocketClient) -> Poll<Result<Option<Message>, WebSocketError>> {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        ws.poll_recv(&mut cx)
+    }
+
+    fn recv_now(ws: &mut WebSocketClient) -> Message {
+        match poll_message(ws) {
+            Poll::Ready(Ok(Some(message))) => message,
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    /// An unmasked server frame.
+    fn server_frame(first: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![first];
+        match payload.len() {
+            n if n <= 125 => out.push(n as u8),
+            n if n <= u16::MAX as usize => {
+                out.push(126);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            n => {
+                out.push(127);
+                out.extend_from_slice(&(n as u64).to_be_bytes());
+            }
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn binary_payload(message: Message) -> Bytes {
+        match message {
+            Message::Binary(payload) => payload,
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn payloads_within_a_chunk_are_views_of_it() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        let mut bytes = server_frame(0x82, b"hello");
+        bytes.extend(server_frame(0x82, &[9; 300]));
+        let chunk = Bytes::from(bytes);
+        wire.push(chunk.clone());
+
+        let first = binary_payload(recv_now(&mut ws));
+        assert_eq!(&first[..], b"hello");
+        assert_eq!(first.as_ptr(), chunk[2..].as_ptr());
+        let second = binary_payload(recv_now(&mut ws));
+        assert_eq!(&second[..], &[9; 300]);
+        assert_eq!(second.as_ptr(), chunk[7 + 4..].as_ptr());
+        assert!(poll_message(&mut ws).is_pending());
+    }
+
+    #[test]
+    fn a_split_header_is_copied_but_its_payload_is_not() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        // A 4-byte header split 3 + 1, the payload whole in the second chunk.
+        let frame = server_frame(0x82, &[5; 200]);
+        wire.push(Bytes::copy_from_slice(&frame[..3]));
+        let second = Bytes::copy_from_slice(&frame[3..]);
+        wire.push(second.clone());
+        let payload = binary_payload(recv_now(&mut ws));
+        assert_eq!(&payload[..], &[5; 200]);
+        assert_eq!(payload.as_ptr(), second[1..].as_ptr());
+    }
+
+    #[test]
+    fn a_split_payload_is_assembled_once() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        let payload: Vec<u8> = (0..100).collect();
+        let frame = server_frame(0x82, &payload);
+        for piece in [&frame[..10], &frame[10..50], &frame[50..]] {
+            wire.push(Bytes::copy_from_slice(piece));
+        }
+        assert_eq!(binary_payload(recv_now(&mut ws)), payload);
+    }
+
+    /// A mixed sequence of frames, cut into chunks at every pair of points
+    /// (and byte by byte), parses to the same messages every time.
+    #[test]
+    fn frames_parse_the_same_however_the_stream_is_chunked() {
+        let mut stream = Vec::new();
+        stream.extend(server_frame(0x82, b""));
+        stream.extend(server_frame(0x81, "héllo".as_bytes()));
+        stream.extend(server_frame(0x02, b"frag-"));
+        stream.extend(server_frame(0x80, b"mented"));
+        stream.extend(server_frame(0x82, &[3; 126]));
+        stream.extend(server_frame(0x8A, b"pong"));
+        stream.extend(server_frame(0x82, &[4; 125]));
+        let expected = vec![
+            Message::Binary(Bytes::new()),
+            Message::Text("héllo".into()),
+            Message::Binary(Bytes::from_static(b"frag-mented")),
+            Message::Binary(Bytes::from(vec![3; 126])),
+            Message::Pong(Bytes::from_static(b"pong")),
+            Message::Binary(Bytes::from(vec![4; 125])),
+        ];
+
+        let check = |chunks: Vec<&[u8]>| {
+            let (mut ws, wire) = tcp_client(Bytes::new());
+            let mut got = Vec::new();
+            for chunk in chunks {
+                wire.push(Bytes::copy_from_slice(chunk));
+                while let Poll::Ready(message) = poll_message(&mut ws) {
+                    got.push(message.unwrap().unwrap());
+                }
+            }
+            assert_eq!(got, expected);
+        };
+        let n = stream.len();
+        for a in 0..=n {
+            for b in (a..=n).step_by(7) {
+                check(vec![&stream[..a], &stream[a..b], &stream[b..]]);
+            }
+        }
+        check(stream.chunks(1).collect());
+    }
+
+    #[test]
+    fn a_large_frame_straddling_many_chunks_is_assembled() {
+        // 70 000 bytes: a 64-bit length, in MSS-sized segments.
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let frame = server_frame(0x82, &payload);
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        let mut got = None;
+        for segment in frame.chunks(1448) {
+            wire.push(Bytes::copy_from_slice(segment));
+            if let Poll::Ready(message) = poll_message(&mut ws) {
+                got = Some(binary_payload(message.unwrap().unwrap()));
+            }
+        }
+        assert_eq!(got.unwrap(), payload);
+    }
+
+    #[test]
+    fn leftover_bytes_from_the_handshake_are_parsed_first() {
+        // Hyper's read held one whole frame and half the next header.
+        let mut leftover = server_frame(0x82, b"early");
+        let next = server_frame(0x82, &[7; 130]);
+        leftover.extend_from_slice(&next[..1]);
+        let leftover = Bytes::from(leftover);
+        let (mut ws, wire) = tcp_client(leftover.clone());
+
+        let first = binary_payload(recv_now(&mut ws));
+        assert_eq!(&first[..], b"early");
+        assert_eq!(first.as_ptr(), leftover[2..].as_ptr());
+        assert!(poll_message(&mut ws).is_pending());
+
+        let rest = Bytes::copy_from_slice(&next[1..]);
+        wire.push(rest.clone());
+        let second = binary_payload(recv_now(&mut ws));
+        assert_eq!(&second[..], &[7; 130]);
+        assert_eq!(second.as_ptr(), rest[3..].as_ptr());
+    }
+
+    #[test]
+    fn protocol_violations_fail_even_mid_split_header() {
+        for (bytes, error) in [
+            (vec![0xC2], WebSocketError::ReservedBitsSet),
+            (vec![0x82], WebSocketError::MaskedServerFrame),
+            (vec![0x82], WebSocketError::FrameTooLarge),
+        ] {
+            let (mut ws, wire) = tcp_client(Bytes::from(bytes));
+            assert!(poll_message(&mut ws).is_pending());
+            let rest: &[u8] = match &error {
+                WebSocketError::ReservedBitsSet => &[0x00],
+                WebSocketError::MaskedServerFrame => &[0x81, 0, 0, 0, 0, 0],
+                _ => &[127, 0, 0, 0, 0, 0x01, 0, 0, 1],
+            };
+            wire.push(Bytes::copy_from_slice(rest));
+            assert!(matches!(poll_message(&mut ws), Poll::Ready(Err(e)) if e == error));
+        }
+    }
+
+    #[test]
+    fn sends_are_masked_and_go_out_in_order() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        let sizes = [0usize, 1, 7, 8, 9, 125, 126, 65_535, 65_536];
+        futures::executor::block_on(async {
+            for &n in &sizes {
+                let payload: Vec<u8> = (0..n).map(|i| (i % 253) as u8).collect();
+                ws.send(Message::Binary(Bytes::from(payload)))
+                    .await
+                    .unwrap();
+            }
+            ws.send(Message::Text("done".into())).await.unwrap();
+        });
+        let frames = decode_client_frames(&wire.sent());
+        assert_eq!(frames.len(), sizes.len() + 1);
+        for (&n, (opcode, payload)) in sizes.iter().zip(&frames) {
+            assert_eq!(*opcode, OP_BINARY);
+            assert_eq!(payload.len(), n);
+            assert!(
+                payload
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == (i % 253) as u8)
+            );
+        }
+        assert_eq!(frames[sizes.len()], (OP_TEXT, b"done".to_vec()));
+    }
+
+    #[test]
+    fn a_send_stalled_on_credit_resumes_where_it_stopped() {
+        use crate::dpdk::tcp::worker::SEND_CAPACITY;
+        let (stream, cmd_rx, inbound_tx, credit) = TcpStream::test_stream();
+        let io = Transport::Tcp(TcpTransport {
+            stream,
+            reader: ChunkReader::new(Bytes::new()),
+        });
+        let mut ws =
+            WebSocketClient::with_transport(io, SystemRandom::new(), None, handshake_parts());
+        let wire = Wire { cmd_rx, inbound_tx };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        let payload = Bytes::from(vec![0xEE; SEND_CAPACITY + 100]);
+        Pin::new(&mut ws)
+            .start_send(Message::Binary(payload.clone()))
+            .unwrap();
+        assert!(Pin::new(&mut ws).poll_flush(&mut cx).is_pending());
+        let mut sent = wire.sent();
+        // The worker acknowledges what it has.
+        credit
+            .bytes
+            .fetch_sub(SEND_CAPACITY, std::sync::atomic::Ordering::AcqRel);
+        assert!(matches!(
+            Pin::new(&mut ws).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        sent.extend(wire.sent());
+        assert_eq!(
+            decode_client_frames(&sent),
+            vec![(OP_BINARY, payload.to_vec())]
+        );
+    }
+
+    #[test]
+    fn pings_are_answered_over_tcp_before_they_are_returned() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        wire.push(Bytes::from(server_frame(0x89, b"are you there")));
+        assert_eq!(
+            recv_now(&mut ws),
+            Message::Ping(Bytes::from_static(b"are you there"))
+        );
+        assert_eq!(
+            decode_client_frames(&wire.sent()),
+            vec![(OP_PONG, b"are you there".to_vec())]
+        );
+    }
+
+    #[test]
+    fn a_peer_close_over_tcp_is_echoed_and_ends_the_stream() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        wire.push(Bytes::from(server_frame(
+            0x88,
+            &[0x03, 0xE8, b'b', b'y', b'e'],
+        )));
+        assert_eq!(
+            recv_now(&mut ws),
+            Message::Close(Some(CloseFrame {
+                code: 1000,
+                reason: "bye".into()
+            }))
+        );
+        assert_eq!(
+            decode_client_frames(&wire.sent()),
+            vec![(OP_CLOSE, vec![0x03, 0xE8])]
+        );
+        assert!(matches!(poll_message(&mut ws), Poll::Ready(Ok(None))));
+        assert_eq!(
+            futures::executor::block_on(ws.send(Message::Text("late".into()))),
+            Err(WebSocketError::SendAfterClose)
+        );
+    }
+
+    #[test]
+    fn eof_over_tcp_without_a_close_is_unclean() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        // Half a frame, then the peer's FIN.
+        wire.push(Bytes::from_static(&[0x82, 5, b'h']));
+        assert!(wire.inbound_tx.push(Inbound::Eof).is_ok());
+        assert!(matches!(
+            poll_message(&mut ws),
+            Poll::Ready(Err(WebSocketError::UncleanClose))
+        ));
+    }
+
+    #[test]
+    fn a_reset_over_tcp_surfaces_as_an_io_error() {
+        let (mut ws, wire) = tcp_client(Bytes::new());
+        assert!(wire.inbound_tx.push(Inbound::Reset).is_ok());
+        assert!(matches!(
+            poll_message(&mut ws),
+            Poll::Ready(Err(WebSocketError::Io(std::io::ErrorKind::ConnectionReset)))
+        ));
+    }
+
+    /// The whole path `open` takes for `ws://`: a hyper HTTP/1.1 upgrade
+    /// over a real `TcpStream`, then the downcast back to it. The server's
+    /// first frame arrives in the same chunk as the 101, so hyper reads it
+    /// past the head and it must come back through `read_buf`.
+    #[tokio::test]
+    async fn a_plaintext_upgrade_recovers_the_tcp_stream_and_its_leftover() {
+        let (stream, cmd_rx, inbound_tx, _credit) = TcpStream::test_stream();
+        let server = tokio::spawn(async move {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                match cmd_rx.pop() {
+                    Some(Command::Send(bytes)) => head.extend_from_slice(&bytes),
+                    Some(_) => {}
+                    None => tokio::task::yield_now().await,
+                }
+            }
+            let mut reply = b"HTTP/1.1 101 Switching Protocols\r\n\
+                Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                .to_vec();
+            reply.extend(server_frame(0x81, b"welcome"));
+            assert!(inbound_tx.push(Inbound::Data(Bytes::from(reply))).is_ok());
+            Wire { cmd_rx, inbound_tx }
+        });
+
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(conn.with_upgrades());
+        let request = Request::builder()
+            .uri("/")
+            .header(header::HOST, "test")
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .body(Empty::new())
+            .unwrap();
+        let mut response = within(sender.send_request(request)).await.unwrap();
+        let upgraded = within(hyper::upgrade::on(&mut response)).await.unwrap();
+        let wire = within(server).await.unwrap();
+
+        let mut ws =
+            WebSocketClient::from_upgraded(upgraded, SystemRandom::new(), None, handshake_parts());
+        let Transport::Tcp(tcp) = &ws.io else {
+            panic!("a plaintext upgrade must run on the raw TcpStream");
+        };
+        assert!(
+            !tcp.reader.chunk.is_empty(),
+            "hyper read the frame past the head"
+        );
+
+        assert_eq!(
+            within(ws.recv()).await.unwrap(),
+            Some(Message::Text("welcome".into()))
+        );
+        within(ws.send(Message::Binary(Bytes::from_static(b"hi"))))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_client_frames(&wire.sent()),
+            vec![(OP_BINARY, b"hi".to_vec())]
         );
     }
 }
