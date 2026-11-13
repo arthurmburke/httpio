@@ -31,10 +31,11 @@
 //! sizes are parsed with overflow checks. Malformed input is an error,
 //! never a panic.
 
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{Stream, StreamExt};
@@ -127,6 +128,9 @@ pub enum H1Error {
     TrailersTooLarge,
     /// The connection ended before the framed end of the body.
     Truncated,
+    /// The request body's producer failed, or broke the length it
+    /// announced, while the response was already being read.
+    RequestBody,
 }
 
 impl From<H1Error> for HttpError {
@@ -294,13 +298,17 @@ impl PreparedRequest {
         out.put(b"\r\n");
     }
 
-    /// Sends `head` and the body over `io`, then reads the response head.
+    /// Sends `head` and the body over `io` and reads the response head.
     /// The returned body owns `io` and drops it when the body ends.
     ///
-    /// The whole request is sent before the response is read: a server that
-    /// answers early and stops reading a large streamed body stalls the
-    /// send (as one would expect with connection-per-request and no
-    /// `Expect: 100-continue` handling).
+    /// The response is read *while* the request is sent, not after it: a
+    /// server may answer before it has read the whole request (a `413` to
+    /// a large upload, an auth failure, an echo that streams back as it
+    /// reads) and then stop reading, and a sender that only looked for the
+    /// response once everything was out would wait on send credit that
+    /// never comes. If the final head arrives first, whatever is left of
+    /// the request goes with the returned [`Body`], which keeps sending it
+    /// as the response body is read and drops it when that body ends.
     pub async fn exchange<T: Transport + Unpin>(
         self,
         mut io: T,
@@ -312,10 +320,48 @@ impl PreparedRequest {
             framing,
             ..
         } = self;
-        send(&mut io, head).await?;
-        send_body(&mut io, body, framing).await?;
-        let (parts, body) = read_response(io, &parts.method).await?;
-        Ok(Response::from_parts(parts, body))
+        let mut upload = Some(Upload::new(head, body, framing));
+        let mut reader = ResponseReader::new();
+        let (parts_in, rest) = poll_fn(|cx| {
+            if let Some(active) = &mut upload {
+                match active.poll(cx, &mut io) {
+                    Poll::Pending => {}
+                    Poll::Ready(Ok(())) => upload = None,
+                    // Ours to report: nothing the server says changes it.
+                    Poll::Ready(Err(UploadError::Request(e))) => return Poll::Ready(Err(e)),
+                    // The peer may have answered and then closed or reset:
+                    // received data is delivered before the failure, so the
+                    // read side decides how this ends.
+                    Poll::Ready(Err(UploadError::Transport)) => upload = None,
+                }
+            }
+            // No response can precede the request head: don't read (and
+            // possibly finish, leaving the head unsent) before it is out.
+            // The upload is `Pending` here, so its waker is registered.
+            if upload
+                .as_ref()
+                .is_some_and(|upload| upload.head == HeadProgress::Unsent)
+            {
+                return Poll::Pending;
+            }
+            loop {
+                let chunk = match ready!(io.poll_recv(cx)) {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => return Poll::Ready(Err(H1Error::IncompleteHead.into())),
+                    Err(e) => return Poll::Ready(Err(H1Error::Io(e.kind()).into())),
+                };
+                match reader.feed(chunk) {
+                    Ok(Some(done)) => return Poll::Ready(Ok(done)),
+                    Ok(None) => {}
+                    Err(e) => return Poll::Ready(Err(HttpError::from(e))),
+                }
+            }
+        })
+        .await?;
+        let decoder = response_decoder(&parts.method, &parts_in)?;
+        let mut body = Body::new(io, rest, decoder);
+        body.continue_upload(upload);
+        Ok(Response::from_parts(parts_in, body))
     }
 }
 
@@ -366,16 +412,6 @@ fn anticipates_body(method: &Method) -> bool {
     )
 }
 
-async fn send<T: Transport + Unpin>(io: &mut T, data: Bytes) -> Result<(), HttpError> {
-    if data.is_empty() {
-        return Ok(());
-    }
-    let mut data = Some(data);
-    poll_fn(|cx| io.poll_send(cx, &mut data))
-        .await
-        .map_err(|_| HttpError::Protocol)
-}
-
 /// The terminating chunk when no data chunk preceded it.
 const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
 /// The terminating chunk, preceded by the CRLF closing the last data chunk.
@@ -396,53 +432,165 @@ fn chunk_prefix(len: usize, first: bool) -> Bytes {
     out.freeze()
 }
 
-async fn send_body<T: Transport + Unpin>(
-    io: &mut T,
-    body: EncodedBody,
-    framing: RequestFraming,
-) -> Result<(), HttpError> {
-    match (body, framing) {
-        (EncodedBody::Full(bytes), RequestFraming::Length(_)) => send(io, bytes).await,
-        (EncodedBody::Full(bytes), RequestFraming::Chunked) => {
-            if bytes.is_empty() {
-                return send(io, Bytes::from_static(LAST_CHUNK)).await;
+/// A streamed request body, as its producer hands it over.
+type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, HttpError>> + Send>>;
+
+/// What is left of the request to produce once `Upload::queue` is sent.
+enum UploadSource {
+    /// Nothing: the queue holds the rest of the request.
+    Buffered,
+    /// A streamed body sent raw under the caller's `Content-Length`.
+    Length {
+        stream: BodyStream,
+        expected: u64,
+        sent: u64,
+    },
+    /// A streamed body sent chunked. `first` until a data chunk went out
+    /// (the terminator and each size line depend on it).
+    Chunked { stream: BodyStream, first: bool },
+}
+
+/// Whether the request head has been handed to the transport. Until it
+/// has, nothing received can be a response to this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadProgress {
+    Unsent,
+    Sent,
+}
+
+/// Why an upload stopped before the whole request was sent.
+#[derive(Debug)]
+enum UploadError {
+    /// The transport refused the bytes (closed or reset).
+    Transport,
+    /// The request itself is at fault: its producer failed, or it broke
+    /// the `Content-Length` it announced.
+    Request(HttpError),
+}
+
+/// The request on its way out: head, then body with its framing. A poll
+/// state machine rather than an `async fn`, because it shares the
+/// connection with the response reader -- both are polled in turn from one
+/// task, by [`PreparedRequest::exchange`] until the response head is in and
+/// by [`Body`] after that, and a future would hold the connection borrowed
+/// between polls.
+///
+/// Body `Bytes` are queued and sent as they are, never copied.
+struct Upload {
+    /// Buffers ready to go, in order.
+    queue: VecDeque<Bytes>,
+    /// The buffer being sent; the transport takes it when it is all out.
+    sending: Option<Bytes>,
+    source: UploadSource,
+    head: HeadProgress,
+}
+
+impl Upload {
+    fn new(head: Bytes, body: EncodedBody, framing: RequestFraming) -> Self {
+        let mut queue = VecDeque::with_capacity(4);
+        queue.push_back(head);
+        let source = match (body, framing) {
+            (EncodedBody::Full(bytes), RequestFraming::Length(_)) => {
+                queue.push_back(bytes);
+                UploadSource::Buffered
             }
-            send(io, chunk_prefix(bytes.len(), true)).await?;
-            send(io, bytes).await?;
-            send(io, Bytes::from_static(CRLF_LAST_CHUNK)).await
-        }
-        (EncodedBody::Stream(stream), RequestFraming::Length(expected)) => {
-            let mut stream = stream.into_inner();
-            let mut sent = 0u64;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                sent += chunk.len() as u64;
-                // Never put more on the wire than was announced.
-                if sent > expected {
-                    return Err(HttpError::MalformedRequest);
+            (EncodedBody::Full(bytes), RequestFraming::Chunked) => {
+                if bytes.is_empty() {
+                    queue.push_back(Bytes::from_static(LAST_CHUNK));
+                } else {
+                    queue.push_back(chunk_prefix(bytes.len(), true));
+                    queue.push_back(bytes);
+                    queue.push_back(Bytes::from_static(CRLF_LAST_CHUNK));
                 }
-                send(io, chunk).await?;
+                UploadSource::Buffered
             }
-            if sent != expected {
-                return Err(HttpError::MalformedRequest);
-            }
-            Ok(())
-        }
-        (EncodedBody::Stream(stream), RequestFraming::Chunked) => {
-            let mut stream = stream.into_inner();
-            let mut first = true;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                // A zero-size chunk would end the body early.
-                if chunk.is_empty() {
-                    continue;
+            (EncodedBody::Stream(stream), RequestFraming::Length(expected)) => {
+                UploadSource::Length {
+                    stream: stream.into_inner(),
+                    expected,
+                    sent: 0,
                 }
-                send(io, chunk_prefix(chunk.len(), first)).await?;
-                send(io, chunk).await?;
-                first = false;
             }
-            let last = if first { LAST_CHUNK } else { CRLF_LAST_CHUNK };
-            send(io, Bytes::from_static(last)).await
+            (EncodedBody::Stream(stream), RequestFraming::Chunked) => UploadSource::Chunked {
+                stream: stream.into_inner(),
+                first: true,
+            },
+        };
+        Self {
+            queue,
+            sending: None,
+            source,
+            head: HeadProgress::Unsent,
+        }
+    }
+
+    /// Sends as much of the request as `io` takes; `Ready(Ok)` once all of
+    /// it is out. After an error the upload must not be polled again.
+    fn poll<T: Transport>(
+        &mut self,
+        cx: &mut Context<'_>,
+        io: &mut T,
+    ) -> Poll<Result<(), UploadError>> {
+        loop {
+            if self.sending.is_none() {
+                self.sending = self.queue.pop_front().filter(|data| !data.is_empty());
+            }
+            if self.sending.is_some() {
+                ready!(io.poll_send(cx, &mut self.sending)).map_err(|_| UploadError::Transport)?;
+                self.sending = None;
+                // The head is the first buffer in the queue.
+                self.head = HeadProgress::Sent;
+                continue;
+            }
+            if !self.queue.is_empty() {
+                // The buffer just popped was empty: on to the next.
+                continue;
+            }
+            match &mut self.source {
+                UploadSource::Buffered => return Poll::Ready(Ok(())),
+                UploadSource::Length {
+                    stream,
+                    expected,
+                    sent,
+                } => match ready!(stream.poll_next_unpin(cx)) {
+                    Some(Ok(chunk)) => {
+                        *sent += chunk.len() as u64;
+                        // Never put more on the wire than was announced.
+                        if *sent > *expected {
+                            return Poll::Ready(Err(UploadError::Request(
+                                HttpError::MalformedRequest,
+                            )));
+                        }
+                        self.queue.push_back(chunk);
+                    }
+                    Some(Err(e)) => return Poll::Ready(Err(UploadError::Request(e))),
+                    None => {
+                        if *sent != *expected {
+                            return Poll::Ready(Err(UploadError::Request(
+                                HttpError::MalformedRequest,
+                            )));
+                        }
+                        self.source = UploadSource::Buffered;
+                    }
+                },
+                UploadSource::Chunked { stream, first } => {
+                    match ready!(stream.poll_next_unpin(cx)) {
+                        // A zero-size chunk would end the body early.
+                        Some(Ok(chunk)) if chunk.is_empty() => {}
+                        Some(Ok(chunk)) => {
+                            self.queue.push_back(chunk_prefix(chunk.len(), *first));
+                            self.queue.push_back(chunk);
+                            *first = false;
+                        }
+                        Some(Err(e)) => return Poll::Ready(Err(UploadError::Request(e))),
+                        None => {
+                            let last = if *first { LAST_CHUNK } else { CRLF_LAST_CHUNK };
+                            self.queue.push_back(Bytes::from_static(last));
+                            self.source = UploadSource::Buffered;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -573,6 +721,7 @@ fn parse_decimal(digits: &[u8]) -> Option<u64> {
 // Response head
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 async fn recv<T: Transport + Unpin>(io: &mut T) -> Result<Option<Bytes>, H1Error> {
     poll_fn(|cx| io.poll_recv(cx))
         .await
@@ -663,42 +812,43 @@ enum HeadBuffer {
     Gathering { buf: BytesMut, end: HeadEnd },
 }
 
-/// Reads one response head (interim or final), starting with `pending`
-/// (bytes already received after the previous head). Returns the head and
-/// the bytes after it in the chunk that completed it.
-async fn read_head<T: Transport + Unpin>(
-    io: &mut T,
-    mut pending: Bytes,
-) -> Result<(response::Parts, Bytes), H1Error> {
-    let mut state = HeadBuffer::Direct;
-    loop {
-        let chunk = if pending.is_empty() {
-            match recv(io).await? {
-                Some(chunk) => chunk,
-                None => return Err(H1Error::IncompleteHead),
-            }
-        } else {
-            std::mem::take(&mut pending)
-        };
-        if chunk.is_empty() {
-            continue;
+/// Reads one response head (interim or final) from chunks fed to it as
+/// they arrive. It takes chunks rather than the connection so that whoever
+/// drives it can keep sending the request on that connection meanwhile.
+struct HeadReader {
+    state: HeadBuffer,
+}
+
+impl HeadReader {
+    fn new() -> Self {
+        Self {
+            state: HeadBuffer::Direct,
         }
-        if let HeadBuffer::Direct = state {
+    }
+
+    /// Takes the next received chunk. Returns the head, and the bytes
+    /// after it in `chunk`, once `chunk` completes it; `None` while more
+    /// is needed.
+    fn feed(&mut self, chunk: Bytes) -> Result<Option<(response::Parts, Bytes)>, H1Error> {
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        if let HeadBuffer::Direct = self.state {
             match parse_head(&chunk)? {
-                Parsed::Complete { parts, len } => return Ok((parts, chunk.slice(len..))),
+                Parsed::Complete { parts, len } => return Ok(Some((parts, chunk.slice(len..)))),
                 Parsed::Partial if chunk.len() > MAX_HEAD_SIZE => {
                     return Err(H1Error::HeadTooLarge);
                 }
                 Parsed::Partial => {
-                    state = HeadBuffer::Gathering {
+                    self.state = HeadBuffer::Gathering {
                         buf: BytesMut::with_capacity(chunk.len() * 2),
                         end: HeadEnd::Text,
                     };
                 }
             }
         }
-        let HeadBuffer::Gathering { buf, end } = &mut state else {
-            continue;
+        let HeadBuffer::Gathering { buf, end } = &mut self.state else {
+            return Ok(None);
         };
         let mut at = 0;
         while at < chunk.len() {
@@ -714,7 +864,7 @@ async fn read_head<T: Transport + Unpin>(
             }
             match parse_head(buf)? {
                 Parsed::Complete { parts, len } if len == buf.len() => {
-                    return Ok((parts, chunk.slice(at..)));
+                    return Ok(Some((parts, chunk.slice(at..))));
                 }
                 // httparse ends a head at its first empty line, exactly as
                 // `HeadEnd` does, so this cannot happen; refuse rather
@@ -725,32 +875,84 @@ async fn read_head<T: Transport + Unpin>(
                 Parsed::Partial => {}
             }
         }
+        Ok(None)
+    }
+}
+
+/// Reads one response head from `io`, starting with `pending` (bytes
+/// already received). Returns the head and the bytes after it in the chunk
+/// that completed it.
+#[cfg(test)]
+async fn read_head<T: Transport + Unpin>(
+    io: &mut T,
+    pending: Bytes,
+) -> Result<(response::Parts, Bytes), H1Error> {
+    let mut reader = HeadReader::new();
+    if let Some(done) = reader.feed(pending)? {
+        return Ok(done);
+    }
+    loop {
+        let chunk = recv(io).await?.ok_or(H1Error::IncompleteHead)?;
+        if let Some(done) = reader.feed(chunk)? {
+            return Ok(done);
+        }
+    }
+}
+
+/// Reads the final response head from chunks fed to it, skipping interim
+/// 1xx responses.
+struct ResponseReader {
+    head: HeadReader,
+    /// Interim responses skipped so far.
+    interim: usize,
+}
+
+impl ResponseReader {
+    fn new() -> Self {
+        Self {
+            head: HeadReader::new(),
+            interim: 0,
+        }
+    }
+
+    /// Takes the next received chunk. Returns the final head, and the
+    /// bytes after it in `chunk`, once `chunk` completes it.
+    fn feed(&mut self, mut chunk: Bytes) -> Result<Option<(response::Parts, Bytes)>, H1Error> {
+        loop {
+            let Some((parts, rest)) = self.head.feed(chunk)? else {
+                return Ok(None);
+            };
+            if parts.status == StatusCode::SWITCHING_PROTOCOLS {
+                return Err(H1Error::UnexpectedUpgrade);
+            }
+            if !parts.status.is_informational() {
+                return Ok(Some((parts, rest)));
+            }
+            self.interim += 1;
+            if self.interim > MAX_INTERIM_RESPONSES {
+                return Err(H1Error::TooManyInterimResponses);
+            }
+            // The next head may start in the same chunk.
+            self.head = HeadReader::new();
+            chunk = rest;
+        }
     }
 }
 
 /// Reads the final response head (skipping interim 1xx responses) and sets
 /// up the body decoder for it.
+#[cfg(test)]
 async fn read_response<T: Transport + Unpin>(
     mut io: T,
     method: &Method,
 ) -> Result<(response::Parts, Body<T>), H1Error> {
-    let mut pending = Bytes::new();
-    let mut interim = 0;
+    let mut reader = ResponseReader::new();
     loop {
-        let (parts, rest) = read_head(&mut io, pending).await?;
-        pending = rest;
-        if parts.status == StatusCode::SWITCHING_PROTOCOLS {
-            return Err(H1Error::UnexpectedUpgrade);
+        let chunk = recv(&mut io).await?.ok_or(H1Error::IncompleteHead)?;
+        if let Some((parts, rest)) = reader.feed(chunk)? {
+            let decoder = response_decoder(method, &parts)?;
+            return Ok((parts, Body::new(io, rest, decoder)));
         }
-        if parts.status.is_informational() {
-            interim += 1;
-            if interim > MAX_INTERIM_RESPONSES {
-                return Err(H1Error::TooManyInterimResponses);
-            }
-            continue;
-        }
-        let decoder = response_decoder(method, &parts)?;
-        return Ok((parts, Body::new(io, pending, decoder)));
     }
 }
 
@@ -1058,6 +1260,9 @@ pub struct Body<T> {
     decoder: Decoder,
     /// The `Content-Length`, when there is one, to size `collect`.
     length_hint: Option<u64>,
+    /// What is left of the request, when the response began before all of
+    /// it was sent: sent on as the body is read, dropped when it ends.
+    upload: Option<Upload>,
 }
 
 impl<T: Transport + Unpin> Body<T> {
@@ -1071,15 +1276,48 @@ impl<T: Transport + Unpin> Body<T> {
             buffered,
             decoder,
             length_hint,
+            upload: None,
         };
         body.release_if_finished();
         body
     }
 
+    /// Hands the body the unsent rest of the request (see
+    /// [`PreparedRequest::exchange`]). Dropped at once if the response has
+    /// no body to read: with the connection gone there is nowhere to send.
+    fn continue_upload(&mut self, upload: Option<Upload>) {
+        if self.io.is_some() {
+            self.upload = upload;
+        }
+    }
+
     fn release_if_finished(&mut self) {
         if self.decoder.is_finished() {
             self.io = None;
+            self.upload = None;
             self.buffered = Bytes::new();
+        }
+    }
+
+    /// Sends more of an unfinished request. A transport failure only ends
+    /// the upload (the server may have answered and stopped reading; the
+    /// read side reports a dead connection). A producer failure fails the
+    /// body: the server is left with half a request and may never finish
+    /// its response.
+    fn drive_upload(&mut self, cx: &mut Context<'_>) -> Result<(), H1Error> {
+        let (Some(io), Some(upload)) = (self.io.as_mut(), self.upload.as_mut()) else {
+            return Ok(());
+        };
+        match upload.poll(cx, io) {
+            Poll::Pending => Ok(()),
+            Poll::Ready(Ok(()) | Err(UploadError::Transport)) => {
+                self.upload = None;
+                Ok(())
+            }
+            Poll::Ready(Err(UploadError::Request(_))) => {
+                self.upload = None;
+                Err(H1Error::RequestBody)
+            }
         }
     }
 
@@ -1093,6 +1331,9 @@ impl<T: Transport + Unpin> Body<T> {
     /// connection that ends before the framed end yields
     /// [`H1Error::Truncated`].
     pub fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, H1Error>>> {
+        if let Err(e) = self.drive_upload(cx) {
+            return self.fail(e);
+        }
         loop {
             match self.decoder.decode(&mut self.buffered) {
                 Ok(Some(data)) => {
@@ -1721,11 +1962,12 @@ HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok";
         let request = PreparedRequest::new(parts, body)?;
         let head = request.encode_head(None);
         let mut mock = Mock::new([]).stalling();
-        block_on(async {
-            send(&mut mock, head).await?;
-            send_body(&mut mock, request.body, request.framing).await
-        })?;
-        Ok(mock.sent.lock().unwrap().clone())
+        let mut upload = Upload::new(head, request.body, request.framing);
+        match block_on(poll_fn(|cx| upload.poll(cx, &mut mock))) {
+            Ok(()) => Ok(mock.sent.lock().unwrap().clone()),
+            Err(UploadError::Request(e)) => Err(e),
+            Err(UploadError::Transport) => Err(HttpError::Protocol),
+        }
     }
 
     fn text(sent: &[Bytes]) -> String {
@@ -1901,6 +2143,235 @@ connection: close\r\n\r\n"
         assert_eq!(
             text(&sent.lock().unwrap()),
             "HEAD /h HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\n\r\n"
+        );
+    }
+
+    /// A peer for the request/response interleaving tests: it takes only
+    /// as many request buffers as it has given credit for, and makes its
+    /// response available once it has seen enough of the request. It never
+    /// wakes anyone, so these tests poll a bounded number of times
+    /// ([`drive`]) and a codec that waits on the wrong thing fails instead
+    /// of hanging.
+    struct Peer {
+        /// Request buffers it will take in total, so far.
+        credit: usize,
+        /// Credit added by each `poll_recv` that returns data.
+        credit_per_read: usize,
+        /// Sends fail once this many buffers were taken.
+        reset_sends_after: Option<usize>,
+        /// Request buffers it must have taken before it answers.
+        respond_after: usize,
+        reads: VecDeque<Bytes>,
+        sent: std::sync::Arc<std::sync::Mutex<Vec<Bytes>>>,
+    }
+
+    impl Peer {
+        fn new(credit: usize, respond_after: usize, reads: &[&'static [u8]]) -> Self {
+            Self {
+                credit,
+                credit_per_read: 0,
+                reset_sends_after: None,
+                respond_after,
+                reads: reads.iter().map(|read| Bytes::from_static(read)).collect(),
+                sent: Default::default(),
+            }
+        }
+    }
+
+    impl Transport for Peer {
+        fn poll_send(
+            &mut self,
+            _cx: &mut Context<'_>,
+            data: &mut Option<Bytes>,
+        ) -> Poll<io::Result<()>> {
+            let mut sent = self.sent.lock().unwrap();
+            if self.reset_sends_after.is_some_and(|n| sent.len() >= n) {
+                return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+            }
+            if sent.len() >= self.credit {
+                return Poll::Pending;
+            }
+            sent.push(data.take().unwrap());
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_recv(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+            if self.sent.lock().unwrap().len() < self.respond_after {
+                return Poll::Pending;
+            }
+            match self.reads.pop_front() {
+                Some(bytes) => {
+                    self.credit += self.credit_per_read;
+                    Poll::Ready(Ok(Some(bytes)))
+                }
+                None => Poll::Ready(Ok(None)),
+            }
+        }
+    }
+
+    /// Polls `f` to completion without a real waker, giving up (and failing
+    /// the test) if it is still pending after many polls.
+    fn drive<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for _ in 0..1000 {
+            if let Poll::Ready(out) = f.as_mut().poll(&mut cx) {
+                return out;
+            }
+        }
+        panic!("stalled: still pending after 1000 polls");
+    }
+
+    fn upload_request(body: EncodedBody) -> (PreparedRequest, Bytes) {
+        let request = PreparedRequest::new(parts(Method::POST, "/up", &[]), body).unwrap();
+        let head = request.encode_head(None);
+        (request, head)
+    }
+
+    #[test]
+    fn an_early_response_ends_an_upload_the_server_stopped_reading() {
+        let chunk = Bytes::from(vec![b'x'; 4096]);
+        let (request, head) = upload_request(stream_of(&[chunk.clone(), chunk.clone(), chunk]));
+        // The server takes the head and the first chunk (size line + data),
+        // answers, and never reads again.
+        let peer = Peer::new(
+            3,
+            1,
+            &[b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 5\r\n\r\nfull!"],
+        );
+        let sent = peer.sent.clone();
+        let response = drive(request.exchange(peer, head)).unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let mut body = response.into_body();
+        assert_eq!(drive(body.chunk()), Some(Ok(Bytes::from_static(b"full!"))));
+        // The response is complete: the connection and the rest of the
+        // request are dropped, not waited on.
+        assert!(body.io.is_none());
+        assert!(body.upload.is_none());
+        assert_eq!(drive(body.chunk()), None);
+        assert_eq!(sent.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn no_response_is_read_before_the_request_head_is_sent() {
+        let (request, head) = upload_request(EncodedBody::Full(Bytes::from_static(b"body")));
+        // Bytes are already waiting, but the peer takes nothing: the
+        // exchange must not finish on them with the head still unsent.
+        let peer = Peer::new(0, 0, &[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]);
+        let sent = peer.sent.clone();
+        let mut exchange = std::pin::pin!(request.exchange(peer, head));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for _ in 0..10 {
+            assert!(exchange.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_upload_continues_while_the_response_body_is_read() {
+        let a = Bytes::from_static(b"hello");
+        let b = Bytes::from_static(b"world");
+        let (request, head) = upload_request(stream_of(&[a.clone(), b.clone()]));
+        // An echo-style server: it answers after the head and reads more
+        // of the request each time it sends a piece of the response.
+        let mut peer = Peer::new(
+            1,
+            1,
+            &[
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                b"1\r\na\r\n",
+                b"1\r\nb\r\n",
+                b"0\r\n\r\n",
+            ],
+        );
+        peer.credit_per_read = 2;
+        let sent = peer.sent.clone();
+        let response = drive(request.exchange(peer, head)).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Only the head is out so far; the rest travels with the body.
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        let mut body = response.into_body();
+        assert!(body.upload.is_some());
+        let mut received = Vec::new();
+        while let Some(chunk) = drive(body.chunk()) {
+            received.push(chunk.unwrap());
+        }
+        assert_eq!(concat(&received), b"ab");
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            text(&sent),
+            "POST /up HTTP/1.1\r\nhost: example.com\r\ntransfer-encoding: chunked\r\n\
+connection: close\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"
+        );
+        // Still the caller's buffers, not copies.
+        assert_eq!(sent[2].as_ptr(), a.as_ptr());
+        assert_eq!(sent[4].as_ptr(), b.as_ptr());
+    }
+
+    #[test]
+    fn a_response_is_still_read_after_the_server_resets_the_upload() {
+        let chunk = Bytes::from(vec![b'x'; 4096]);
+        let (request, head) = upload_request(stream_of(&[chunk.clone(), chunk]));
+        let mut peer = Peer::new(
+            usize::MAX,
+            1,
+            &[b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\nno"],
+        );
+        peer.reset_sends_after = Some(1);
+        let response = drive(request.exchange(peer, head)).unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            drive(response.into_body().collect()),
+            Ok(Bytes::from_static(b"no"))
+        );
+    }
+
+    #[test]
+    fn a_failed_send_with_no_response_is_an_error() {
+        let (request, head) = upload_request(EncodedBody::Full(Bytes::from_static(b"body")));
+        let mut peer = Peer::new(usize::MAX, 0, &[]);
+        peer.reset_sends_after = Some(0);
+        assert_eq!(
+            drive(request.exchange(peer, head)).map(drop).unwrap_err(),
+            HttpError::Protocol
+        );
+    }
+
+    #[test]
+    fn a_producer_failure_during_the_response_fails_the_body() {
+        let failing = EncodedBody::Stream(ByteStream::new(futures::stream::iter([
+            Ok(Bytes::from_static(b"hello")),
+            Err(HttpError::BodyProducer(io::ErrorKind::BrokenPipe)),
+        ])));
+        let (request, head) = upload_request(failing);
+        // The response head arrives after the request head; reading it
+        // lets the server take more, which is when the producer fails.
+        let mut peer = Peer::new(
+            1,
+            1,
+            &[
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n",
+                b"0123456789",
+            ],
+        );
+        peer.credit_per_read = 2;
+        let response = drive(request.exchange(peer, head)).unwrap();
+        let mut body = response.into_body();
+        assert_eq!(drive(body.chunk()), Some(Err(H1Error::RequestBody)));
+        assert!(body.io.is_none());
+        assert_eq!(drive(body.chunk()), None);
+    }
+
+    #[test]
+    fn a_producer_failure_before_the_response_is_reported_as_itself() {
+        let failing = EncodedBody::Stream(ByteStream::new(futures::stream::iter([Err(
+            HttpError::BodyProducer(io::ErrorKind::BrokenPipe),
+        )])));
+        let (request, head) = upload_request(failing);
+        let peer = Peer::new(usize::MAX, usize::MAX, &[]);
+        assert_eq!(
+            drive(request.exchange(peer, head)).map(drop).unwrap_err(),
+            HttpError::BodyProducer(io::ErrorKind::BrokenPipe)
         );
     }
 }
