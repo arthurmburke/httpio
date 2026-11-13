@@ -60,3 +60,8 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 bindgen = "0.71"
 cc = "1"
 pkg-config = "0.3"
+
+[dev-dependencies]
+# hyper's server side, for the DPDK TLS stream's end-to-end tests (an
+# in-process h1/h2 server over a fake TCP peer). Test builds only.
+hyper = { version = "1", features = ["server", "http1", "http2"] }

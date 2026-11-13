@@ -153,6 +153,54 @@ impl DmaWriter {
         Some(out)
     }
 
+    /// Lends `len` contiguous writable bytes of DMA memory to `fill`, which
+    /// writes a prefix of them and returns its length; that prefix comes
+    /// back as [`Bytes`] the stack attaches to packets without a copy.
+    ///
+    /// For producers that generate their output in place rather than copy
+    /// it from somewhere (TLS encryption writes ciphertext straight into the
+    /// lent slice). The slice's contents on entry are unspecified (zeroes or
+    /// stale data from an earlier use of the block). If the current block
+    /// has less than `len` bytes left, its tail is left unused and the next
+    /// block is taken. `None` if `len` is zero or larger than the largest
+    /// block, or no DMA memory could be allocated; `fill` is then not
+    /// called. `fill` returning 0 yields an empty `Bytes` and uses no space.
+    ///
+    /// EAL must be initialised.
+    pub fn fill_with(
+        &mut self,
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> usize,
+    ) -> Option<Bytes> {
+        if len == 0 || len > MAX_BLOCK {
+            return None;
+        }
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|block| block.whole.len() - block.used < len)
+        {
+            self.current = None;
+        }
+        if self.current.is_none() {
+            self.current = Some(self.next_block(len)?);
+        }
+        let block = self.current.as_mut()?;
+        // SAFETY: `used + len` is within the block (checked above, and a
+        // fresh block is at least `len` long since `len <= MAX_BLOCK`), and
+        // no slice covering these bytes has been handed out, so nothing
+        // else can read or write them while `fill` holds this slice. The
+        // memory is initialised (zeroed at allocation, or earlier data).
+        let lent = unsafe { slice::from_raw_parts_mut(block.base.as_ptr().add(block.used), len) };
+        let n = fill(lent).min(len);
+        let out = block.whole.slice(block.used..block.used + n);
+        block.used += n;
+        if block.used == block.whole.len() {
+            self.current = None;
+        }
+        Some(out)
+    }
+
     /// Takes back the bytes the last [`copy`](Self::copy) returned, when
     /// they turned out not to be needed, so the space is used again.
     pub fn undo(&mut self, bytes: Bytes) {

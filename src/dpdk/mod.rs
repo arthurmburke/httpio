@@ -12,6 +12,7 @@ pub mod mempool;
 pub mod net;
 pub mod port;
 pub mod tcp;
+pub mod tls;
 pub mod tokio;
 
 pub use lcore::{WorkerJoin, first_worker_lcore, launch};
