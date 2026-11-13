@@ -377,13 +377,16 @@ impl Client {
                 send_h1(tls, parts, Full::new(body), &host, port, is_https).await
             }
         } else {
-            let tcp = self
+            let mut tcp = self
                 .dial(&host, port, tcp_options, flush_handle.as_ref())
                 .await?;
             // Plain HTTP has no handshake, so cork right away.
             if tcp_options.cork {
                 tcp.request_cork();
             }
+            // hyper writes the body vectored, straight from these `Bytes`:
+            // lent to the stream, they go out as slices, not copies.
+            tcp.lend_body(&body);
             send_h1(tcp, parts, Full::new(body), &host, port, is_https).await
         }
     }

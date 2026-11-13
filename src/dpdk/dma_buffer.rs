@@ -129,22 +129,52 @@ impl DmaWriter {
     ///
     /// EAL must be initialised.
     pub fn copy(&mut self, data: &[u8]) -> Option<Bytes> {
-        if data.is_empty() {
+        self.copy_parts([data], data.len())
+    }
+
+    /// Like [`copy`](Self::copy), for the concatenation of `parts`: copies
+    /// a prefix of the first `len` bytes of it into one contiguous run of
+    /// the current block and returns it as a single `Bytes`. A vectored
+    /// write uses this so a small header and the start of a body land
+    /// next to each other and can leave in one packet. The prefix is
+    /// short only when the block has less room than `len` (or `parts`
+    /// holds fewer than `len` bytes). `None` if nothing was copied.
+    pub fn copy_parts<'a>(
+        &mut self,
+        parts: impl IntoIterator<Item = &'a [u8]>,
+        len: usize,
+    ) -> Option<Bytes> {
+        if len == 0 {
             return None;
         }
         if self.current.is_none() {
-            self.current = Some(self.next_block(data.len())?);
+            self.current = Some(self.next_block(len)?);
         }
         let block = self.current.as_mut()?;
-        let n = data.len().min(block.whole.len() - block.used);
-        // SAFETY: `used + n` is within the block, and no slice covering
-        // these bytes has been handed out, so nothing else can read or
-        // write them.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), block.base.as_ptr().add(block.used), n);
+        let n = len.min(block.whole.len() - block.used);
+        let mut copied = 0;
+        for part in parts {
+            if copied == n {
+                break;
+            }
+            let take = part.len().min(n - copied);
+            // SAFETY: `used + copied + take <= used + n` is within the
+            // block, and no slice covering these bytes has been handed
+            // out, so nothing else can read or write them.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    part.as_ptr(),
+                    block.base.as_ptr().add(block.used + copied),
+                    take,
+                );
+            }
+            copied += take;
         }
-        let out = block.whole.slice(block.used..block.used + n);
-        block.used += n;
+        if copied == 0 {
+            return None;
+        }
+        let out = block.whole.slice(block.used..block.used + copied);
+        block.used += copied;
         if block.used == block.whole.len() {
             // Full: let go of it now, so it comes back for reuse as soon
             // as the slices handed out are dropped.
