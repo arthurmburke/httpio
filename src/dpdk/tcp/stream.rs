@@ -207,6 +207,20 @@ enum LentBody {
 }
 
 impl LentBody {
+    /// What [`TcpStream::lend_body`] keeps of `body`. With a DMA writer
+    /// only a body that `is_dma` (checked once, here, not per write) is
+    /// worth lending; see there. `is_dma` is not called without a writer,
+    /// which is also when EAL may not be up to answer it.
+    fn new(body: &Bytes, has_writer: bool, is_dma: impl FnOnce() -> bool) -> Self {
+        if body.is_empty() || (has_writer && !is_dma()) {
+            return LentBody::Empty;
+        }
+        LentBody::Lent {
+            body: body.clone(),
+            unsent: body.len(),
+        }
+    }
+
     /// The part of the lent body that `data` borrows from, if all of
     /// `data` lies inside it.
     fn slice_of(&self, data: &[u8]) -> Option<Bytes> {
@@ -348,15 +362,23 @@ impl TcpStream {
     ///
     /// Only for writes that reach the stream unchanged: behind TLS the
     /// stream sees ciphertext, which never matches.
+    ///
+    /// On a port that attaches external buffers (the stream has a
+    /// `DmaWriter`) the body is kept only if it is already EAL memory. A
+    /// heap body is left unlent: sliced, it would reach the worker as heap
+    /// memory and be copied into mbufs there, on the shared worker lcore,
+    /// whereas copied here it lands in the writer's DMA block once, on the
+    /// app thread, and the worker attaches it. Without a writer the worker
+    /// copies every payload anyway, so slicing is never worse than copying
+    /// and the body is always lent.
     pub fn lend_body(&mut self, body: &Bytes) {
-        self.lent = if body.is_empty() {
-            LentBody::Empty
-        } else {
-            LentBody::Lent {
-                body: body.clone(),
-                unsent: body.len(),
-            }
-        };
+        self.lent = LentBody::new(body, self.writer.is_some(), || {
+            // Classifies by the first byte's memory segment: EAL memory or
+            // not. A body longer than one segment (or than `dma_prefix`'s
+            // u16 cap) still counts; the engine attaches what it can and
+            // copies the rest, chunk by chunk.
+            crate::dpdk::mbuf::Mbuf::dma_prefix(body).is_some()
+        });
     }
 
     /// Zero-copy write: hands owned `data` straight to the worker as a
@@ -1168,6 +1190,37 @@ mod tests {
         assert_eq!(second.len(), rest.len());
         // All of it went out as slices: the stream lets go of the body.
         assert!(matches!(stream.lent, LentBody::Empty));
+    }
+
+    /// The lending decision, with the EAL memory check stubbed: telling
+    /// heap from EAL memory needs EAL, which unit tests don't start.
+    #[test]
+    fn a_writer_lends_only_dma_bodies_and_asks_only_once() {
+        let body = Bytes::from(vec![3; 32]);
+        let lent = |state: &LentBody| matches!(state, LentBody::Lent { unsent: 32, .. });
+        // No writer: always lent, and EAL is never consulted.
+        assert!(lent(&LentBody::new(&body, false, || panic!(
+            "no EAL check without a writer"
+        ))));
+        // A writer and a heap body: left to be copied into the writer.
+        let mut asked = 0;
+        let heap = LentBody::new(&body, true, || {
+            asked += 1;
+            false
+        });
+        assert!(matches!(heap, LentBody::Empty));
+        // A writer and a DMA body: lent.
+        let dma = LentBody::new(&body, true, || {
+            asked += 1;
+            true
+        });
+        assert!(lent(&dma));
+        assert_eq!(asked, 2);
+        // Empty bodies are never lent, and need no check.
+        assert!(matches!(
+            LentBody::new(&Bytes::new(), true, || panic!("no check for an empty body")),
+            LentBody::Empty
+        ));
     }
 
     #[test]

@@ -385,7 +385,8 @@ impl Client {
                 tcp.request_cork();
             }
             // hyper writes the body vectored, straight from these `Bytes`:
-            // lent to the stream, they go out as slices, not copies.
+            // lent to the stream, they go out as slices, not copies -- when
+            // that helps (DMA memory, or a port that copies regardless).
             tcp.lend_body(&body);
             send_h1(tcp, parts, Full::new(body), &host, port, is_https).await
         }
