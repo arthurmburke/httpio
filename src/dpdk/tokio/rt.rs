@@ -14,13 +14,12 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::mem;
-use std::sync::Arc;
 
 use crate::dpdk::lcore::CoreIterator;
 
 /// Builds a multi-threaded tokio runtime confined to the CPUs not owned by
-/// any DPDK lcore. One worker thread is created per available CPU, each
-/// pinned to a distinct one; the spawn-blocking pool is likewise kept off
+/// any DPDK lcore. One worker thread is created per available CPU, with all
+/// workers confined to that CPU set; the spawn-blocking pool is likewise kept off
 /// the DPDK cores.
 ///
 /// Errors if every CPU the process may run on is a DPDK lcore (nothing
@@ -47,7 +46,7 @@ pub fn available_cpus() -> io::Result<Vec<usize>> {
 }
 
 /// Builds a multi-threaded runtime whose threads are pinned to exactly
-/// `cpus` (round-robin, one worker per CPU).
+/// `cpus` (one worker per CPU, sharing the allowed CPU set).
 fn build_runtime_on(cpus: Vec<usize>) -> io::Result<tokio::runtime::Runtime> {
     if cpus.is_empty() {
         return Err(io::Error::other(
@@ -56,7 +55,6 @@ fn build_runtime_on(cpus: Vec<usize>) -> io::Result<tokio::runtime::Runtime> {
         ));
     }
     let worker_threads = cpus.len();
-    let cpus = Arc::new(cpus);
 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
@@ -101,7 +99,7 @@ fn online_cpus() -> io::Result<Vec<usize>> {
 
 /// Pins the calling thread to set of CPUs.
 fn pin_thread_to_cpus<I: Iterator<Item = usize>>(cpus: I) -> io::Result<()> {
-    // SAFETY: builds a single-CPU cpu_set_t and applies it to the calling
+    // SAFETY: builds a cpu_set_t and applies it to the calling
     // thread (pid 0).
     unsafe {
         let mut set: libc::cpu_set_t = mem::zeroed();
@@ -109,22 +107,6 @@ fn pin_thread_to_cpus<I: Iterator<Item = usize>>(cpus: I) -> io::Result<()> {
         for cpu in cpus {
             libc::CPU_SET(cpu, &mut set);
         }
-        if libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-/// Pins the calling thread to a single CPU.
-#[allow(unused)]
-fn pin_current_thread(cpu: usize) -> io::Result<()> {
-    // SAFETY: builds a single-CPU cpu_set_t and applies it to the calling
-    // thread (pid 0).
-    unsafe {
-        let mut set: libc::cpu_set_t = mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
         if libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
             return Err(io::Error::last_os_error());
         }

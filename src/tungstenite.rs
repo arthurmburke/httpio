@@ -126,7 +126,6 @@ impl Default for TungsteniteClient {
 /// translation.
 pub struct TungsteniteWebSocket<S = MaybeTlsStream<TcpStream>> {
     inner: WebSocketStream<S>,
-    protocol: Option<String>,
     handshake: http::response::Parts,
 }
 
@@ -135,17 +134,7 @@ impl<S> TungsteniteWebSocket<S> {
     /// completed, along with the handshake response it returned.
     pub fn from_parts(inner: WebSocketStream<S>, response: Response) -> Self {
         let (handshake, _body) = response.into_parts();
-        // tungstenite has already checked the selection against the offers.
-        let protocol = handshake
-            .headers
-            .get(header::SEC_WEBSOCKET_PROTOCOL)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.trim().to_string());
-        TungsteniteWebSocket {
-            inner,
-            protocol,
-            handshake,
-        }
+        TungsteniteWebSocket { inner, handshake }
     }
 
     /// The underlying tokio-tungstenite stream.
@@ -231,7 +220,12 @@ impl WebSocket for TungsteniteWebSocket {
     }
 
     fn protocol(&self) -> Option<&str> {
-        self.protocol.as_deref()
+        // tungstenite has already checked the selection against the offers.
+        self.handshake
+            .headers
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
     }
 
     fn handshake(&self) -> &http::response::Parts {

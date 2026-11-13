@@ -67,14 +67,12 @@ impl ContentType {
     /// header isn't valid text or names an unsupported media type.
     pub fn from_header(value: &HeaderValue) -> Option<Self> {
         let media = value.to_str().ok()?.split(';').next()?.trim();
-        match media.to_ascii_lowercase().as_str() {
-            "application/json" => Some(ContentType::Json),
-            "application/xml" | "text/xml" => Some(ContentType::Xml),
-            "application/x-www-form-urlencoded" => Some(ContentType::Form),
-            "text/plain" => Some(ContentType::Text),
-            "application/octet-stream" => Some(ContentType::Octet),
-            _ => None,
+        if media.eq_ignore_ascii_case("text/xml") {
+            return Some(Self::Xml);
         }
+        [Self::Json, Self::Xml, Self::Form, Self::Text, Self::Octet]
+            .into_iter()
+            .find(|ct| media.eq_ignore_ascii_case(ct.as_str()))
     }
 
     /// The canonical media-type string.
@@ -372,6 +370,35 @@ mod tests {
 
     fn ct(s: &str) -> HeaderValue {
         HeaderValue::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn content_type_parsing_ignores_case_parameters_and_whitespace() {
+        for kind in [
+            ContentType::Json,
+            ContentType::Xml,
+            ContentType::Form,
+            ContentType::Text,
+            ContentType::Octet,
+        ] {
+            let header = ct(&format!(
+                " {} ; charset=utf-8",
+                kind.as_str().to_ascii_uppercase()
+            ));
+            assert_eq!(ContentType::from_header(&header), Some(kind));
+        }
+        assert_eq!(
+            ContentType::from_header(&ct("Text/XML")),
+            Some(ContentType::Xml)
+        );
+        assert_eq!(
+            ContentType::from_header(&ct("application/json-extra")),
+            None
+        );
+        assert_eq!(
+            ContentType::from_header(&HeaderValue::from_bytes(b"\xff").unwrap()),
+            None
+        );
     }
 
     /// Unwraps the buffered arm (every non-`ByteStream` body encodes to it).

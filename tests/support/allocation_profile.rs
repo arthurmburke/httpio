@@ -18,6 +18,7 @@ pub struct Stats {
     pub allocation_ns: u64,
     pub free_ns: u64,
 }
+#[cfg(dpdk)]
 impl Stats {
     pub fn allocations(self) -> u64 {
         self.alloc_calls + self.zeroed_calls + self.realloc_calls
