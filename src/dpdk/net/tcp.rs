@@ -64,7 +64,40 @@ impl SackBlocks {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The SACK option of one segment. Almost no segment has one, and every
+/// received and queued packet carries a [`TcpHeader`]: held inline, four
+/// blocks more than double that header, which measurably slows the
+/// loss-free path. They are boxed instead, so only a segment that
+/// actually reports or receives blocks pays (an allocation, during loss).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Sack(Option<Box<SackBlocks>>);
+
+impl Sack {
+    /// Appends a block; ignored once the option is full.
+    pub fn push(&mut self, left: u32, right: u32) {
+        self.0.get_or_insert_default().push(left, right);
+    }
+
+    pub fn as_slice(&self) -> &[(u32, u32)] {
+        self.0.as_deref().map_or(&[], SackBlocks::as_slice)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn wire_len(&self) -> usize {
+        self.0.as_deref().map_or(0, SackBlocks::wire_len)
+    }
+}
+
+impl From<SackBlocks> for Sack {
+    fn from(blocks: SackBlocks) -> Self {
+        Self((!blocks.is_empty()).then(|| Box::new(blocks)))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TcpOptions {
     pub mss: Option<u16>,
     pub window_scale: Option<u8>,
@@ -72,7 +105,7 @@ pub struct TcpOptions {
     pub sack_permitted: bool,
     /// Selective acknowledgments. This stack sends them only on segments
     /// without payload, so data segments never lose room to them.
-    pub sack: SackBlocks,
+    pub sack: Sack,
 }
 
 impl TcpOptions {

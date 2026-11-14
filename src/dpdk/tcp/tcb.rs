@@ -1280,7 +1280,7 @@ impl Tcb {
                     && seg.flags & (flags::SYN | flags::RST) == 0
                     && self.recv_buffer.has_out_of_order()
                 {
-                    self.recv_buffer.sack_blocks(self.sack_recent)
+                    self.recv_buffer.sack_blocks(self.sack_recent).into()
                 } else {
                     Default::default()
                 },
