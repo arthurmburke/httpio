@@ -132,46 +132,31 @@ up as confusing mid-build errors like ``crate `syn` required to be
 available in rlib format``. It also keeps builds off slow VirtioFS and
 persists incremental state across container rebuilds.
 
-## The FFI layer: bindgen + a small C shim
+## DPDK bindings and cross-language LTO
 
-`build.rs` generates the bindings at build time with **bindgen**: it runs
-over [`csrc/wrapper.h`](csrc/wrapper.h) using the include flags from
-`pkg-config --cflags libdpdk`, so struct layouts and exported-function
-signatures (`rte_eal_init`, `rte_eth_rx_queue_setup`/`tx_queue_setup`,
-`rte_eth_dev_start`/`stop`, `rte_eth_macaddr_get`,
-`rte_eth_promiscuous_enable`, `rte_pktmbuf_pool_create`, ...) are
-ABI-exact for the DPDK version actually installed. The allowlist in
-`build.rs` keeps the generated file to just what the stack calls.
-[`src/dpdk/ffi.rs`](src/dpdk/ffi.rs) includes the generated bindings under
-`cfg(dpdk_bound)`, with a hand-written stub mirror as the type-check-only
-fallback when DPDK isn't present.
+`build.rs` uses bindgen and [`wrapper.h`](wrapper.h) to generate bindings
+against the installed DPDK headers. Bindgen also generates C wrappers for
+`static inline` functions such as `rte_pktmbuf_alloc`, `rte_pktmbuf_free`,
+and `rte_eth_rx_burst`/`rte_eth_tx_burst` so Rust can call them.
 
-A handful of the hottest DPDK functions/macros
-(`rte_eth_rx_burst`/`tx_burst`, `rte_pktmbuf_alloc`/`alloc_bulk`/`free`,
-`rte_pktmbuf_mtod`, `rte_pktmbuf_append`/`prepend`/`adj`/`trim`/`reset`,
-`rte_pktmbuf_headroom`/`tailroom`, `rte_socket_id`) are `static inline` in
-the DPDK headers: they're compiled into whatever C translation unit uses
-them and never produce a linkable symbol in libdpdk.so, so neither bindgen
-nor an `extern "C"` block can call them. [`csrc/shim.c`](csrc/shim.c) is a
-few dozen one-line wrappers giving those inlines a real exported name
-(`dpdk_shim_*`), compiled by `build.rs` against the same installed
-headers. `rte_eth_dev_configure` also goes through the shim so the
-version-sensitive `struct rte_eth_conf` is built (zeroed) in C against the
-real header rather than replicated in Rust.
+Release builds from this workspace enable cross-language ThinLTO on
+native GNU/Linux when libdpdk is installed. The devcontainer includes
+Clang and LLVM ar, so use the standard Cargo commands:
 
-The safe wrappers (`src/dpdk/mbuf.rs` etc.) deliberately treat `rte_mbuf`
-and `rte_mempool` as opaque pointers and access mbuf fields through shim
-accessors, so the Rust side never depends on `rte_mbuf`'s layout
-(cache-line split, conditional fields, bitfields) staying put across DPDK
-versions.
+```sh
+cargo build --release --example bench_library
+cargo test --release --test dpdk_engine --test dpdk_external_tx
+```
 
-Note on static linking: DPDK PMDs self-register via constructors, which
-typically needs `-Wl,--whole-archive`/`--no-whole-archive` around the
-driver libraries when linking statically. `build.rs` forwards `-l`/`-L`
-tokens from `pkg-config --libs libdpdk` to cargo but can't represent
-arbitrary linker flags — if a static-linking setup needs those, pass them
-via `RUSTFLAGS`. The devcontainer uses Debian's shared DPDK libs, where
-PMDs are auto-loaded at runtime from the system PMD directory instead.
+The build uses the Rust toolchain's bundled LLD. Clang compiles the
+generated wrappers to LLVM bitcode, so LLD can inline them into Rust
+callers. The installed DPDK shared libraries and PMD calls still use
+their native ABI. Set `HTTPIO_DPDK_LTO=0` for a release build with native
+C wrappers and Rust-only LTO. Debug builds use native C wrappers.
+
+The devcontainer uses shared DPDK libraries, which load PMDs at runtime.
+Static DPDK builds may need additional linker flags to retain the PMD
+registration constructors.
 
 ## Running
 

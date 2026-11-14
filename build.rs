@@ -15,6 +15,7 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -23,6 +24,8 @@ fn main() {
     // `dpdk` is a build-script-set cfg (not a Cargo feature); declare it so
     // the unexpected_cfgs lint knows it's expected whether or not it's set.
     println!("cargo::rustc-check-cfg=cfg(dpdk)");
+    println!("cargo::rustc-check-cfg=cfg(dpdk_linker_lto)");
+    println!("cargo::rerun-if-env-changed=HTTPIO_DPDK_LTO");
 
     // Locate libdpdk and emit its link flags (this also prints the
     // cargo:rustc-link-lib/search lines for every DPDK library). If it isn't
@@ -95,6 +98,26 @@ fn main() {
 
     // Compile and link the generated static-inline wrappers.
     let mut cc = cc::Build::new();
+    let target = env::var("TARGET").unwrap();
+    if option_env!("HTTPIO_DPDK_RUSTC_WRAPPER").is_some()
+        && env::var("PROFILE").as_deref() == Ok("release")
+        && env::var("HOST").as_deref() == Ok(target.as_str())
+        && target.ends_with("-linux-gnu")
+        && env::var("HTTPIO_DPDK_LTO").as_deref() != Ok("0")
+    {
+        // Match Rust's linker-plugin ThinLTO mode. Use the archiver from
+        // the same Clang toolchain so the archive has a bitcode symbol index.
+        let archiver = Command::new("clang")
+            .arg("-print-prog-name=llvm-ar")
+            .output()
+            .expect("cross-language LTO requires clang and llvm-ar");
+        assert!(archiver.status.success(), "clang could not locate llvm-ar");
+        let archiver = std::str::from_utf8(&archiver.stdout)
+            .expect("clang returned a non-UTF-8 llvm-ar path")
+            .trim();
+        cc.compiler("clang").archiver(archiver).flag("-flto=thin");
+        println!("cargo::rustc-cfg=dpdk_linker_lto");
+    }
     cc.file(&static_fns_c).include(".");
     for include in &dpdk.include_paths {
         cc.include(include);

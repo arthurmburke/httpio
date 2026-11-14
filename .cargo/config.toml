@@ -5,3 +5,4 @@
 # otherwise a hard compile error on aarch64.
 [build]
 rustflags = ["-C", "target-cpu=native"]
+rustc-workspace-wrapper = "scripts/dpdk-rustc.sh"
