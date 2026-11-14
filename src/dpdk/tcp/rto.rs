@@ -83,6 +83,14 @@ pub struct UnackedSegment {
     /// generate an RTT sample when it's finally acked.
     pub retransmitted: bool,
     pub retransmit_count: u32,
+    /// The peer reported holding this range (RFC 2018). Not an
+    /// acknowledgment: the range stays queued until cumulatively acked.
+    pub sacked: bool,
+    /// Considered lost: it no longer counts as in flight, and is resent
+    /// as soon as the congestion window allows.
+    pub lost: bool,
+    /// Resent since it was marked lost; that copy counts as in flight.
+    pub rexmit_out: bool,
     pending_transmit: bool,
 }
 
@@ -103,6 +111,8 @@ pub struct RetransmitQueue {
     /// New segments start out waiting for the port to accept them; see
     /// [`RetransmitQueue::hold_until_transmitted`].
     hold: bool,
+    /// Some segment is marked SACKed or lost.
+    scoreboard: bool,
     /// How many segments at the back of the queue are still waiting.
     /// They are confirmed oldest first, so the next confirmation is
     /// normally for the first of them and needs no search.
@@ -130,8 +140,185 @@ impl RetransmitQueue {
             last_sent_at: now,
             retransmitted: false,
             retransmit_count: 0,
+            sacked: false,
+            lost: false,
+            rexmit_out: false,
             pending_transmit: self.hold,
         });
+    }
+
+    /// Whether any segment is marked SACKed or lost. While none is, what
+    /// is in flight is simply everything unacknowledged.
+    pub fn scoreboard(&self) -> bool {
+        self.scoreboard
+    }
+
+    /// Makes `seq` a segment boundary, splitting the data segment it
+    /// falls inside (a SACK block or one MSS can end mid-segment: a
+    /// segment here may be a whole TSO packet).
+    fn split_at(&mut self, seq: Seq) {
+        let index = self.segments.partition_point(|s| s.end_seq().leq(seq));
+        let len = self.segments.len();
+        let Some(seg) = self.segments.get_mut(index) else {
+            return;
+        };
+        if !seg.seq.lt(seq) {
+            return;
+        }
+        let n = seq.distance(seg.seq) as usize;
+        if n >= seg.data.len() {
+            return;
+        }
+        let right = UnackedSegment {
+            seq,
+            data: seg.data.slice(n, seg.data.len() - n),
+            syn: false,
+            fin: false,
+            first_sent_at: seg.first_sent_at,
+            last_sent_at: seg.last_sent_at,
+            retransmitted: seg.retransmitted,
+            retransmit_count: seg.retransmit_count,
+            sacked: seg.sacked,
+            lost: seg.lost,
+            rexmit_out: seg.rexmit_out,
+            pending_transmit: seg.pending_transmit,
+        };
+        seg.data = seg.data.slice(0, n);
+        // One more segment among those still waiting for the port.
+        if right.pending_transmit && index >= len - self.untransmitted.min(len) {
+            self.untransmitted += 1;
+        }
+        self.segments.insert(index + 1, right);
+    }
+
+    /// Limits the oldest segment to `mss` bytes, so that resending it
+    /// resends all of it.
+    pub fn split_front(&mut self, mss: usize) {
+        if let Some(front) = self.segments.front()
+            && front.data.len() > mss
+        {
+            self.split_at(front.seq + mss as u32);
+        }
+    }
+
+    /// Records the peer's SACK blocks. Blocks outside `(snd_una, snd_nxt]`
+    /// (stale, duplicate-SACK, or invalid) are ignored.
+    pub fn apply_sack(&mut self, blocks: &[(u32, u32)], snd_una: Seq, snd_nxt: Seq) {
+        for &(left, right) in blocks {
+            let (mut left, right) = (Seq::new(left), Seq::new(right));
+            if !left.lt(right) || right.leq(snd_una) || right.gt(snd_nxt) {
+                continue;
+            }
+            if left.lt(snd_una) {
+                left = snd_una;
+            }
+            self.split_at(left);
+            self.split_at(right);
+            let start = self.segments.partition_point(|s| s.seq.lt(left));
+            for seg in self.segments.range_mut(start..) {
+                if seg.end_seq().gt(right) {
+                    break;
+                }
+                seg.sacked = true;
+                self.scoreboard = true;
+            }
+        }
+    }
+
+    /// RFC 6675 `IsLost`: an unSACKed segment is lost once the peer holds
+    /// three segments, or more than two MSS of data, sent after it.
+    /// Returns whether any segment was newly marked.
+    pub fn detect_lost(&mut self, mss: u32) -> bool {
+        let (mut bytes_above, mut segments_above) = (0u32, 0u32);
+        let mut any = false;
+        for seg in self.segments.iter_mut().rev() {
+            if seg.sacked {
+                bytes_above = bytes_above.saturating_add(seg.data.len() as u32);
+                segments_above += 1;
+            } else if (segments_above >= 3 || bytes_above > 2 * mss) && !seg.lost && !seg.syn {
+                seg.lost = true;
+                seg.rexmit_out = false;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// The oldest segment is known lost (third duplicate ACK, or a
+    /// partial ACK during recovery) unless a resent copy is still out.
+    pub fn mark_front_lost(&mut self) {
+        if let Some(front) = self.segments.front_mut()
+            && !front.sacked
+            && !front.rexmit_out
+        {
+            front.lost = true;
+            self.scoreboard = true;
+        }
+    }
+
+    /// Retransmission timeout: everything the peer has not reported
+    /// holding is presumed lost and is resent as the window reopens.
+    pub fn mark_all_lost(&mut self) {
+        // The oldest segment cannot both be held by the peer and remain
+        // unacknowledged: the peer discarded data it had SACKed (RFC 2018
+        // §8), so none of its reports can be trusted.
+        if self.segments.front().is_some_and(|s| s.sacked) {
+            for seg in &mut self.segments {
+                seg.sacked = false;
+            }
+        }
+        for seg in &mut self.segments {
+            if !seg.sacked && !seg.pending_transmit {
+                seg.lost = true;
+                seg.rexmit_out = false;
+                self.scoreboard = true;
+            }
+        }
+    }
+
+    /// RFC 6675 `SetPipe`: sequence space believed to be in the network.
+    /// SACKed data has left it and lost data never arrived; a resent copy
+    /// of lost data is in it.
+    pub fn pipe(&self) -> u32 {
+        let mut pipe = 0u32;
+        for seg in &self.segments {
+            if seg.sacked {
+                continue;
+            }
+            let len = seg.end_seq().distance(seg.seq) as u32;
+            if !seg.lost || seg.rexmit_out {
+                pipe = pipe.saturating_add(len);
+            }
+        }
+        pipe
+    }
+
+    fn awaits_resend(seg: &UnackedSegment) -> bool {
+        seg.lost && !seg.sacked && !seg.rexmit_out && !seg.syn
+    }
+
+    pub fn has_lost_to_send(&self) -> bool {
+        self.scoreboard && self.segments.iter().any(Self::awaits_resend)
+    }
+
+    /// Takes the oldest lost segment for resending, at most `mss` bytes
+    /// of it: its sequence number, data, and whether it is the FIN.
+    pub fn take_lost(&mut self, mss: usize, now: Instant) -> Option<(Seq, Payload, bool)> {
+        let index = self.segments.iter().position(Self::awaits_resend)?;
+        if self.segments[index].data.len() > mss {
+            let boundary = self.segments[index].seq + mss as u32;
+            self.split_at(boundary);
+        }
+        let hold = self.hold;
+        let seg = &mut self.segments[index];
+        seg.rexmit_out = true;
+        // Karn: its eventual ACK is ambiguous.
+        seg.retransmitted = true;
+        seg.last_sent_at = now;
+        if hold {
+            seg.pending_transmit = true;
+        }
+        Some((seg.seq, seg.data.clone(), seg.fin))
     }
 
     /// Chooses whether segments queued from now on wait for
@@ -145,10 +332,12 @@ impl RetransmitQueue {
     /// The oldest segment is about to be resent: under a hold its timer
     /// waits for the port again.
     pub fn front_resent(&mut self) {
-        if self.hold
-            && let Some(front) = self.segments.front_mut()
-        {
-            front.pending_transmit = true;
+        let hold = self.hold;
+        if let Some(front) = self.segments.front_mut() {
+            front.rexmit_out = front.lost;
+            if hold {
+                front.pending_transmit = true;
+            }
         }
     }
 
@@ -211,6 +400,19 @@ impl RetransmitQueue {
             }
         }
         self.untransmitted = self.untransmitted.min(self.segments.len());
+        // RFC 6298 §5.3: an ACK of new data restarts the timer for what
+        // is still outstanding. Otherwise a segment sent long ago and
+        // lost along with the one just acknowledged would time out the
+        // moment it reached the front, before it could be resent.
+        if let Some(front) = self.segments.front_mut()
+            && !front.pending_transmit
+            && front.last_sent_at < now
+        {
+            front.last_sent_at = now;
+        }
+        if self.scoreboard {
+            self.scoreboard = self.segments.iter().any(|s| s.sacked || s.lost);
+        }
         sample
     }
 

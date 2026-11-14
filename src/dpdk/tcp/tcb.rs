@@ -28,6 +28,12 @@ const LOCAL_WINDOW_SCALE: u8 = 4;
 /// RFC 9293 §3.10.7.4 / RFC 6191: 2*MSL time-wait duration; shortened well
 /// below the traditional 4 minutes for a lab/demo-scale stack.
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(30);
+/// Longest an acknowledgment of in-order data is withheld waiting for a
+/// second segment or outgoing data to carry it (RFC 9293 §3.8.6.3 allows
+/// up to 500 ms). Short, because a sender whose window ends on an
+/// unacknowledged odd segment is stalled for this long, and because on a
+/// poll loop the next segment of a stream is microseconds away anyway.
+pub const DELAYED_ACK_TIMEOUT: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FourTuple {
@@ -143,7 +149,26 @@ pub struct Tcb {
     send_buffer: SendBuffer,
     recv_buffer: ReassemblyBuffer,
 
+    /// Both ends offered SACK-permitted (RFC 2018).
+    sack_ok: bool,
+    /// Start of the out-of-order segment that arrived last: the SACK
+    /// block containing it is reported first.
+    sack_recent: Option<Seq>,
+    /// Out-of-order data arrived and its SACK blocks have not gone out.
+    /// They travel only on a segment without payload, so an ACK carried
+    /// by outgoing data does not settle this.
+    sack_pending: bool,
+    /// `snd_nxt` at the last retransmission timeout. Until everything
+    /// sent before it is acknowledged, further loss signals belong to the
+    /// same event and must not shrink the window again (RFC 6675 §5.1).
+    rto_recovery_point: Option<Seq>,
+    /// An ACK goes out on the next output poll.
     ack_pending: bool,
+    /// An ACK is owed for in-order data but withheld until this deadline,
+    /// a second segment, or outgoing data, whichever comes first. Without
+    /// this a fast poll loop, which usually finds one packet per poll,
+    /// answers every data packet with a pure ACK.
+    ack_delayed: Option<Instant>,
     /// Right edge of the receive window last advertised to the peer.
     /// Written when a segment is built, read to decide whether a read by
     /// the application opened enough window to be worth announcing.
@@ -215,7 +240,12 @@ impl Tcb {
             congestion: CongestionControl::new(DEFAULT_MSS),
             send_buffer: SendBuffer::default(),
             recv_buffer: ReassemblyBuffer::default(),
+            sack_ok: false,
+            sack_recent: None,
+            sack_pending: false,
+            rto_recovery_point: None,
             ack_pending: false,
+            ack_delayed: None,
             rcv_advertised: Cell::new(Seq::new(0)),
             retransmit_now: false,
             handshake_out: None,
@@ -255,6 +285,13 @@ impl Tcb {
     /// Records the window scale announced by the peer, capped at 14.
     pub fn set_peer_scale(&mut self, scale: Option<u8>) {
         self.peer_scale = scale.map(|v| v.min(14));
+    }
+
+    /// Records whether the peer's SYN carried SACK-permitted. This stack
+    /// always offers it, so that settles whether the connection uses SACK.
+    pub fn set_peer_sack(&mut self, permitted: bool) {
+        self.sack_ok = permitted;
+        self.congestion.set_sack(permitted);
     }
     fn receive_capacity(&self) -> u32 {
         if self.peer_scale.is_some() {
@@ -499,6 +536,7 @@ impl Tcb {
             .clamp(1, DEFAULT_MSS);
         self.congestion =
             CongestionControl::with_initial_window(self.send_mss(), self.initial_window_segments);
+        self.set_peer_sack(hdr.options.sack_permitted);
 
         if hdr.has_flag(flags::ACK) {
             self.snd_una = Seq::new(hdr.ack);
@@ -605,6 +643,8 @@ impl Tcb {
             } else {
                 payload_len.min(right_edge.distance(seq) as u32)
             };
+            let expected = self.rcv_nxt;
+            let in_order = seq == expected && !self.recv_buffer.has_out_of_order();
             if keep != 0 {
                 let mut remaining = keep as usize;
                 let mut chunk_seq = seq;
@@ -619,7 +659,28 @@ impl Tcb {
                     chunk_seq = end;
                 }
             }
-            self.ack_pending = true;
+            // Acknowledge at once whatever the sender is waiting to hear:
+            // loss signals (out-of-order data, or data filling a gap), a
+            // segment the window cut short, the end of a write (PSH), a
+            // second segment, or two segments' worth in one (aggregated)
+            // segment. A lone in-order segment mid-stream can wait briefly
+            // for the next one (RFC 9293 §3.8.6.3, RFC 5681 §4.2).
+            let ack_now = !in_order
+                || keep < payload_len
+                || hdr.has_flag(flags::PSH)
+                || hdr.has_flag(flags::FIN)
+                || keep >= 2 * u32::from(self.send_mss())
+                || self.ack_delayed.is_some();
+            if ack_now {
+                self.ack_pending = true;
+            } else if !self.ack_pending {
+                self.ack_delayed = Some(now + DELAYED_ACK_TIMEOUT);
+            }
+            if self.sack_ok && !in_order {
+                self.sack_pending = true;
+                self.sack_recent = (seq.gt(expected) && self.recv_buffer.has_out_of_order())
+                    .then_some(seq);
+            }
         }
 
         if hdr.has_flag(flags::FIN) && self.state.is_synchronized() {
@@ -675,7 +736,9 @@ impl Tcb {
                 // Partial ACK (RFC 6582 §3.2): the next unacked segment was
                 // lost too; retransmit it now instead of waiting for an RTO.
                 // Karn: the retransmission makes its eventual ACK ambiguous.
-                if let Some(seg) = self.retransmit.segments.front_mut() {
+                if self.sack_ok {
+                    self.retransmit.mark_front_lost();
+                } else if let Some(seg) = self.retransmit.segments.front_mut() {
                     seg.retransmitted = true;
                     seg.last_sent_at = now;
                     self.retransmit_now = true;
@@ -693,18 +756,46 @@ impl Tcb {
             if is_dup_candidate
                 && self.persist != Persist::ProbeOutstanding
                 && self.flight_size() > 0
+                && self.rto_recovery_point.is_none()
                 && self.congestion.on_duplicate_ack(self.snd_nxt.0)
             {
-                // Karn's algorithm: an ACK after this retransmission is
-                // ambiguous and must not produce an RTT sample. Restart
-                // the oldest segment's timer from this transmission.
-                if let Some(seg) = self.retransmit.segments.front_mut() {
-                    seg.retransmitted = true;
-                    seg.last_sent_at = now;
+                if self.sack_ok {
+                    // Resent with the other lost segments, as the window
+                    // and the scoreboard allow.
+                    self.retransmit.mark_front_lost();
+                } else {
+                    // Karn's algorithm: an ACK after this retransmission
+                    // is ambiguous and must not produce an RTT sample.
+                    // Restart the oldest segment's timer from this
+                    // transmission.
+                    if let Some(seg) = self.retransmit.segments.front_mut() {
+                        seg.retransmitted = true;
+                        seg.last_sent_at = now;
+                    }
+                    self.retransmit_now = true;
                 }
-                self.retransmit_now = true;
             }
             self.update_send_window(hdr, ack);
+        }
+
+        if self
+            .rto_recovery_point
+            .is_some_and(|point| self.snd_una.geq(point))
+        {
+            self.rto_recovery_point = None;
+        }
+        // The scoreboard (RFC 6675): note what the peer holds beyond the
+        // cumulative ACK, and treat as lost whatever it has skipped by
+        // three segments. Every hole found this way is resent within the
+        // same round trip, rather than one per round trip.
+        if self.sack_ok && !hdr.options.sack.is_empty() {
+            self.retransmit
+                .apply_sack(hdr.options.sack.as_slice(), self.snd_una, self.snd_nxt);
+            if self.retransmit.detect_lost(u32::from(self.send_mss()))
+                && self.rto_recovery_point.is_none()
+            {
+                self.congestion.enter_recovery(self.snd_nxt.0);
+            }
         }
 
         if self.persist == Persist::ProbeOutstanding {
@@ -784,6 +875,12 @@ impl Tcb {
         {
             self.persist = Persist::ProbeDue;
         }
+        if let Some(deadline) = self.ack_delayed
+            && now >= deadline
+        {
+            self.ack_delayed = None;
+            self.ack_pending = true;
+        }
         if let Some(deadline) = self.time_wait_deadline
             && now >= deadline
         {
@@ -832,6 +929,12 @@ impl Tcb {
     fn on_rto(&mut self, now: Instant) {
         self.congestion.on_rto_timeout(self.flight_size());
         self.rto.backoff();
+        // Everything outstanding is presumed lost and goes out again as
+        // acknowledgments reopen the window, starting with the oldest
+        // segment below. Without this each further lost segment would
+        // wait for a timeout of its own.
+        self.rto_recovery_point = Some(self.snd_nxt);
+        self.retransmit.mark_all_lost();
         if let Some(seg) = self.retransmit.segments.front_mut() {
             seg.retransmitted = true;
             seg.retransmit_count += 1;
@@ -924,14 +1027,11 @@ impl Tcb {
             #[cfg(feature = "tcp-metrics")]
             crate::dpdk::metrics::record(|m| m.retransmits += 1);
             self.retransmit_now = false;
+            // At most one MSS of the oldest range, as a segment of its own.
+            self.retransmit.split_front(usize::from(self.send_mss()));
             if let Some(seg) = self.retransmit.segments.front() {
                 let seq = seg.seq;
-                let data = seg.data.slice(
-                    0,
-                    seg.data
-                        .len()
-                        .min(self.peer_mss.min(self.local_mss) as usize),
-                );
+                let data = seg.data.clone();
                 let mut seg_flags = 0u8;
                 if seg.syn {
                     seg_flags |= flags::SYN;
@@ -945,6 +1045,25 @@ impl Tcb {
                 let mss = seg.syn.then_some(self.local_mss);
                 out.push(self.make_segment(seq, seg_flags, data, mss));
                 self.retransmit.front_resent();
+            }
+        }
+
+        // Segments marked lost (by the SACK scoreboard or a timeout), for
+        // as long as what is in flight leaves room in the window.
+        if self.retransmit.scoreboard() {
+            let mss = usize::from(self.send_mss());
+            let cwnd = self.congestion.cwnd();
+            let mut pipe = self.retransmit.pipe();
+            while out.len() < limit && pipe < cwnd {
+                let Some((seq, data, fin)) = self.retransmit.take_lost(mss, now) else {
+                    break;
+                };
+                #[cfg(feature = "tcp-metrics")]
+                crate::dpdk::metrics::record(|m| m.retransmits += 1);
+                pipe = pipe.saturating_add(data.len() as u32 + u32::from(fin));
+                let seg_flags = flags::ACK | if fin { flags::FIN } else { 0 };
+                out.push(self.make_segment(seq, seg_flags, data, None));
+                self.ack_sent();
             }
         }
 
@@ -970,10 +1089,42 @@ impl Tcb {
             self.retransmit.push(seq, Bytes::new(), false, true, now);
             self.state = self.state.on_fin_sent();
             out.push(self.make_segment(seq, flags::FIN | flags::ACK, Bytes::new(), None));
-        } else if self.ack_pending && out.is_empty() {
-            self.ack_pending = false;
+        } else if (self.ack_pending && out.is_empty()) || (self.sack_pending && out.len() < limit)
+        {
+            self.ack_sent();
             out.push(self.make_segment(self.snd_nxt, flags::ACK, Bytes::new(), None));
         }
+        // Any segment without payload carries the current SACK blocks.
+        if out.last().is_some_and(|seg| seg.payload.is_empty()) {
+            self.sack_pending = false;
+        }
+    }
+
+    /// Sequence space sent but not counted as in flight: SACKed by the
+    /// peer, or lost and not yet resent. Zero unless there has been loss.
+    fn out_of_flight(&self) -> u32 {
+        if self.retransmit.scoreboard() {
+            self.flight_size().saturating_sub(self.retransmit.pipe())
+        } else {
+            0
+        }
+    }
+
+    /// How much new data may be sent: within the peer's window past what
+    /// is unacknowledged, and within the congestion window past what is
+    /// in flight.
+    fn send_room(&self, out_of_flight: u32) -> u32 {
+        let flight = self.flight_size();
+        let in_flight = flight.saturating_sub(out_of_flight);
+        self.snd_wnd
+            .saturating_sub(flight)
+            .min(self.congestion.cwnd().saturating_sub(in_flight))
+    }
+
+    /// A segment carrying the current `rcv_nxt` went out: nothing is owed.
+    fn ack_sent(&mut self) {
+        self.ack_pending = false;
+        self.ack_delayed = None;
     }
 
     fn send_new_data(&mut self, now: Instant, out: &mut Vec<OutSegment>, limit: usize) {
@@ -991,14 +1142,14 @@ impl Tcb {
                 self.retransmit.push(seq, data.clone(), false, false, now);
                 self.persist = Persist::ProbeOutstanding;
                 out.push(self.make_segment(seq, flags::ACK | flags::PSH, data, None));
-                self.ack_pending = false;
+                self.ack_sent();
             }
         }
 
+        let out_of_flight = self.out_of_flight();
         while out.len() < limit {
-            let usable_window = self.snd_wnd.min(self.congestion.cwnd());
             let flight = self.flight_size();
-            let available = usable_window.saturating_sub(flight);
+            let available = self.send_room(out_of_flight);
             if available == 0 || self.send_buffer.is_empty() {
                 break;
             }
@@ -1044,7 +1195,7 @@ impl Tcb {
                 0
             };
             out.push(self.make_segment(seq, flags::ACK | push, data, None));
-            self.ack_pending = false;
+            self.ack_sent();
         }
 
         // A flush is one-shot: once everything buffered at flush time has
@@ -1100,6 +1251,19 @@ impl Tcb {
                 window_scale: (seg.flags & flags::SYN != 0
                     && (self.state == TcpState::SynSent || self.peer_scale.is_some()))
                 .then_some(LOCAL_WINDOW_SCALE),
+                // Offered on every SYN; echoed on a SYN-ACK only to a peer
+                // that offered it.
+                sack_permitted: seg.flags & flags::SYN != 0
+                    && (self.state == TcpState::SynSent || self.sack_ok),
+                sack: if self.sack_ok
+                    && seg.payload.is_empty()
+                    && seg.flags & (flags::SYN | flags::RST) == 0
+                    && self.recv_buffer.has_out_of_order()
+                {
+                    self.recv_buffer.sack_blocks(self.sack_recent)
+                } else {
+                    Default::default()
+                },
             },
         }
     }
@@ -1113,10 +1277,10 @@ impl Tcb {
         // Likewise data blocked only by a zero send window: the persist
         // timer (see `has_armed_timer`) drives the probe, not a busy poll.
         let flight = self.flight_size();
-        let available = self
-            .snd_wnd
-            .min(self.congestion.cwnd())
-            .saturating_sub(flight);
+        let out_of_flight = self.out_of_flight();
+        let available = self.send_room(out_of_flight);
+        let lost_to_send = self.retransmit.has_lost_to_send()
+            && flight.saturating_sub(out_of_flight) < self.congestion.cwnd();
         let mss = self.peer_mss.min(self.local_mss) as usize;
         // Match send_new_data: only a true sub-MSS tail is cork/Nagle held;
         // a window-clamped prefix may still be sent.
@@ -1132,6 +1296,8 @@ impl Tcb {
         self.handshake_out.is_some()
             || self.reset_out.is_some()
             || self.ack_pending
+            || self.sack_pending
+            || lost_to_send
             || self.retransmit_now
             || self.persist == Persist::ProbeDue
             || sendable_data
@@ -1151,6 +1317,7 @@ impl Tcb {
         }
         [
             self.time_wait_deadline,
+            self.ack_delayed,
             self.retransmit.oldest_deadline(self.rto.rto()),
             match self.persist {
                 Persist::Armed(at) => Some(at),
@@ -1169,6 +1336,7 @@ impl Tcb {
     pub fn has_armed_timer(&self) -> bool {
         !self.retransmit.is_empty()
             || self.time_wait_deadline.is_some()
+            || self.ack_delayed.is_some()
             // Reported as soon as the persist condition holds (before the
             // deadline is armed by the next tick/poll) so the engine ticks it.
             || matches!(self.persist, Persist::Armed(_))
@@ -1216,6 +1384,252 @@ mod tests {
         let _ack = tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::Established);
         tcb
+    }
+
+    #[test]
+    fn lone_in_order_segments_are_acknowledged_every_second_one_or_on_timeout() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        let data = |tcb: &Tcb, flags: u8| {
+            (
+                header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK | flags, u16::MAX),
+                Bytes::from(vec![7; 500]),
+            )
+        };
+        // One packet per poll, as a fast poll loop sees a stream: an ACK
+        // for every second segment, not every segment.
+        let mut acks = 0;
+        for _ in 0..10 {
+            let (hdr, payload) = data(&tcb, 0);
+            tcb.on_segment(&hdr, payload, now);
+            tcb.tick(now);
+            acks += tcb.poll_output(now).len();
+        }
+        assert_eq!(acks, 5);
+
+        // A lone segment is acknowledged when the timer runs out...
+        let (hdr, payload) = data(&tcb, 0);
+        tcb.on_segment(&hdr, payload, now);
+        assert!(!tcb.has_pending_output());
+        assert_eq!(tcb.next_deadline(), Some(now + DELAYED_ACK_TIMEOUT));
+        assert!(tcb.poll_output(now).is_empty());
+        let later = now + DELAYED_ACK_TIMEOUT;
+        tcb.tick(later);
+        let out = tcb.poll_output(later);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ack, tcb.rcv_nxt);
+        assert_eq!(tcb.next_deadline(), None);
+
+        // ...at once when it ends the peer's write...
+        let (hdr, payload) = data(&tcb, flags::PSH);
+        tcb.on_segment(&hdr, payload, later);
+        assert_eq!(tcb.poll_output(later).len(), 1);
+
+        // ...at once when it is out of order (the peer needs the duplicate
+        // ACK to detect loss)...
+        let (mut hdr, payload) = data(&tcb, 0);
+        hdr.seq = (tcb.rcv_nxt + 500).0;
+        tcb.on_segment(&hdr, payload, later);
+        assert_eq!(tcb.poll_output(later).len(), 1);
+        let (hdr, payload) = data(&tcb, 0);
+        tcb.on_segment(&hdr, payload, later);
+        assert_eq!(tcb.poll_output(later).len(), 1);
+
+        // ...and rides on outgoing data instead of a segment of its own.
+        let (hdr, payload) = data(&tcb, 0);
+        tcb.on_segment(&hdr, payload, later);
+        tcb.set_nodelay(true);
+        tcb.send(Bytes::from_static(b"reply"));
+        let out = tcb.poll_output(later);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ack, tcb.rcv_nxt);
+        assert!(tcb.next_deadline().is_some()); // the reply's RTO only
+        tcb.tick(later + DELAYED_ACK_TIMEOUT);
+        assert!(tcb.poll_output(later + DELAYED_ACK_TIMEOUT).is_empty());
+    }
+
+    /// An established active open whose peer announced MSS 1460 and,
+    /// optionally, SACK-permitted.
+    fn establish_with_sack(now: Instant, sack: bool) -> Tcb {
+        let mut tcb = Tcb::new_active(tuple());
+        let syn = tcb.poll_output(now);
+        assert!(tcb.to_header(&syn[0]).options.sack_permitted);
+        let mut syn_ack = header(
+            Seq::new(1000),
+            tcb.snd_nxt,
+            flags::SYN | flags::ACK,
+            u16::MAX,
+        );
+        syn_ack.options.mss = Some(1460);
+        syn_ack.options.sack_permitted = sack;
+        tcb.on_segment(&syn_ack, Bytes::new(), now);
+        tcb.poll_output(now);
+        assert_eq!(tcb.state, TcpState::Established);
+        tcb.set_nodelay(true);
+        tcb
+    }
+
+    #[test]
+    fn sack_is_offered_on_every_syn_and_echoed_only_when_offered() {
+        for offered in [false, true] {
+            let mut tcb = Tcb::new_from_listen(tuple(), Seq::new(1000), 1460);
+            tcb.set_peer_sack(offered);
+            let syn_ack = tcb.poll_output(Instant::now());
+            assert_eq!(tcb.to_header(&syn_ack[0]).options.sack_permitted, offered);
+        }
+        // A peer that did not answer the offer gets no SACK blocks.
+        let now = Instant::now();
+        let mut tcb = establish_with_sack(now, false);
+        let ahead = header(tcb.rcv_nxt + 1000, tcb.snd_nxt, flags::ACK, u16::MAX);
+        tcb.on_segment(&ahead, Bytes::from(vec![1; 500]), now);
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 1);
+        assert!(tcb.to_header(&out[0]).options.sack.is_empty());
+    }
+
+    #[test]
+    fn out_of_order_data_is_reported_in_sack_blocks_until_the_gap_fills() {
+        let now = Instant::now();
+        let mut tcb = establish_with_sack(now, true);
+        let start = tcb.rcv_nxt;
+        let segment = |tcb: &Tcb, offset: u32| header(start + offset, tcb.snd_nxt, flags::ACK, u16::MAX);
+
+        let hdr = segment(&tcb, 1000);
+        tcb.on_segment(&hdr, Bytes::from(vec![1; 500]), now);
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].ack, start);
+        assert_eq!(
+            tcb.to_header(&out[0]).options.sack.as_slice(),
+            [((start + 1000).0, (start + 1500).0)]
+        );
+
+        // A second island: it arrived last, so it is reported first.
+        let hdr = segment(&tcb, 3000);
+        tcb.on_segment(&hdr, Bytes::from(vec![1; 500]), now);
+        let out = tcb.poll_output(now);
+        assert_eq!(
+            tcb.to_header(&out[0]).options.sack.as_slice(),
+            [
+                ((start + 3000).0, (start + 3500).0),
+                ((start + 1000).0, (start + 1500).0)
+            ]
+        );
+
+        // The blocks go out even when data carries the acknowledgment:
+        // a data segment has no room for them, so a bare ACK follows it.
+        let hdr = segment(&tcb, 5000);
+        tcb.on_segment(&hdr, Bytes::from(vec![1; 500]), now);
+        tcb.send(Bytes::from_static(b"reply"));
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 2);
+        assert!(tcb.to_header(&out[0]).options.sack.is_empty());
+        assert_eq!(tcb.to_header(&out[1]).options.sack.as_slice().len(), 3);
+        assert!(!tcb.has_pending_output());
+
+        // Filling the first gap acknowledges through the first island
+        // and stops reporting it.
+        let hdr = segment(&tcb, 0);
+        tcb.on_segment(&hdr, Bytes::from(vec![1; 1000]), now);
+        let out = tcb.poll_output(now);
+        assert_eq!(out[0].ack, start + 1500);
+        assert_eq!(tcb.to_header(&out[0]).options.sack.as_slice().len(), 2);
+    }
+
+    #[test]
+    fn sack_recovery_resends_every_hole_in_one_round_trip() {
+        let now = Instant::now();
+        let mut tcb = establish_with_sack(now, true);
+        let base = tcb.snd_nxt;
+        tcb.send(Bytes::from(vec![9; 10 * 1460]));
+        assert_eq!(tcb.poll_output(now).len(), 10);
+
+        // The peer holds everything except the first and third segments.
+        let mut ack = header(tcb.rcv_nxt, base, flags::ACK, u16::MAX);
+        ack.options.sack.push((base + 1460).0, (base + 2 * 1460).0);
+        ack.options.sack.push((base + 3 * 1460).0, (base + 10 * 1460).0);
+        tcb.on_segment(&ack, Bytes::new(), now);
+        assert!(tcb.congestion.in_fast_recovery());
+        assert!(tcb.has_pending_output());
+        let out = tcb.poll_output(now);
+        let resent: Vec<_> = out.iter().map(|seg| (seg.seq, seg.payload.len())).collect();
+        assert_eq!(resent, [(base, 1460), (base + 2 * 1460, 1460)]);
+        // Nothing more until the peer answers.
+        assert!(!tcb.has_pending_output());
+        assert!(tcb.poll_output(now).is_empty());
+
+        // New data flows during recovery once SACKed data has left the
+        // window: 2 MSS are in flight against a window of 5.
+        tcb.send(Bytes::from(vec![9; 1460]));
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, base + 10 * 1460);
+
+        let done = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
+        tcb.on_segment(&done, Bytes::new(), now);
+        assert!(!tcb.congestion.in_fast_recovery());
+        assert!(!tcb.retransmit.scoreboard());
+        assert_eq!(tcb.buffered_send_bytes(), 0);
+        assert!(tcb.poll_output(now).is_empty());
+    }
+
+    #[test]
+    fn sack_blocks_split_a_large_segment_and_only_the_missing_part_is_resent() {
+        let now = Instant::now();
+        let mut tcb = establish_with_sack(now, true);
+        tcb.set_tx_payload_limit(32 * 1024);
+        let base = tcb.snd_nxt;
+        tcb.send(Bytes::from(vec![9; 8 * 1460]));
+        // One TSO-sized segment.
+        assert_eq!(tcb.poll_output(now).len(), 1);
+
+        // On the wire it was eight packets; the second was lost.
+        let mut ack = header(tcb.rcv_nxt, base + 1460, flags::ACK, u16::MAX);
+        ack.options.sack.push((base + 2 * 1460).0, (base + 8 * 1460).0);
+        tcb.on_segment(&ack, Bytes::new(), now);
+        let out = tcb.poll_output(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].seq, out[0].payload.len()), (base + 1460, 1460));
+        assert_eq!(tcb.buffered_send_bytes(), 7 * 1460);
+
+        let done = header(tcb.rcv_nxt, base + 8 * 1460, flags::ACK, u16::MAX);
+        tcb.on_segment(&done, Bytes::new(), now);
+        assert_eq!(tcb.buffered_send_bytes(), 0);
+    }
+
+    #[test]
+    fn after_a_timeout_the_rest_is_resent_as_acks_arrive_not_per_timeout() {
+        for sack in [false, true] {
+            let now = Instant::now();
+            let mut tcb = establish_with_sack(now, sack);
+            let base = tcb.snd_nxt;
+            tcb.send(Bytes::from(vec![9; 10 * 1460]));
+            assert_eq!(tcb.poll_output(now).len(), 10);
+
+            // Nothing is acknowledged: the timer fires and the oldest
+            // segment goes out alone (the window is one MSS).
+            let late = now + Duration::from_secs(2);
+            tcb.tick(late);
+            let out = tcb.poll_output(late);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].seq, base);
+            assert!(tcb.poll_output(late).is_empty());
+
+            // Its ACK doubles the window, and the next two follow at
+            // once: no second timeout, no duplicate ACKs needed.
+            let ack = header(tcb.rcv_nxt, base + 1460, flags::ACK, u16::MAX);
+            tcb.on_segment(&ack, Bytes::new(), late);
+            tcb.tick(late);
+            let out = tcb.poll_output(late);
+            let resent: Vec<_> = out.iter().map(|seg| seg.seq).collect();
+            assert_eq!(resent, [base + 1460, base + 2 * 1460], "sack={sack}");
+
+            // The peer had the rest all along: one cumulative ACK ends it.
+            let done = header(tcb.rcv_nxt, base + 10 * 1460, flags::ACK, u16::MAX);
+            tcb.on_segment(&done, Bytes::new(), late);
+            assert_eq!(tcb.buffered_send_bytes(), 0);
+            assert!(tcb.poll_output(late).is_empty());
+        }
     }
 
     #[test]

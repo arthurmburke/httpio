@@ -1,7 +1,7 @@
 //! TCP segment header parsing/serialization (RFC 9293 §3.1), including
-//! MSS and window scale options. SACK / timestamps are intentionally out of
-//! scope -- see the top-level README for what this stack does and doesn't
-//! implement.
+//! the MSS, window scale and selective acknowledgment (RFC 2018) options.
+//! Timestamps are intentionally out of scope: they would add 12 bytes to
+//! every segment.
 
 use std::net::Ipv4Addr;
 
@@ -23,11 +23,56 @@ pub mod flags {
 pub const OPT_KIND_END: u8 = 0;
 pub const OPT_KIND_NOP: u8 = 1;
 pub const OPT_KIND_MSS: u8 = 2;
+pub const OPT_KIND_SACK_PERMITTED: u8 = 4;
+pub const OPT_KIND_SACK: u8 = 5;
+
+/// Most SACK blocks one segment can carry: 4 fit the 40 bytes of option
+/// space when no other option is present (RFC 2018 §3).
+pub const MAX_SACK_BLOCKS: usize = 4;
+
+/// The `[left, right)` sequence ranges of a SACK option, in wire order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SackBlocks {
+    blocks: [(u32, u32); MAX_SACK_BLOCKS],
+    count: u8,
+}
+
+impl SackBlocks {
+    /// Appends a block; ignored once the option is full.
+    pub fn push(&mut self, left: u32, right: u32) {
+        if let Some(slot) = self.blocks.get_mut(usize::from(self.count)) {
+            *slot = (left, right);
+            self.count += 1;
+        }
+    }
+
+    pub fn as_slice(&self) -> &[(u32, u32)] {
+        &self.blocks[..usize::from(self.count)]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Bytes this option occupies on the wire, padded to a multiple of 4.
+    fn wire_len(&self) -> usize {
+        if self.is_empty() {
+            0
+        } else {
+            4 + 8 * usize::from(self.count)
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TcpOptions {
     pub mss: Option<u16>,
     pub window_scale: Option<u8>,
+    /// SACK-permitted (SYN segments only).
+    pub sack_permitted: bool,
+    /// Selective acknowledgments. This stack sends them only on segments
+    /// without payload, so data segments never lose room to them.
+    pub sack: SackBlocks,
 }
 
 impl TcpOptions {
@@ -44,6 +89,25 @@ impl TcpOptions {
                 3 if buf.len() >= 3 && buf[1] == 3 => {
                     opts.window_scale = Some(buf[2].min(14));
                     buf = &buf[3..];
+                }
+                OPT_KIND_SACK_PERMITTED if buf.len() >= 2 && buf[1] == 2 => {
+                    opts.sack_permitted = true;
+                    buf = &buf[2..];
+                }
+                OPT_KIND_SACK
+                    if buf.len() >= 2
+                        && buf[1] >= 10
+                        && (buf[1] - 2).is_multiple_of(8)
+                        && usize::from(buf[1]) <= buf.len() =>
+                {
+                    let len = usize::from(buf[1]);
+                    for block in buf[2..len].chunks_exact(8) {
+                        opts.sack.push(
+                            u32::from_be_bytes(block[..4].try_into().unwrap()),
+                            u32::from_be_bytes(block[4..].try_into().unwrap()),
+                        );
+                    }
+                    buf = &buf[len..];
                 }
                 _kind => {
                     // Unknown/other option: length-prefixed per RFC 9293
@@ -144,6 +208,8 @@ impl TcpHeader {
             } else {
                 0
             }
+            + if self.options.sack_permitted { 4 } else { 0 }
+            + self.options.sack.wire_len()
     }
 
     /// Writes the header (and options) into `out` and fills in the
@@ -181,6 +247,29 @@ impl TcpHeader {
         if let Some(scale) = self.options.window_scale {
             let start = TCP_HDR_LEN + if self.options.mss.is_some() { 4 } else { 0 };
             out[start..start + 4].copy_from_slice(&[1, 3, 3, scale.min(14)]);
+        }
+        // Whatever precedes these is a multiple of 4 bytes; two NOPs keep
+        // each of them one too.
+        let mut at = TCP_HDR_LEN
+            + if self.options.mss.is_some() { 4 } else { 0 }
+            + if self.options.window_scale.is_some() {
+                4
+            } else {
+                0
+            };
+        if self.options.sack_permitted {
+            out[at..at + 4].copy_from_slice(&[1, 1, OPT_KIND_SACK_PERMITTED, 2]);
+            at += 4;
+        }
+        let sack = self.options.sack.as_slice();
+        if !sack.is_empty() {
+            out[at..at + 4].copy_from_slice(&[1, 1, OPT_KIND_SACK, 2 + 8 * sack.len() as u8]);
+            at += 4;
+            for &(left, right) in sack {
+                out[at..at + 4].copy_from_slice(&left.to_be_bytes());
+                out[at + 4..at + 8].copy_from_slice(&right.to_be_bytes());
+                at += 8;
+            }
         }
         let pseudo = checksum::ipv4_pseudo_header_sum(
             src_ip,
@@ -257,6 +346,50 @@ mod tests {
                 assert_eq!(decoded.options.mss, mss);
             }
         }
+    }
+
+    #[test]
+    fn sack_options_round_trip_alongside_the_others() {
+        for mss in [None, Some(1460)] {
+            for scale in [None, Some(4)] {
+                // SYN: SACK-permitted.
+                let mut h = header(mss);
+                h.options.window_scale = scale;
+                h.options.sack_permitted = true;
+                let wire = build(&h, &[], false);
+                let (decoded, len) = TcpHeader::parse(&wire, SRC, DST, true).unwrap();
+                assert_eq!(len, h.wire_len());
+                assert_eq!(decoded.options, h.options);
+            }
+        }
+        // Pure ACK: one to four blocks, including across sequence wrap.
+        for count in 1..=MAX_SACK_BLOCKS as u32 {
+            let mut h = header(None);
+            for i in 0..count {
+                h.options
+                    .sack
+                    .push((u32::MAX - 500).wrapping_add(i * 1000), u32::MAX.wrapping_add(i * 1000));
+            }
+            assert_eq!(h.wire_len(), 20 + 4 + 8 * count as usize);
+            let wire = build(&h, &[], false);
+            let (decoded, len) = TcpHeader::parse(&wire, SRC, DST, true).unwrap();
+            assert_eq!(len, h.wire_len());
+            assert_eq!(decoded.options.sack, h.options.sack);
+            assert_eq!(decoded.options.sack.as_slice().len(), count as usize);
+        }
+        // A fifth block does not fit and is dropped rather than overflowing.
+        let mut blocks = SackBlocks::default();
+        for i in 0..5 {
+            blocks.push(i, i + 1);
+        }
+        assert_eq!(blocks.as_slice().len(), MAX_SACK_BLOCKS);
+        // A malformed SACK length is skipped, not misread.
+        let mut h = header(None);
+        h.options.sack.push(1, 2);
+        let mut wire = build(&h, &[], false);
+        wire[23] = 9;
+        let (decoded, _) = TcpHeader::parse(&wire, SRC, DST, false).unwrap();
+        assert!(decoded.options.sack.is_empty());
     }
 
     #[test]

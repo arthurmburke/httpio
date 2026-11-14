@@ -22,6 +22,10 @@ pub struct CongestionControl {
     /// Bytes acknowledged in congestion avoidance that have not yet been
     /// converted into window growth (RFC 3465 §2.1).
     avoidance_acked: u32,
+    /// The connection negotiated SACK. Recovery is then paced by what the
+    /// scoreboard says is in flight (RFC 6675), so the window is neither
+    /// inflated per duplicate ACK nor deflated per partial ACK.
+    sack: bool,
 }
 
 impl CongestionControl {
@@ -51,7 +55,30 @@ impl CongestionControl {
             phase: Phase::SlowStart,
             dup_ack_count: 0,
             avoidance_acked: 0,
+            sack: false,
         }
+    }
+
+    pub fn set_sack(&mut self, sack: bool) {
+        self.sack = sack;
+    }
+
+    /// Enters fast recovery on loss the SACK scoreboard detected, without
+    /// waiting for a third duplicate ACK. Returns `false` if already
+    /// recovering.
+    pub fn enter_recovery(&mut self, recovery_point: u32) -> bool {
+        if matches!(self.phase, Phase::FastRecovery { .. }) {
+            return false;
+        }
+        self.dup_ack_count = 0;
+        self.ssthresh = (self.cwnd / 2).max(self.mss.saturating_mul(2));
+        self.cwnd = if self.sack {
+            self.ssthresh
+        } else {
+            self.ssthresh.saturating_add(self.mss.saturating_mul(3))
+        };
+        self.phase = Phase::FastRecovery { recovery_point };
+        true
     }
 
     pub fn cwnd(&self) -> u32 {
@@ -99,8 +126,10 @@ impl CongestionControl {
                     // Partial ack: a further segment was lost. Deflate
                     // cwnd by the amount acked (NewReno-lite) and stay in
                     // recovery so the next lost segment gets retransmitted
-                    // too.
-                    self.cwnd = self.cwnd.saturating_sub(newly_acked).max(self.mss);
+                    // too. With SACK the window was never inflated.
+                    if !self.sack {
+                        self.cwnd = self.cwnd.saturating_sub(newly_acked).max(self.mss);
+                    }
                 }
             }
         }
@@ -113,19 +142,15 @@ impl CongestionControl {
         if matches!(self.phase, Phase::FastRecovery { .. }) {
             // Already in recovery: RFC 5681's "artificial inflation" --
             // each further dup ack means another segment left the
-            // network, so cwnd can grow by one MSS.
-            self.cwnd = self.cwnd.saturating_add(self.mss);
+            // network, so cwnd can grow by one MSS. With SACK the
+            // scoreboard already shows it gone.
+            if !self.sack {
+                self.cwnd = self.cwnd.saturating_add(self.mss);
+            }
             return false;
         }
         self.dup_ack_count += 1;
-        if self.dup_ack_count == 3 {
-            self.ssthresh = (self.cwnd / 2).max(self.mss.saturating_mul(2));
-            self.cwnd = self.ssthresh.saturating_add(self.mss.saturating_mul(3));
-            self.phase = Phase::FastRecovery { recovery_point };
-            true
-        } else {
-            false
-        }
+        self.dup_ack_count == 3 && self.enter_recovery(recovery_point)
     }
 
     /// Call when the retransmission timer fires (RFC 5681 §3.1 / RFC

@@ -275,7 +275,19 @@ fn dpdk(args: &[String]) {
         let mut b_to_a: std::collections::VecDeque<Mbuf> = Default::default();
         let mut scratch: Vec<u8> = Vec::with_capacity(64 * 1024);
         let mut burst: Vec<Mbuf> = Vec::with_capacity(64);
-        let mut forward = |from: &EthPort, to: &EthPort, wire: &mut std::collections::VecDeque<Mbuf>| {
+        // BENCH_LIBRARY_DELIVER=1 hands an engine one packet per poll, which
+        // is what a poll loop faster than the packet rate sees.
+        let deliver: usize = std::env::var("BENCH_LIBRARY_DELIVER").map_or(64, |v| v.parse().unwrap());
+        assert!((1..=64).contains(&deliver));
+        // BENCH_LIBRARY_LOSS=N drops every Nth data packet from the sender
+        // to the receiver (retransmissions included), after segmentation.
+        let loss: usize = std::env::var("BENCH_LIBRARY_LOSS").map_or(0, |v| v.parse().unwrap());
+        let mut data_packets = 0usize;
+        let mut forward = |from: &EthPort,
+                           to: &EthPort,
+                           wire: &mut std::collections::VecDeque<Mbuf>,
+                           lossy: bool| {
+            let first_new = wire.len();
             loop {
                 let before = wire.len();
                 if emulate {
@@ -289,7 +301,18 @@ fn dpdk(args: &[String]) {
                     break;
                 }
             }
-            burst.extend(wire.drain(..wire.len().min(64)));
+            if lossy && loss != 0 {
+                let mut index = 0;
+                wire.retain(|packet| {
+                    index += 1;
+                    if index <= first_new || packet.pkt_len() <= 100 {
+                        return true;
+                    }
+                    data_packets += 1;
+                    data_packets % loss != 0
+                });
+            }
+            burst.extend(wire.drain(..wire.len().min(deliver)));
             to.tx_burst_in_place(&mut burst);
             assert!(burst.is_empty(), "harness ring overflow");
         };
@@ -325,9 +348,9 @@ fn dpdk(args: &[String]) {
             let start = Instant::now();
             while accepted.is_none() || a.state(a_tuple) != Some(TcpState::Established) {
                 a.poll_into(&a_port, &pool, Instant::now(), &mut a_events);
-                forward(&a_port, &b_port, &mut a_to_b);
+                forward(&a_port, &b_port, &mut a_to_b, true);
                 b.poll_into(&b_port, &pool, Instant::now(), &mut b_events);
-                forward(&b_port, &a_port, &mut b_to_a);
+                forward(&b_port, &a_port, &mut b_to_a, false);
                 if accepted.is_none() {
                     accepted = b.accept(80);
                 }
@@ -365,13 +388,13 @@ fn dpdk(args: &[String]) {
                             a.poll_into(&a_port, &pool, Instant::now(), &mut a_events)
                         });
                         timed(breakdown, &mut parts.forward_ns, || {
-                            forward(&a_port, &b_port, &mut a_to_b)
+                            forward(&a_port, &b_port, &mut a_to_b, true)
                         });
                         timed(breakdown, &mut parts.rx_ns, || {
                             b.poll_into(&b_port, &pool, Instant::now(), &mut b_events)
                         });
                         timed(breakdown, &mut parts.forward_ns, || {
-                            forward(&b_port, &a_port, &mut b_to_a)
+                            forward(&b_port, &a_port, &mut b_to_a, false)
                         });
                         timed(breakdown, &mut parts.app_ns, || {
                             loop {

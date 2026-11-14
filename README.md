@@ -67,8 +67,14 @@ IPv4 + TCP, no kernel network stack involved.
   builds one from strings; `http_get`/`ws_client` take `LOCAL_IP/PREFIX`
   and `--gateway IP`.
 
-Not implemented (explicitly out of scope): SACK, timestamps,
-delayed ACK, IPv6, IP fragmentation/options, multi-segment (chained) mbufs,
+- **Loss recovery**: selective acknowledgments (RFC 2018) with
+  scoreboard-driven recovery (RFC 6675), so every hole the peer reports
+  is resent within one round trip; NewReno against peers without SACK.
+  After a timeout the outstanding data is resent as ACKs reopen the
+  window. Delayed ACKs (every second segment, or 1 ms).
+
+Not implemented (explicitly out of scope): timestamps, tail-loss
+probes, IPv6, IP fragmentation/options, multi-segment (chained) mbufs,
 a route table beyond the single default gateway.
 
 ## Building: use the devcontainer

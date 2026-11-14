@@ -979,6 +979,7 @@ impl TcpEngine {
             let peer_mss = tcp_hdr.options.mss.unwrap_or(536);
             let mut tcb = Tcb::new_from_listen(tuple, Seq::new(tcp_hdr.seq), peer_mss);
             tcb.set_peer_scale(tcp_hdr.options.window_scale);
+            tcb.set_peer_sack(tcp_hdr.options.sack_permitted);
             // Has a SYN-ACK to send.
             let mut conn = Conn::new(tcb, AcceptState::AwaitingHandshake);
             Self::mark_active(&mut self.active, &mut conn, tuple);

@@ -201,12 +201,19 @@ fn engine_transmits_window_updates_and_final_reset() {
         output(&port);
         peer.seq += 1;
         peer.flags = tcp::flags::ACK;
-        for _ in 0..64 {
+        for segment in 0..64 {
             inject_tcp(&port, &pool, &peer, &[42; 1024]);
             engine.poll(&port, &pool, now);
-            let ack = output(&port).remove(0);
+            let acks = output(&port);
             peer.seq += 1024;
-            assert_eq!(ack.ack, peer.seq);
+            // One packet per poll: every second in-order segment is
+            // acknowledged, the one in between is not.
+            if segment % 2 == 0 {
+                assert!(acks.is_empty(), "lone segment acknowledged at once");
+            } else {
+                assert_eq!(acks.len(), 1);
+                assert_eq!(acks[0].ack, peer.seq);
+            }
         }
         // Pure ACKs and rejected payloads must not allocate Bytes owners.
         let mut events = Vec::new();
