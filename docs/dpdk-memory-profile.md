@@ -124,7 +124,19 @@ taskset -c 0 cargo test --release --lib benchmark_stream_reads -- \
 
 The test stages real mbufs in the same inbound ring that `TcpStream` uses
 and reads the same payload into a preallocated application buffer with
-`poll_read` or with `poll_recv` followed by a copy. Timing covers the
+`poll_read`, with `poll_recv` followed by a copy, or with `poll_recv_chunk`
+followed by a copy. `poll_recv` must box one `Bytes` owner per mbuf (asserted
+as one allocation per segment); `poll_read` and `poll_recv_chunk` are
+asserted allocation-free.
+
+The WebSocket reader over plain TCP has a matching check on real mbufs: text
+frames allocate only their `String`, and binary frames one `Bytes` owner per
+packet, shared by every frame in it:
+
+```sh
+cargo test --release --lib frames_in_a_packet_buffer -- \
+  --ignored --nocapture --test-threads=1
+``` Timing covers the
 application read and mbuf release. Ring production, packet processing,
 worker scheduling and wakeups are outside the timed window. Allocation
 counting uses a separate sample so it does not perturb the timed runs.

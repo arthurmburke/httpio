@@ -51,7 +51,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::client::Client;
-use crate::dpdk::tcp::stream::TcpStream;
+use crate::dpdk::tcp::stream::{RecvChunk, TcpStream};
 use crate::http::errors::{
     HttpError::{self, InvalidHeaderValue},
     WebSocketError,
@@ -362,32 +362,46 @@ impl WebSocketClient {
     /// Applies one parsed frame; returns a `Message` when one is complete.
     /// Automatic replies are queued, not written; the caller drives them.
     fn handle_frame(&mut self, frame: RawFrame) -> Result<Option<Message>, WebSocketError> {
+        // A payload still in the received packet buffer is read in place;
+        // only frames handed to the caller as `Bytes` (Binary, Ping, Pong)
+        // convert it, everything else is copied or parsed from the slice.
         match frame.opcode {
             OP_TEXT | OP_BINARY => {
                 if self.fragment.is_some() {
                     return Err(WebSocketError::UnexpectedDataFrame);
                 }
+                let opcode = frame.opcode;
                 if frame.fin {
-                    return Ok(Some(into_data_message(frame.opcode, frame.payload)?));
+                    let payload =
+                        if opcode == OP_TEXT && matches!(frame.payload, Payload::InChunk(_)) {
+                            // Becomes the `String`'s buffer without a further copy.
+                            Bytes::from(self.io.payload(&frame).to_vec())
+                        } else {
+                            self.io.payload_bytes(frame)
+                        };
+                    return Ok(Some(into_data_message(opcode, payload)?));
                 }
                 // A payload this side assembled (it straddled chunks) is
                 // uniquely owned and grows in place; one that is a view of
                 // received data is copied into an owned buffer.
-                let buffered = frame
-                    .payload
-                    .try_into_mut()
-                    .unwrap_or_else(|shared| BytesMut::from(&shared[..]));
-                self.fragment = Some((frame.opcode, buffered));
+                let buffered = match frame.payload {
+                    Payload::Owned(bytes) => bytes
+                        .try_into_mut()
+                        .unwrap_or_else(|shared| BytesMut::from(&shared[..])),
+                    Payload::InChunk(_) => BytesMut::from(self.io.payload(&frame)),
+                };
+                self.fragment = Some((opcode, buffered));
                 Ok(None)
             }
             OP_CONTINUATION => {
+                let payload = self.io.payload(&frame);
                 let Some((_, buffered)) = self.fragment.as_mut() else {
                     return Err(WebSocketError::UnexpectedContinuation);
                 };
-                if buffered.len() + frame.payload.len() > MAX_MESSAGE {
+                if buffered.len() + payload.len() > MAX_MESSAGE {
                     return Err(WebSocketError::MessageTooLarge);
                 }
-                buffered.put_slice(&frame.payload);
+                buffered.put_slice(payload);
                 if !frame.fin {
                     return Ok(None);
                 }
@@ -396,30 +410,30 @@ impl WebSocketClient {
             }
             OP_PING => {
                 validate_control(&frame)?;
+                let payload = self.io.payload_bytes(frame);
                 // Auto-pong with the same payload (RFC 6455 §5.5.3),
                 // unless we've already sent our Close.
                 if self.close == CloseState::Open {
-                    self.queue_frame(OP_PONG, &frame.payload)?;
+                    self.queue_frame(OP_PONG, &payload)?;
                 }
-                Ok(Some(Message::Ping(frame.payload)))
+                Ok(Some(Message::Ping(payload)))
             }
             OP_PONG => {
                 validate_control(&frame)?;
-                Ok(Some(Message::Pong(frame.payload)))
+                Ok(Some(Message::Pong(self.io.payload_bytes(frame))))
             }
             OP_CLOSE => {
                 validate_control(&frame)?;
-                let close_frame = parse_close_payload(&frame.payload)?;
+                let payload = self.io.payload(&frame);
+                let close_frame = parse_close_payload(payload)?;
+                // Echo the close (same code) if the peer initiated.
+                let mut echo = [0; 2];
+                let echo_len = if payload.len() >= 2 { 2 } else { 0 };
+                echo[..echo_len].copy_from_slice(&payload[..echo_len]);
                 let peer_initiated = self.close == CloseState::Open;
                 self.close = CloseState::Closed;
-                // Echo the close (same code) if the peer initiated.
                 if peer_initiated {
-                    let echo: Bytes = if frame.payload.len() >= 2 {
-                        frame.payload.slice(..2)
-                    } else {
-                        Bytes::new()
-                    };
-                    self.queue_frame(OP_CLOSE, &echo)?;
+                    self.queue_frame(OP_CLOSE, &echo[..echo_len])?;
                 }
                 Ok(Some(Message::Close(close_frame)))
             }
@@ -504,11 +518,11 @@ impl Sink<Message> for WebSocketClient {
             Message::Text(text) => this.queue_frame(OP_TEXT, text.as_bytes()),
             Message::Binary(data) => this.queue_frame(OP_BINARY, &data),
             Message::Ping(data) => {
-                check_control_len(&data)?;
+                check_control_len(data.len())?;
                 this.queue_frame(OP_PING, &data)
             }
             Message::Pong(data) => {
-                check_control_len(&data)?;
+                check_control_len(data.len())?;
                 this.queue_frame(OP_PONG, &data)
             }
             Message::Close(frame) => {
@@ -517,7 +531,7 @@ impl Sink<Message> for WebSocketClient {
                     payload.put_u16(frame.code);
                     payload.put_slice(frame.reason.as_bytes());
                 }
-                check_control_len(&payload)?;
+                check_control_len(payload.len())?;
                 // No further messages may be enqueued, even if encoding
                 // fails below.
                 this.close = CloseState::CloseSent;
@@ -599,6 +613,30 @@ impl Transport {
         }
     }
 
+    /// The payload of `frame`, the frame [`poll_frame`](Self::poll_frame)
+    /// last returned.
+    fn payload<'a>(&'a self, frame: &'a RawFrame) -> &'a [u8] {
+        match (self, &frame.payload) {
+            (_, Payload::Owned(bytes)) => bytes,
+            (Transport::Tcp(tcp), payload) => tcp.reader.payload(payload),
+            (Transport::Upgraded(_), Payload::InChunk(_)) => {
+                unreachable!("the copying transport only parses owned payloads")
+            }
+        }
+    }
+
+    /// The payload of `frame` (the frame `poll_frame` last returned) as
+    /// shared `Bytes`, for handing to the caller.
+    fn payload_bytes(&mut self, frame: RawFrame) -> Bytes {
+        match (self, frame.payload) {
+            (_, Payload::Owned(bytes)) => bytes,
+            (Transport::Tcp(tcp), payload) => tcp.reader.payload_bytes(payload),
+            (Transport::Upgraded(_), Payload::InChunk(_)) => {
+                unreachable!("the copying transport only parses owned payloads")
+            }
+        }
+    }
+
     /// Appends one encoded frame to `queue`.
     fn encode(&mut self, head: &OutboundHeader, payload: &[u8], queue: &mut VecDeque<Bytes>) {
         match self {
@@ -641,7 +679,7 @@ impl TcpTransport {
             if let Some(frame) = self.reader.next_frame()? {
                 return Poll::Ready(Ok(Some(frame)));
             }
-            match ready!(self.stream.poll_recv(cx)) {
+            match ready!(self.stream.poll_recv_chunk(cx)) {
                 Ok(Some(chunk)) => self.reader.push(chunk),
                 Ok(None) => return Poll::Ready(Ok(None)),
                 Err(e) => return Poll::Ready(Err(WebSocketError::Io(e.kind()))),
@@ -776,9 +814,12 @@ impl UpgradedTransport {
 /// chunks arrive, so a large payload never pins more than one received
 /// packet buffer at a time.
 struct ChunkReader {
-    /// The unparsed rest of the latest chunk. Empty whenever
-    /// [`next_frame`](Self::next_frame) returns `None`.
-    chunk: Bytes,
+    /// The unparsed rest of the latest chunk, still in its packet buffer.
+    /// Empty whenever [`next_frame`](Self::next_frame) returns `None`.
+    chunk: RecvChunk,
+    /// Length of the [`Payload::InChunk`] frame last returned, which still
+    /// sits at the front of `chunk`; dropped on the next `next_frame`.
+    lent: usize,
     state: RecvState,
 }
 
@@ -813,25 +854,59 @@ impl ChunkReader {
     /// 101 response head.
     fn new(leftover: Bytes) -> Self {
         ChunkReader {
-            chunk: leftover,
+            chunk: leftover.into(),
+            lent: 0,
             state: RecvState::START,
         }
     }
 
     /// Supplies the next received chunk, once `next_frame` has asked for
     /// more input.
-    fn push(&mut self, chunk: Bytes) {
+    fn push(&mut self, chunk: RecvChunk) {
         debug_assert!(
-            self.chunk.is_empty(),
+            self.chunk.is_empty() && self.lent == 0,
             "chunk pushed before the last was used"
         );
         self.chunk = chunk;
     }
 
+    /// The bytes of `payload`, from the frame [`next_frame`] last returned.
+    fn payload<'a>(&'a self, payload: &'a Payload) -> &'a [u8] {
+        match payload {
+            Payload::Owned(bytes) => bytes,
+            Payload::InChunk(n) => {
+                debug_assert_eq!(*n, self.lent);
+                &self.chunk[..*n]
+            }
+        }
+    }
+
+    /// `payload` (from the frame [`next_frame`] last returned) as shared
+    /// [`Bytes`]. An in-chunk payload turns the packet buffer into `Bytes`
+    /// -- one allocation, shared by every later frame sliced from the same
+    /// chunk.
+    fn payload_bytes(&mut self, payload: Payload) -> Bytes {
+        match payload {
+            Payload::Owned(bytes) => bytes,
+            Payload::InChunk(n) => {
+                debug_assert_eq!(n, self.lent);
+                let mut shared = std::mem::take(&mut self.chunk).into_bytes();
+                let payload = shared.split_to(n);
+                self.chunk = shared.into();
+                self.lent = 0;
+                payload
+            }
+        }
+    }
+
     /// The next complete frame, or `None` once the current chunk is used up
     /// and more input is needed. Enforces the same rules as
-    /// [`try_parse_frame`].
+    /// [`try_parse_frame`]. A payload that lies within the current chunk
+    /// is left there as [`Payload::InChunk`], to be read through
+    /// [`payload`](Self::payload) or [`payload_bytes`](Self::payload_bytes)
+    /// before the next call.
     fn next_frame(&mut self) -> Result<Option<RawFrame>, WebSocketError> {
+        self.chunk.advance(std::mem::take(&mut self.lent));
         let header = match &mut self.state {
             RecvState::Payload {
                 payload, remaining, ..
@@ -855,7 +930,7 @@ impl ChunkReader {
                 return Ok(Some(RawFrame {
                     fin,
                     opcode,
-                    payload: payload.freeze(),
+                    payload: Payload::Owned(payload.freeze()),
                 }));
             }
             RecvState::Header { head, filled } if *filled == 0 => {
@@ -871,7 +946,7 @@ impl ChunkReader {
                         let n = self.chunk.len();
                         head[..n].copy_from_slice(&self.chunk);
                         *filled = n;
-                        self.chunk = Bytes::new();
+                        self.chunk = RecvChunk::default();
                         return Ok(None);
                     }
                 }
@@ -894,16 +969,17 @@ impl ChunkReader {
         self.state = RecvState::START;
 
         if self.chunk.len() >= header.payload_len {
+            self.lent = header.payload_len;
             return Ok(Some(RawFrame {
                 fin: header.fin,
                 opcode: header.opcode,
-                payload: self.chunk.split_to(header.payload_len),
+                payload: Payload::InChunk(header.payload_len),
             }));
         }
         let mut payload = BytesMut::with_capacity(header.payload_len);
         payload.extend_from_slice(&self.chunk);
         let remaining = header.payload_len - self.chunk.len();
-        self.chunk = Bytes::new();
+        self.chunk = RecvChunk::default();
         self.state = RecvState::Payload {
             fin: header.fin,
             opcode: header.opcode,
@@ -917,7 +993,27 @@ impl ChunkReader {
 struct RawFrame {
     fin: bool,
     opcode: u8,
-    payload: Bytes,
+    payload: Payload,
+}
+
+/// Where a [`RawFrame`]'s payload is.
+enum Payload {
+    /// Already its own `Bytes` (assembled across chunks, or parsed from
+    /// the copying transport's buffer).
+    Owned(Bytes),
+    /// The first `n` bytes of the [`ChunkReader`]'s current chunk, still
+    /// in the received packet buffer. Converting it to `Bytes` costs an
+    /// allocation, so frames whose payload is only read or copied never do.
+    InChunk(usize),
+}
+
+impl Payload {
+    fn len(&self) -> usize {
+        match self {
+            Payload::Owned(bytes) => bytes.len(),
+            Payload::InChunk(n) => *n,
+        }
+    }
 }
 
 /// A parsed inbound frame header.
@@ -1001,7 +1097,7 @@ fn try_parse_frame(buf: &mut BytesMut) -> Result<Option<RawFrame>, WebSocketErro
     Ok(Some(RawFrame {
         fin: header.fin,
         opcode: header.opcode,
-        payload,
+        payload: Payload::Owned(payload),
     }))
 }
 
@@ -1144,11 +1240,11 @@ fn validate_control(frame: &RawFrame) -> Result<(), WebSocketError> {
     if !frame.fin {
         return Err(WebSocketError::FragmentedControlFrame);
     }
-    check_control_len(&frame.payload)
+    check_control_len(frame.payload.len())
 }
 
-fn check_control_len(payload: &[u8]) -> Result<(), WebSocketError> {
-    if payload.len() > 125 {
+fn check_control_len(len: usize) -> Result<(), WebSocketError> {
+    if len > 125 {
         return Err(WebSocketError::ControlFrameTooLarge);
     }
     Ok(())
@@ -1265,7 +1361,7 @@ mod tests {
         let frame = try_parse_frame(&mut buf).unwrap().unwrap();
         assert!(frame.fin);
         assert_eq!(frame.opcode, OP_TEXT);
-        assert_eq!(&frame.payload[..], b"hello");
+        assert!(matches!(&frame.payload, Payload::Owned(p) if &p[..] == b"hello"));
         assert!(buf.is_empty());
     }
 
@@ -1988,5 +2084,80 @@ mod tests {
             decode_client_frames(&wire.sent()),
             vec![(OP_BINARY, b"hi".to_vec())]
         );
+    }
+
+    /// Frames parsed out of a real packet buffer allocate only for what
+    /// they hand out: a text frame for its `String`, and binary frames one
+    /// shared `Bytes` owner per packet. Initializes EAL, so it runs alone:
+    /// `cargo test --lib frames_in_a_packet_buffer -- --ignored`.
+    #[test]
+    #[ignore = "initializes EAL; run alone"]
+    fn frames_in_a_packet_buffer_allocate_only_what_they_hand_out() {
+        use crate::allocations::count_allocations;
+        use crate::dpdk::tcp::chunk::Chunk;
+        use crate::dpdk::tcp::worker::InboundMessage;
+        use crate::dpdk::{Mbuf, Mempool, eal, ffi, mempool::DEFAULT_MBUF_DATA_ROOM_SIZE};
+
+        let cpu = unsafe { libc::sched_getcpu() };
+        eal::init(&[
+            "ws-alloc-test",
+            "--no-huge",
+            "--no-pci",
+            "--no-shconf",
+            "--no-telemetry",
+            "--lcores",
+            &format!("0@{cpu}"),
+        ])
+        .unwrap();
+        {
+            let pool =
+                Mempool::create("ws-alloc-test", 255, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+            let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
+            let free = available();
+            let (mut ws, wire) = tcp_client(Bytes::new());
+            let push = |frames: &[Vec<u8>]| {
+                let data = frames.concat();
+                let mut packet = Mbuf::alloc(&pool).unwrap();
+                packet
+                    .append(data.len() as u16)
+                    .unwrap()
+                    .copy_from_slice(&data);
+                let message = InboundMessage::Data(Chunk::packet(packet, 0, data.len()));
+                assert!(wire.inbound_tx.push(message).is_ok());
+            };
+
+            push(&[
+                server_frame(0x81, b"one"),
+                server_frame(0x81, b"two"),
+                server_frame(0x81, b"three"),
+            ]);
+            let (texts, allocations) =
+                count_allocations(|| [recv_now(&mut ws), recv_now(&mut ws), recv_now(&mut ws)]);
+            assert_eq!(
+                texts,
+                [
+                    Message::Text("one".into()),
+                    Message::Text("two".into()),
+                    Message::Text("three".into()),
+                ]
+            );
+            assert_eq!(allocations, 3, "one String each, no Bytes owner");
+
+            push(&[server_frame(0x82, b"ab"), server_frame(0x82, b"cd")]);
+            let (binaries, allocations) =
+                count_allocations(|| [recv_now(&mut ws), recv_now(&mut ws)]);
+            assert_eq!(
+                binaries,
+                [
+                    Message::Binary(Bytes::from_static(b"ab")),
+                    Message::Binary(Bytes::from_static(b"cd")),
+                ]
+            );
+            assert_eq!(allocations, 1, "one Bytes owner shared by both frames");
+
+            drop((texts, binaries, ws, wire));
+            assert_eq!(available(), free, "every packet buffer returned");
+        }
+        eal::cleanup();
     }
 }

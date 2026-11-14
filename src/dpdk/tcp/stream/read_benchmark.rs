@@ -37,7 +37,8 @@ fn benchmark_stream_reads() {
         for size in [64usize, 16 * 1024, 64 * 1024, 1024 * 1024] {
             let expected: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
             let mut output = vec![0; size];
-            for (name, borrowed) in [("borrowed", true), ("owned_then_copy", false)] {
+            for name in ["borrowed", "owned_then_copy", "chunk_then_copy"] {
+                let borrowed = name == "borrowed";
                 let mut samples = Vec::with_capacity(iterations);
                 let mut allocations = 0;
                 for iteration in 0..129 + iterations {
@@ -61,11 +62,24 @@ fn benchmark_stream_reads() {
                         } else {
                             let mut offset = 0;
                             while offset < size {
-                                let Poll::Ready(Ok(Some(chunk))) = stream.poll_recv(&mut cx) else {
-                                    panic!("missing staged mbuf");
+                                let end = if name == "chunk_then_copy" {
+                                    let Poll::Ready(Ok(Some(chunk))) =
+                                        stream.poll_recv_chunk(&mut cx)
+                                    else {
+                                        panic!("missing staged mbuf");
+                                    };
+                                    let end = offset + chunk.len();
+                                    output[offset..end].copy_from_slice(&chunk);
+                                    end
+                                } else {
+                                    let Poll::Ready(Ok(Some(chunk))) = stream.poll_recv(&mut cx)
+                                    else {
+                                        panic!("missing staged mbuf");
+                                    };
+                                    let end = offset + chunk.len();
+                                    output[offset..end].copy_from_slice(&chunk);
+                                    end
                                 };
-                                let end = offset + chunk.len();
-                                output[offset..end].copy_from_slice(&chunk);
                                 offset = end;
                             }
                         }
@@ -86,7 +100,11 @@ fn benchmark_stream_reads() {
                 }
                 assert_eq!(
                     allocations,
-                    if borrowed { 0 } else { size.div_ceil(SEGMENT) }
+                    if name == "owned_then_copy" {
+                        size.div_ceil(SEGMENT)
+                    } else {
+                        0
+                    }
                 );
                 samples.sort_unstable();
                 let n = samples.len();

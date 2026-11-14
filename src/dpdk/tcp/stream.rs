@@ -285,6 +285,70 @@ impl Position {
     }
 }
 
+/// One in-order run of received bytes from [`TcpStream::recv_chunk`]: a view
+/// into the packet buffer it arrived in (or into `Bytes`, for data that was
+/// already shared). Holding it keeps that packet buffer out of the pool.
+pub struct RecvChunk(Chunk);
+
+impl RecvChunk {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Drops the first `n` bytes from the view.
+    ///
+    /// # Panics
+    /// If `n > self.len()`.
+    pub fn advance(&mut self, n: usize) {
+        assert!(n <= self.len(), "advance past the end of a RecvChunk");
+        self.0.advance(n);
+    }
+
+    /// Converts to shared [`Bytes`]. For a packet buffer this allocates the
+    /// `Bytes` owner (once; slices of the result share it).
+    pub fn into_bytes(self) -> Bytes {
+        self.0.into_bytes()
+    }
+}
+
+impl Default for RecvChunk {
+    fn default() -> Self {
+        RecvChunk(Chunk::Bytes(Bytes::new()))
+    }
+}
+
+impl From<Bytes> for RecvChunk {
+    fn from(bytes: Bytes) -> Self {
+        RecvChunk(Chunk::Bytes(bytes))
+    }
+}
+
+impl std::ops::Deref for RecvChunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for RecvChunk {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl std::fmt::Debug for RecvChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvChunk")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
 pub struct TcpStream {
     cmd_tx: CmdTx,
     inbound_rx: InboundRx,
@@ -476,6 +540,11 @@ impl TcpStream {
     /// refcounted view), avoiding the copy the [`AsyncRead`] path is forced to
     /// make into the caller's `ReadBuf`. `Ok(None)` is a clean EOF; waits
     /// until a chunk, EOF, or reset is available.
+    ///
+    /// Turning a packet buffer into `Bytes` heap-allocates its shared owner
+    /// (`Bytes` has no allocation-free way to wrap foreign memory). A caller
+    /// that only needs to look at the data, or copies it, should use
+    /// [`recv_chunk`](Self::recv_chunk) instead.
     pub async fn recv(&mut self) -> io::Result<Option<Bytes>> {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
@@ -483,6 +552,20 @@ impl TcpStream {
     /// Poll form of [`recv`](Self::recv). Buffered data is delivered before a
     /// reset is surfaced, matching [`AsyncRead`].
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+        self.poll_recv_chunk(cx)
+            .map_ok(|chunk| chunk.map(RecvChunk::into_bytes))
+    }
+
+    /// Like [`recv`](Self::recv), but hands out the packet buffer itself:
+    /// no copy and no heap allocation. Dropping the [`RecvChunk`] returns
+    /// the buffer to its pool; [`RecvChunk::into_bytes`] converts it when
+    /// shared ownership is needed.
+    pub async fn recv_chunk(&mut self) -> io::Result<Option<RecvChunk>> {
+        poll_fn(|cx| self.poll_recv_chunk(cx)).await
+    }
+
+    /// Poll form of [`recv_chunk`](Self::recv_chunk).
+    pub fn poll_recv_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<RecvChunk>>> {
         if let Poll::Ready(done) = self.try_recv() {
             return Poll::Ready(done);
         }
@@ -492,11 +575,11 @@ impl TcpStream {
         self.try_recv()
     }
 
-    fn try_recv(&mut self) -> Poll<io::Result<Option<Bytes>>> {
+    fn try_recv(&mut self) -> Poll<io::Result<Option<RecvChunk>>> {
         self.drain_flush();
         self.drain_inbound();
         if let Some(chunk) = self.read_chunk.take() {
-            return Poll::Ready(Ok(Some(chunk.into_bytes())));
+            return Poll::Ready(Ok(Some(RecvChunk(chunk))));
         }
         match self.state {
             StreamState::Reset => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),

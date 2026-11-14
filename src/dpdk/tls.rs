@@ -488,7 +488,7 @@ impl TlsStream {
                 Stop::Open | Stop::Blocked => {
                     // The peer answers only once our flight is out.
                     ready!(self.poll_flush_tx(cx))?;
-                    match ready!(self.tcp.poll_recv(cx))? {
+                    match ready!(self.tcp.poll_recv_chunk(cx))? {
                         Some(segment) => self.incoming.append(&segment)?,
                         None => {
                             return Poll::Ready(Err(io::Error::new(
@@ -539,7 +539,7 @@ impl TlsStream {
             {
                 return Poll::Ready(Err(e));
             }
-            match ready!(self.tcp.poll_recv(cx))? {
+            match ready!(self.tcp.poll_recv_chunk(cx))? {
                 Some(segment) => self.incoming.append(&segment)?,
                 None => {
                     self.read = ReadState::Truncated;
