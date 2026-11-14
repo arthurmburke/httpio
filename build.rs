@@ -75,6 +75,7 @@ fn main() {
         // constant-fold on its own. This falls back to clang to evaluate
         // them so they're generated rather than hand-transcribed.
         .clang_macro_fallback()
+        .clang_macro_fallback_build_dir(&out_dir)
         .allowlist_function("rte_.*")
         .allowlist_type("rte_.*")
         .allowlist_type("RTE_.*")
