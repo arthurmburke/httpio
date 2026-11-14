@@ -15,7 +15,7 @@ instead of silently producing an empty profile. `DPDK_PROFILE_ITERS` accepts
 100–1,000,000. The default is 10,000 iterations **per pass per scenario**.
 
 The fixture initializes real EAL, pins its calling thread to an available CPU,
-creates a cache-disabled mbuf pool and uses the `net_ring` loopback PMD. A
+creates an mbuf pool with per-lcore caching disabled by default and uses the `net_ring` loopback PMD. A
 synthetic TCP peer completes a handshake, injects checksummed packets and
 acknowledges transmitted data. Protocol time stays fixed to prevent host
 scheduling delays from triggering retransmission timeouts.
@@ -57,7 +57,8 @@ engine construction and the initial handshake.
 | `rx_data_1024` | Receive, read and release 1,024 bytes |
 | `tx_owned_1024` | Send a static owned `Bytes` and build/transmit its packet |
 | `tx_copied_1024` | Copy 1,024 borrowed bytes into `Bytes`, then send (models the transport write copy, not the async ring) |
-| `tx_4_fragments` | Send four static slices totaling 1,024 bytes |
+| `tx_2_fragments` | Send two static slices totaling 1,024 bytes within inline metadata |
+| `tx_4_fragments` | Send four static slices totaling 1,024 bytes and allocate overflow metadata |
 | `tx_32_fragments` | Send 32 static slices totaling 1,024 bytes; exercises overflow metadata |
 
 ## Interpretation and limits
@@ -97,3 +98,33 @@ Warmed owned TX, four-fragment TX, ACK handling, rejected RX and idle polling
 still measured zero Rust allocations. The profiler does not exercise worker
 notification scheduling; that path has separate command/read/drop and
 notification-overflow regression tests.
+
+## TX allocation and stream read baselines
+
+The memory profiler also compares allocating and freeing 16 or 64 mbufs
+individually versus acquiring them with one `rte_pktmbuf_alloc_bulk` call.
+Both paths hold the entire batch and free each mbuf individually. Run with
+`DPDK_PROFILE_POOL_CACHE=256` to model the stack's default per-lcore cache,
+or omit it for the cache-disabled reference.
+
+The `copy_64x1024` and `attach_64x1024` rows compare construction and release
+of 64 payload mbufs from one preallocated DMA buffer. Pool occupancy is
+sampled in a separate pass. Headers, TCP, PMD submission, and driver
+completion are outside this comparison. The report also records whether a
+16-mbuf request, an external attachment, or one individual allocation
+succeeds with one pool object left.
+
+Run the stream read baseline separately so its EAL setup has the process
+to itself:
+
+```sh
+taskset -c 0 cargo test --release --lib benchmark_stream_reads -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The test stages real mbufs in the same inbound ring that `TcpStream` uses
+and reads the same payload into a preallocated application buffer with
+`poll_read` or with `poll_recv` followed by a copy. Timing covers the
+application read and mbuf release. Ring production, packet processing,
+worker scheduling and wakeups are outside the timed window. Allocation
+counting uses a separate sample so it does not perturb the timed runs.

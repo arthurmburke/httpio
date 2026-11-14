@@ -48,7 +48,7 @@ mod dpdk {
     use super::allocation_profile::{Stats, measure};
     use bytes::Bytes;
     use httpio::dpdk::{
-        EthPort, Mbuf, Mempool, eal, ffi,
+        DmaBuffer, EthPort, Mbuf, Mempool, eal, ffi,
         mempool::DEFAULT_MBUF_DATA_ROOM_SIZE,
         net::{arp, eth, eth::EthAddr, ipv4, tcp},
         tcp::{
@@ -78,9 +78,15 @@ mod dpdk {
         now: Instant,
     }
     impl Fixture {
-        fn new() -> Self {
-            let pool = Mempool::create("memory-profile", 4095, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
-                .unwrap();
+        fn new(cache_size: u32) -> Self {
+            let pool = Mempool::create(
+                "memory-profile",
+                4095,
+                cache_size,
+                DEFAULT_MBUF_DATA_ROOM_SIZE,
+                -1,
+            )
+            .unwrap();
             let port = EthPort::init(0, &pool, 128, 128, 1500, 0).unwrap();
             let mut engine = TcpEngine::new(EngineConfig {
                 local_ip: LOCAL_IP,
@@ -335,7 +341,10 @@ mod dpdk {
             ])
             .unwrap()
         });
-        let (mut f, setup_stats) = measure(Fixture::new);
+        let cache_size = std::env::var("DPDK_PROFILE_POOL_CACHE").map_or(0, |value| {
+            value.parse().expect("invalid DPDK_PROFILE_POOL_CACHE")
+        });
+        let (mut f, setup_stats) = measure(|| Fixture::new(cache_size));
         let mut rows = Vec::new();
         rows.push(profile(
             "timer_overhead",
@@ -357,6 +366,101 @@ mod dpdk {
             },
             |_| {},
         ));
+        // Compare acquisition strategies in isolation. Both release the
+        // same number of Mbuf handles; production TX is unchanged.
+        for (name, count, bulk) in [
+            ("mbuf_single_16", 16, false),
+            ("mbuf_bulk_16", 16, true),
+            ("mbuf_single_64", 64, false),
+            ("mbuf_bulk_64", 64, true),
+        ] {
+            rows.push(profile(
+                name,
+                iterations,
+                &mut f,
+                |_| {},
+                |f| {
+                    let mut raw = [std::ptr::null_mut(); 64];
+                    if bulk {
+                        assert_eq!(
+                            unsafe {
+                                ffi::rte_pktmbuf_alloc_bulk(
+                                    f.pool.as_raw(),
+                                    raw.as_mut_ptr(),
+                                    count as u32,
+                                )
+                            },
+                            0
+                        );
+                    } else {
+                        for packet in &mut raw[..count] {
+                            *packet = Mbuf::alloc(&f.pool).unwrap().into_raw();
+                        }
+                    }
+                    for &packet in black_box(&raw[..count]) {
+                        // SAFETY: both paths above acquired every pointer in this prefix.
+                        drop(unsafe { Mbuf::from_raw(packet) });
+                    }
+                },
+                |_| {},
+            ));
+        }
+        let initial_available = f.available();
+        let held: Vec<_> = (0..initial_available - 1)
+            .map(|_| Mbuf::alloc(&f.pool).unwrap())
+            .collect();
+        let mut raw = [std::ptr::null_mut(); 16];
+        assert_ne!(
+            unsafe { ffi::rte_pktmbuf_alloc_bulk(f.pool.as_raw(), raw.as_mut_ptr(), 16) },
+            0
+        );
+        assert_eq!(f.available(), 1);
+        let dma = DmaBuffer::new(DATA.len()).unwrap().freeze();
+        assert!(Mbuf::from_external_bytes(&f.pool, dma.clone()).is_none());
+        assert_eq!(f.available(), 1);
+        drop(Mbuf::alloc(&f.pool).expect("one pooled mbuf remains after bulk/attach failure"));
+        drop(held);
+        assert_eq!(f.available(), initial_available);
+
+        // Both paths retain 64 payload mbufs until the end of the sample.
+        // The external path must also retain a separate owner record each.
+        let mut occupancy = Vec::new();
+        for (name, external) in [("copy_64x1024", false), ("attach_64x1024", true)] {
+            let mut packets = Vec::with_capacity(64);
+            let fill = |f: &Fixture, packets: &mut Vec<Mbuf>| {
+                for _ in 0..64 {
+                    let packet = if external {
+                        Mbuf::from_external_bytes(&f.pool, dma.clone()).unwrap()
+                    } else {
+                        let mut packet = Mbuf::alloc(&f.pool).unwrap();
+                        packet
+                            .append(DATA.len() as u16)
+                            .unwrap()
+                            .copy_from_slice(&dma);
+                        packet
+                    };
+                    packets.push(packet);
+                }
+            };
+            rows.push(profile(
+                name,
+                iterations,
+                &mut f,
+                |_| {},
+                |f| {
+                    fill(f, &mut packets);
+                    black_box(&packets);
+                    packets.clear();
+                },
+                |_| {},
+            ));
+            let before = f.available();
+            fill(&f, &mut packets);
+            let peak = before - f.available();
+            packets.clear();
+            assert_eq!(f.available(), before);
+            occupancy.push(serde_json::json!({"scenario": name, "peak_pool_objects": peak}));
+        }
         rows.push(profile(
             "mbuf_bytes_owner",
             iterations,
@@ -410,6 +514,7 @@ mod dpdk {
         for (name, chunks, copy) in [
             ("tx_owned_1024", 1, false),
             ("tx_copied_1024", 1, true),
+            ("tx_2_fragments", 2, false),
             ("tx_4_fragments", 4, false),
             ("tx_32_fragments", 32, false),
         ] {
@@ -442,7 +547,7 @@ mod dpdk {
                     | "rx_ack"
                     | "rx_rejected"
                     | "tx_owned_1024"
-                    | "tx_4_fragments"
+                    | "tx_2_fragments"
             ) {
                 assert_eq!(
                     row.stats.allocations(),
@@ -454,7 +559,7 @@ mod dpdk {
         }
         let report = serde_json::json!({
             "schema_version": 1, "iterations": iterations, "warmup_iterations": 128,
-            "cpu": cpu, "optimized": !cfg!(debug_assertions), "driver": "net_ring", "pool_cache_size": 0,
+            "cpu": cpu, "optimized": !cfg!(debug_assertions), "driver": "net_ring", "pool_cache_size": cache_size,
             "dpdk_version": unsafe { std::ffi::CStr::from_ptr(ffi::rte_version()) }.to_string_lossy(),
             "architecture": std::env::consts::ARCH, "os": std::env::consts::OS,
             "allocator": "std::alloc::System", "pool_objects": 4095,
@@ -462,6 +567,14 @@ mod dpdk {
             "scope": "Rust System allocator on the calling thread only; DPDK/C allocations excluded; prepare/finish excluded",
             "timing_note": "baseline retains inactive TLS hook and Instant sampling overhead; allocator timing includes clock overhead; not CPU cycles or attributable end-to-end speedup",
             "rust_eal_setup": eal_stats, "rust_fixture_setup": setup_stats, "scenarios": rows,
+            "pool_occupancy": occupancy,
+            "pool_pressure": {
+                "free_objects": 1,
+                "bulk_request": 16,
+                "bulk_succeeded": false,
+                "external_attachment_succeeded": false,
+                "single_allocation_succeeded": true
+            },
         });
         println!(
             "\n{:<20} {:>9} {:>10} {:>11} {:>11} {:>11} {:>11}",
@@ -493,6 +606,7 @@ mod dpdk {
         }
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
         println!("JSON report: {}", path.display());
+        drop(dma);
         drop(f);
         eal::cleanup();
     }

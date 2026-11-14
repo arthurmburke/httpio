@@ -1352,3 +1352,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod read_benchmark;
