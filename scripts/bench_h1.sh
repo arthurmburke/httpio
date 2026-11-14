@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-BIN="$TARGET_DIR/release/examples/bench_h1"
+BIN="${BENCH_H1_BIN:-$TARGET_DIR/release/examples/bench_h1}"
 REPEATS="${BENCH_H1_REPEATS:-3}"
 NS=httpio-h1-bench
 DEV=h1bench0
@@ -15,7 +15,9 @@ if ip link show "$DEV" >/dev/null 2>&1 || ip netns list | grep -q "^$NS\b"; then
 fi
 command -v ethtool >/dev/null || { echo 'Install ethtool before running this benchmark' >&2; exit 1; }
 if [[ "${BENCH_H1_SKIP_BUILD:-0}" != 1 ]]; then
-    cargo build --release --example bench_h1
+    features=()
+    if [[ "${BENCH_H1_METRICS:-0}" == 1 ]]; then features=(--features tcp-metrics); fi
+    cargo build --release --example bench_h1 "${features[@]}"
 fi
 SERVER_PID=
 cleanup() {

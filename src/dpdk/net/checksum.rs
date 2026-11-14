@@ -9,6 +9,8 @@ use std::net::Ipv4Addr;
 /// can chain multiple regions (e.g. pseudo-header + TCP header + payload)
 /// by feeding the running sum into the next call via `with_seed`.
 pub fn sum16(data: &[u8], seed: u32) -> u32 {
+    #[cfg(feature = "tcp-metrics")]
+    let metrics_start = std::time::Instant::now();
     let mut sum = seed;
     let mut chunks = data.chunks_exact(2);
     for chunk in &mut chunks {
@@ -17,6 +19,12 @@ pub fn sum16(data: &[u8], seed: u32) -> u32 {
     if let [last] = chunks.remainder() {
         sum += (*last as u32) << 8;
     }
+    #[cfg(feature = "tcp-metrics")]
+    crate::dpdk::tcp::metrics::record(|m| {
+        m.checksum_calls += 1;
+        m.checksum_bytes += data.len() as u64;
+        m.checksum_ns += metrics_start.elapsed().as_nanos() as u64;
+    });
     sum
 }
 

@@ -19,6 +19,9 @@ pub struct CongestionControl {
     ssthresh: u32,
     phase: Phase,
     dup_ack_count: u32,
+    /// Bytes acknowledged in congestion avoidance that have not yet been
+    /// converted into window growth (RFC 3465 §2.1).
+    avoidance_acked: u32,
 }
 
 impl CongestionControl {
@@ -41,6 +44,7 @@ impl CongestionControl {
             ssthresh: u32::MAX,
             phase: Phase::SlowStart,
             dup_ack_count: 0,
+            avoidance_acked: 0,
         }
     }
 
@@ -53,20 +57,30 @@ impl CongestionControl {
     pub fn on_new_ack(&mut self, newly_acked: u32, snd_una_after: u32) {
         self.dup_ack_count = 0;
         match self.phase {
+            // Both phases count acknowledged bytes, not ACKs. A receiver
+            // that aggregates (GRO or LRO: every Linux peer on a real NIC,
+            // and this stack) acknowledges tens of segments at once.
+            // Growing by a fixed amount per ACK would then open the window
+            // tens of times slower than the same data acknowledged one
+            // segment at a time.
             Phase::SlowStart => {
-                // RFC 3465 byte counting with L = 2: a receiver that ACKs
-                // every other segment (or a whole burst at once) still
-                // lets the window double each round trip.
-                self.cwnd = self.cwnd.saturating_add(newly_acked.min(2 * self.mss));
+                // The window doubles each round trip, up to ssthresh; the
+                // next ACK continues in congestion avoidance.
+                let limit = self.ssthresh.max(self.cwnd);
+                self.cwnd = self.cwnd.saturating_add(newly_acked).min(limit);
                 if self.cwnd >= self.ssthresh {
                     self.phase = Phase::CongestionAvoidance;
+                    self.avoidance_acked = 0;
                 }
             }
             Phase::CongestionAvoidance => {
-                // Additive increase: +MSS per RTT, approximated as
-                // +MSS*MSS/cwnd per ACK.
-                let inc = ((self.mss as u64 * self.mss as u64) / self.cwnd as u64).max(1) as u32;
-                self.cwnd = self.cwnd.saturating_add(inc);
+                // Additive increase: one MSS per window of acknowledged
+                // data, which is one MSS per round trip.
+                self.avoidance_acked = self.avoidance_acked.saturating_add(newly_acked);
+                while self.avoidance_acked >= self.cwnd && self.cwnd < u32::MAX {
+                    self.avoidance_acked -= self.cwnd;
+                    self.cwnd = self.cwnd.saturating_add(self.mss);
+                }
             }
             Phase::FastRecovery { recovery_point } => {
                 if snd_una_after.wrapping_sub(recovery_point) as i32 >= 0 {
@@ -74,6 +88,7 @@ impl CongestionControl {
                     // recovery) is now acked: recovery is over.
                     self.cwnd = self.ssthresh;
                     self.phase = Phase::CongestionAvoidance;
+                    self.avoidance_acked = 0;
                 } else {
                     // Partial ack: a further segment was lost. Deflate
                     // cwnd by the amount acked (NewReno-lite) and stay in
@@ -157,8 +172,35 @@ mod tests {
         cc.on_new_ack(1460, 1000);
         assert_eq!(cc.cwnd(), u32::MAX);
         cc.cwnd = u32::MAX - 1;
-        cc.on_new_ack(1460, 2000);
+        cc.on_new_ack(u32::MAX, 2000);
         assert_eq!(cc.cwnd(), u32::MAX);
+    }
+
+    #[test]
+    fn growth_counts_acknowledged_bytes_not_acks() {
+        // One ACK covering 40 segments opens the window as far as 40 ACKs
+        // of one segment each.
+        let mut stretch = CongestionControl::new(1460);
+        let mut single = CongestionControl::new(1460);
+        stretch.on_new_ack(40 * 1460, 1);
+        for i in 0..40 {
+            single.on_new_ack(1460, i);
+        }
+        assert_eq!(stretch.cwnd(), single.cwnd());
+        assert_eq!(stretch.cwnd(), 50 * 1460);
+
+        // Slow start stops at ssthresh.
+        let mut cc = CongestionControl::new(1460);
+        cc.ssthresh = 20 * 1460;
+        cc.on_new_ack(40 * 1460, 1);
+        assert_eq!(cc.cwnd(), 20 * 1460);
+        assert_eq!(cc.phase, Phase::CongestionAvoidance);
+
+        // Avoidance: one MSS per window of data, however it is acknowledged.
+        cc.on_new_ack(10 * 1460, 2);
+        assert_eq!(cc.cwnd(), 20 * 1460);
+        cc.on_new_ack(10 * 1460, 3);
+        assert_eq!(cc.cwnd(), 21 * 1460);
     }
 
     #[test]

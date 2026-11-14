@@ -30,6 +30,7 @@ use super::tx_queue::Payload;
 
 const MAX_RX_BURST: usize = 64;
 const MAX_PENDING_TX: usize = 256;
+pub const DEFAULT_TX_BUDGET: usize = 64;
 const ARP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the port may refuse the packet at the head of the transmit
 /// queue before the engine gives up on that packet. Far longer than a
@@ -82,6 +83,10 @@ struct Conn {
     /// Segments of this connection queued locally (awaiting pool space or
     /// NIC acceptance). No new output is produced while this is non-zero.
     queued_tx: usize,
+    /// Already in the engine's `active` set, so marking it again (once per
+    /// received packet) needs no hashing. May be false for a member that a
+    /// due timer inserted; inserting such a tuple twice is harmless.
+    active: bool,
 }
 
 impl Conn {
@@ -91,6 +96,7 @@ impl Conn {
             accept,
             next_hop: NextHop::Resolved,
             queued_tx: 0,
+            active: false,
         }
     }
 }
@@ -179,6 +185,7 @@ fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, prefix_len: u8) -> bool {
 }
 
 pub struct TcpEngine {
+    tx_budget: usize,
     config: EngineConfig,
     rx_gro: bool,
     listeners: HashSet<u16>,
@@ -215,6 +222,7 @@ pub struct TcpEngine {
 impl TcpEngine {
     pub fn new(config: EngineConfig) -> Self {
         Self {
+            tx_budget: DEFAULT_TX_BUDGET,
             config,
             rx_gro: true,
             listeners: HashSet::default(),
@@ -237,6 +245,18 @@ impl TcpEngine {
         }
     }
 
+    /// Maximum output packets per connection per poll, clamped to the global
+    /// pending-TX bound. Active connections share that bound; no packet waits
+    /// for a full batch. This does not change congestion or receive windows.
+    pub fn set_tx_budget(&mut self, packets: std::num::NonZeroU16) {
+        self.tx_budget = usize::from(packets.get()).min(MAX_PENDING_TX);
+    }
+
+    fn output_budget(&self) -> usize {
+        self.tx_budget
+            .min((MAX_PENDING_TX / self.processing.len().max(1)).max(1))
+    }
+
     /// Enable/disable burst-local receive aggregation for workload comparisons.
     pub fn set_rx_gro(&mut self, enabled: bool) {
         self.rx_gro = enabled;
@@ -244,10 +264,14 @@ impl TcpEngine {
 
     /// Marks a connection as needing attention on the next `poll`. Cheap
     /// and idempotent; called from every path that can give a connection
-    /// pending output (app ops, inbound segments).
-    fn mark_active(&mut self, tuple: FourTuple) {
-        self.timers.remove(tuple);
-        self.active.insert(tuple);
+    /// pending output (app ops, inbound segments). Its timer entry stays:
+    /// a due timer only inserts into the same set, and the poll that
+    /// processes the connection re-arms or removes it.
+    fn mark_active(active: &mut HashSet<FourTuple>, conn: &mut Conn, tuple: FourTuple) {
+        if !conn.active {
+            conn.active = true;
+            active.insert(tuple);
+        }
     }
 
     pub fn listen(&mut self, port: u16) {
@@ -279,14 +303,15 @@ impl TcpEngine {
         match self.connections.entry(tuple) {
             std::collections::hash_map::Entry::Occupied(_) => return None,
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(Conn::new(
+                let conn = v.insert(Conn::new(
                     Tcb::new_active(tuple),
                     AcceptState::NotApplicable,
                 ));
+                // Has a SYN to send.
+                Self::mark_active(&mut self.active, conn, tuple);
             }
         }
         self.connections_opened += 1;
-        self.mark_active(tuple); // has a SYN to send
         Some(tuple)
     }
 
@@ -330,7 +355,7 @@ impl TcpEngine {
     pub fn send(&mut self, tuple: FourTuple, data: Bytes) {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             conn.tcb.send(data);
-            self.mark_active(tuple);
+            Self::mark_active(&mut self.active, conn, tuple);
         }
     }
 
@@ -341,9 +366,37 @@ impl TcpEngine {
         let data = conn.tcb.recv(max_len);
         // Reading only needs a poll when it produced a window update.
         if !data.is_empty() && conn.tcb.has_pending_output() {
-            self.mark_active(tuple);
+            Self::mark_active(&mut self.active, conn, tuple);
         }
         data
+    }
+
+    /// Hands every readable chunk to `deliver` until it returns `false` or
+    /// nothing is left, with one connection lookup for the whole run.
+    pub(crate) fn recv_each(
+        &mut self,
+        tuple: FourTuple,
+        max_len: usize,
+        mut deliver: impl FnMut(Bytes) -> bool,
+    ) {
+        let Some(conn) = self.connections.get_mut(&tuple) else {
+            return;
+        };
+        let mut any = false;
+        loop {
+            let data = conn.tcb.recv(max_len);
+            if data.is_empty() {
+                break;
+            }
+            any = true;
+            if !deliver(data) {
+                break;
+            }
+        }
+        // Reading only needs a poll when it produced a window update.
+        if any && conn.tcb.has_pending_output() {
+            Self::mark_active(&mut self.active, conn, tuple);
+        }
     }
 
     pub fn readable_len(&self, tuple: FourTuple) -> usize {
@@ -356,7 +409,7 @@ impl TcpEngine {
     pub fn close(&mut self, tuple: FourTuple) {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             conn.tcb.close();
-            self.mark_active(tuple);
+            Self::mark_active(&mut self.active, conn, tuple);
         }
     }
 
@@ -372,7 +425,7 @@ impl TcpEngine {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             conn.tcb.set_nodelay(nodelay);
             // May unblock a Nagle-held tail.
-            self.mark_active(tuple);
+            Self::mark_active(&mut self.active, conn, tuple);
         }
     }
 
@@ -382,7 +435,7 @@ impl TcpEngine {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             conn.tcb.set_cork(corked);
             // Uncorking flushes a held tail.
-            self.mark_active(tuple);
+            Self::mark_active(&mut self.active, conn, tuple);
         }
     }
 
@@ -390,7 +443,7 @@ impl TcpEngine {
     pub fn flush(&mut self, tuple: FourTuple) {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             conn.tcb.flush();
-            self.mark_active(tuple);
+            Self::mark_active(&mut self.active, conn, tuple);
         }
     }
 
@@ -422,19 +475,29 @@ impl TcpEngine {
         now: Instant,
         events: &mut Vec<(FourTuple, Event)>,
     ) {
+        #[cfg(feature = "tcp-metrics")]
+        let metrics_start = Instant::now();
         events.clear();
         self.updated.clear();
         self.arp.expire(now);
-        let mut gro_packets = [std::ptr::null_mut(); MAX_RX_BURST];
-        let mut gro_count = 0;
-        for mut mbuf in port.rx_packets(MAX_RX_BURST) {
+        // The burst is received into uninitialized stack storage and each
+        // packet is taken out of it exactly once: an idle poll (most polls)
+        // must not pay for clearing or moving 64 slots. A run of
+        // GRO-eligible packets is merged where it lies.
+        let mut burst = [std::mem::MaybeUninit::uninit(); MAX_RX_BURST];
+        let burst = port.rx_burst_raw(&mut burst);
+        let mut run_start = 0;
+        for i in 0..burst.len() {
+            // SAFETY: the driver handed over ownership of this packet, and
+            // each slot is converted once: here, or by `handle_gro` after
+            // `into_raw` gives it back to the slot's pointer.
+            let mut mbuf = unsafe { Mbuf::from_raw(burst[i]) };
             if self.rx_gro && super::super::net::gro::prepare(&mut mbuf) {
-                gro_packets[gro_count] = mbuf.into_raw();
-                gro_count += 1;
+                let _ = mbuf.into_raw();
                 continue;
             }
-            self.handle_gro(&mut gro_packets, gro_count, now);
-            gro_count = 0;
+            self.handle_gro(&mut burst[run_start..i], now);
+            run_start = i + 1;
             // RX checksum offload: if the NIC checked a checksum and it was
             // wrong, drop the frame; if it verified one as good, skip the
             // corresponding software check. When RX offload is off the
@@ -447,7 +510,7 @@ impl TcpEngine {
             self.handle_frame(mbuf, ip_ok, l4_ok, now);
         }
 
-        self.handle_gro(&mut gro_packets, gro_count, now);
+        self.handle_gro(&mut burst[run_start..], now);
         self.flush_tx(port, pool, now);
 
         self.activate_due(now);
@@ -465,6 +528,8 @@ impl TcpEngine {
             let Some(conn) = self.connections.get_mut(&tuple) else {
                 continue;
             };
+            // `active` was swapped out: this connection is no longer in it.
+            conn.active = false;
             conn.tcb.tick(now);
             let mut established = false;
             for ev in conn.tcb.events.drain(..) {
@@ -491,6 +556,7 @@ impl TcpEngine {
             .min(u32::from(pool.packet_capacity()).saturating_sub(eth::ETH_HDR_LEN as u32))
             .saturating_sub((ipv4::IPV4_HDR_LEN + tcp::TCP_HDR_LEN) as u32)
             .min(u16::MAX as u32) as u16;
+        let output_budget = self.output_budget();
         let connections = &mut self.connections;
         let config = &self.config;
         let arp = &mut self.arp;
@@ -507,6 +573,10 @@ impl TcpEngine {
             // Do not consume output until both resolution and bounded
             // local queue space are available. ARP replies are usable this poll.
             let room = MAX_PENDING_TX.saturating_sub(self.tx_batch.len() + self.pending_tx.len());
+            #[cfg(feature = "tcp-metrics")]
+            if conn.queued_tx != 0 {
+                super::metrics::record(|m| m.queued_tx_skips += 1);
+            }
             if conn.queued_tx != 0 || room == 0 {
                 continue;
             }
@@ -529,7 +599,17 @@ impl TcpEngine {
             conn.tcb
                 .set_tx_payload_limit(port.offloads().tso_max_payload);
             conn.tcb
-                .poll_output_queued(now, &mut self.segments, room.min(32));
+                .poll_output_queued(now, &mut self.segments, room.min(output_budget));
+            #[cfg(feature = "tcp-metrics")]
+            super::metrics::record(|m| {
+                let n = self.segments.len();
+                if n > 0 {
+                    m.output_batches[super::metrics::bucket(n)] += 1;
+                }
+                m.output_packets += n as u64;
+                m.output_budget_exhausted +=
+                    u64::from(n == room.min(output_budget) && conn.tcb.has_pending_output());
+            });
             // A connection that closed is dropped below, so whatever it
             // just produced (a final reset) goes out unowned.
             let owned = !conn.tcb.is_closed();
@@ -609,15 +689,14 @@ impl TcpEngine {
 
         self.flush_tx(port, pool, now);
         // NIC acceptance can arm/restart RTO, so schedule only after TX.
-        self.reschedule_processed();
+        self.reschedule_processed(now);
+        #[cfg(feature = "tcp-metrics")]
+        super::metrics::record(|m| m.engine_poll_ns += metrics_start.elapsed().as_nanos() as u64);
     }
 
-    fn handle_gro(
-        &mut self,
-        packets: &mut [*mut crate::dpdk::ffi::rte_mbuf],
-        count: usize,
-        now: Instant,
-    ) {
+    /// Takes ownership of every packet in `packets`.
+    fn handle_gro(&mut self, packets: &mut [*mut crate::dpdk::ffi::rte_mbuf], now: Instant) {
+        let count = packets.len();
         if count == 0 {
             return;
         }
@@ -639,18 +718,20 @@ impl TcpEngine {
         }
     }
 
-    fn reschedule_processed(&mut self) {
+    fn reschedule_processed(&mut self, _now: Instant) {
         for &tuple in &self.processing {
             self.active.remove(&tuple);
-            let Some(conn) = self.connections.get(&tuple) else {
+            let Some(conn) = self.connections.get_mut(&tuple) else {
                 self.timers.remove(tuple);
                 continue;
             };
+            #[cfg(feature = "tcp-metrics")]
+            conn.tcb.record_window_limits(_now);
             self.timers.set(tuple, conn.tcb.next_deadline());
-            if conn.tcb.has_pending_output()
+            conn.active = conn.tcb.has_pending_output()
                 || conn.queued_tx != 0
-                || matches!(conn.next_hop, NextHop::Resolving { .. })
-            {
+                || matches!(conn.next_hop, NextHop::Resolving { .. });
+            if conn.active {
                 self.active.insert(tuple);
             }
         }
@@ -674,8 +755,14 @@ impl TcpEngine {
     }
 
     fn flush_tx(&mut self, port: &EthPort, pool: &Mempool, now: Instant) {
+        #[cfg(feature = "tcp-metrics")]
+        super::metrics::record(|m| {
+            m.pending_tx_peak = m.pending_tx_peak.max(self.pending_tx_len() as u64)
+        });
         while let Some(packet) = self.pending_tx.front() {
-            let Some(mbuf) = build_ip_tcp_frame_external(
+            #[cfg(feature = "tcp-metrics")]
+            let metrics_start = Instant::now();
+            let built = build_ip_tcp_frame_external(
                 pool,
                 self.config.local_mac,
                 packet.mac,
@@ -686,7 +773,14 @@ impl TcpEngine {
                 port.tx_cksum_offload(),
                 packet.tso_mss,
                 port.offloads().tx_max_segments,
-            ) else {
+            );
+            #[cfg(feature = "tcp-metrics")]
+            super::metrics::record(|m| {
+                m.packet_build_calls += 1;
+                m.packet_build_failures += u64::from(built.is_none());
+                m.packet_build_ns += metrics_start.elapsed().as_nanos() as u64;
+            });
+            let Some(mbuf) = built else {
                 break;
             };
             self.tx_owners.push(
@@ -703,9 +797,23 @@ impl TcpEngine {
         }
         port.tx_burst_in_place(&mut self.tx_batch);
         let sent = before - self.tx_batch.len();
-        for owner in self.tx_owners.drain(..sent).flatten() {
-            Self::transmitted(&mut self.connections, owner, now);
+        // A burst is mostly runs of one connection's packets: look the
+        // connection up once per run rather than once per packet.
+        let mut owners = self.tx_owners.drain(..sent).flatten().peekable();
+        while let Some((tuple, seq)) = owners.next() {
+            // An owned packet's connection is still tracked: `abort`
+            // discards a connection's queued packets along with it.
+            let Some(conn) = self.connections.get_mut(&tuple) else {
+                continue;
+            };
+            conn.tcb.mark_transmitted(seq, now);
+            conn.queued_tx = conn.queued_tx.saturating_sub(1);
+            while let Some((_, seq)) = owners.next_if(|(next, _)| *next == tuple) {
+                conn.tcb.mark_transmitted(seq, now);
+                conn.queued_tx = conn.queued_tx.saturating_sub(1);
+            }
         }
+        drop(owners);
         // The unaccepted suffix and its ownership metadata remain for retry.
         if sent > 0 || self.tx_batch.is_empty() {
             self.tx_stalled_since = None;
@@ -845,12 +953,12 @@ impl TcpEngine {
                 },
                 now,
             );
+            // The segment may have produced an ACK/data to send, an event,
+            // or a state change -- process it next poll.
+            Self::mark_active(&mut self.active, conn, tuple);
             if conn.tcb.is_closed() {
                 self.discard_queued(tuple);
             }
-            // The segment may have produced an ACK/data to send, an event,
-            // or a state change -- process it next poll.
-            self.mark_active(tuple);
             return;
         }
 
@@ -859,9 +967,10 @@ impl TcpEngine {
             let peer_mss = tcp_hdr.options.mss.unwrap_or(536);
             let mut tcb = Tcb::new_from_listen(tuple, Seq::new(tcp_hdr.seq), peer_mss);
             tcb.set_peer_scale(tcp_hdr.options.window_scale);
-            self.connections
-                .insert(tuple, Conn::new(tcb, AcceptState::AwaitingHandshake));
-            self.mark_active(tuple); // has a SYN-ACK to send
+            // Has a SYN-ACK to send.
+            let mut conn = Conn::new(tcb, AcceptState::AwaitingHandshake);
+            Self::mark_active(&mut self.active, &mut conn, tuple);
+            self.connections.insert(tuple, conn);
             return;
         }
 
@@ -1181,6 +1290,52 @@ mod tests {
         EngineConfig::from_cli(EthAddr::ZERO, local, gateway).unwrap()
     }
 
+    #[test]
+    fn larger_budget_shares_queue_space_and_preserves_unsent_data() {
+        let now = Instant::now();
+        let mut engine = TcpEngine::new(EngineConfig::default());
+        engine.set_tx_budget(std::num::NonZeroU16::new(256).unwrap());
+        for port in 1000..1008 {
+            let (mut tcb, _) = established_tcb(port, now);
+            tcb.set_nodelay(true);
+            // Open enough congestion/receive window for a meaningful budget
+            // test by acknowledging each warmup flight.
+            for _ in 0..20 {
+                tcb.send(Bytes::from(vec![0; 4096]));
+                let output = tcb.poll_output(now);
+                let last = output.last().unwrap();
+                let ack = tcp::TcpHeader {
+                    src_port: 80,
+                    dst_port: port,
+                    seq: 101,
+                    ack: (last.seq + last.payload.len() as u32).0,
+                    flags: tcp::flags::ACK,
+                    window: u16::MAX,
+                    urgent_pointer: 0,
+                    options: tcp::TcpOptions::default(),
+                };
+                tcb.on_segment(&ack, Bytes::new(), now);
+            }
+            tcb.send(Bytes::from(vec![0; 100_000]));
+            let tuple = tcb.tuple;
+            engine
+                .connections
+                .insert(tuple, Conn::new(tcb, AcceptState::NotApplicable));
+            engine.processing.insert(tuple);
+        }
+        let budget = engine.output_budget();
+        let mut total = 0;
+        for conn in engine.connections.values_mut() {
+            let mut output = Vec::new();
+            conn.tcb.poll_output_queued(now, &mut output, budget);
+            assert_eq!(output.len(), 32);
+            total += output.len();
+            assert!(conn.tcb.has_pending_output());
+            assert_eq!(conn.tcb.buffered_send_bytes(), 100_000);
+        }
+        assert_eq!(total, MAX_PENDING_TX);
+    }
+
     fn established_tcb(port: u16, now: Instant) -> (Tcb, tcp::TcpHeader) {
         let tuple = FourTuple {
             local_ip: Ipv4Addr::new(10, 0, 0, 1),
@@ -1213,7 +1368,7 @@ mod tests {
             .connections
             .insert(tuple, Conn::new(tcb, AcceptState::NotApplicable));
         engine.processing.insert(tuple);
-        engine.reschedule_processed();
+        engine.reschedule_processed(Instant::now());
         tuple
     }
 
@@ -1484,9 +1639,13 @@ mod tests {
         conn.tcb.poll_output(later);
         let new_deadline = conn.tcb.next_deadline().unwrap();
         assert!(new_deadline > old_deadline);
-        engine.mark_active(tuple);
+        TcpEngine::mark_active(
+            &mut engine.active,
+            engine.connections.get_mut(&tuple).unwrap(),
+            tuple,
+        );
         engine.processing.insert(tuple);
-        engine.reschedule_processed();
+        engine.reschedule_processed(Instant::now());
         engine.activate_due(old_deadline);
         assert!(engine.active.is_empty());
         engine.activate_due(new_deadline);
@@ -1534,9 +1693,13 @@ mod tests {
             .unwrap()
             .tcb
             .on_segment(&peer, Bytes::new(), now);
-        engine.mark_active(tuple);
+        TcpEngine::mark_active(
+            &mut engine.active,
+            engine.connections.get_mut(&tuple).unwrap(),
+            tuple,
+        );
         engine.processing.insert(tuple);
-        engine.reschedule_processed();
+        engine.reschedule_processed(Instant::now());
         engine.activate_due(deadline);
         assert!(engine.active.is_empty());
         // An aborted timer must not later activate a new connection with the same tuple.

@@ -11,3 +11,6 @@ pub mod tcb;
 mod timers;
 pub mod tx_queue;
 pub mod worker;
+
+#[cfg(feature = "tcp-metrics")]
+pub mod metrics;

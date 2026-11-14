@@ -44,14 +44,27 @@ async fn server(ip: Ipv4Addr) {
                     let size: usize = req.uri().path().trim_start_matches('/').parse().unwrap();
                     let index = SIZES.iter().position(|n| *n == size).unwrap();
                     let upload = req.method() == http::Method::POST;
+                    #[cfg(feature = "tcp-metrics")]
+                    let receive_start = Instant::now();
                     let body = req.into_body().collect().await.unwrap().to_bytes();
+                    #[cfg(feature = "tcp-metrics")]
+                    let receive_ns = receive_start.elapsed().as_nanos();
+                    #[cfg(feature = "tcp-metrics")]
+                    let validation_start = Instant::now();
                     if upload {
                         assert_eq!(body.len(), size);
                         assert!(body.iter().all(|b| *b == 0x5a));
                     } else {
                         assert!(body.is_empty());
                     }
-                    let response = Response::builder()
+                    #[cfg(feature = "tcp-metrics")]
+                    let validation_ns = validation_start.elapsed().as_nanos();
+                    let response = Response::builder();
+                    #[cfg(feature = "tcp-metrics")]
+                    let response = response
+                        .header("x-bench-receive-ns", receive_ns.to_string())
+                        .header("x-bench-validate-ns", validation_ns.to_string());
+                    let response = response
                         .header("content-type", "application/octet-stream")
                         .header("connection", "close")
                         .body(Full::new(if upload {
@@ -102,7 +115,16 @@ where
 {
     println!("backend\tmethod\tbytes\tsamples\tp50_us\tp99_us\tmean_us\treq_s\tpayload_mbit_s");
     for upload in [false, true] {
+        let method = if upload { "POST" } else { "GET" };
+        if std::env::var("BENCH_H1_METHOD").is_ok_and(|v| v != method) {
+            continue;
+        }
         for size in SIZES {
+            if std::env::var("BENCH_H1_BYTES").is_ok_and(|v| v.parse::<usize>().unwrap() != size) {
+                continue;
+            }
+            #[cfg(feature = "tcp-metrics")]
+            let mut server_times = [0u128; 2];
             let rounds = setting(
                 "BENCH_H1_ROUNDS",
                 if size == 1024 * 1024 { 30 } else { 300 },
@@ -139,9 +161,26 @@ where
                     assert!(response.body().iter().all(|b| *b == 0x5a));
                 }
                 if i >= warmup {
+                    #[cfg(feature = "tcp-metrics")]
+                    for (total, name) in server_times
+                        .iter_mut()
+                        .zip(["x-bench-receive-ns", "x-bench-validate-ns"])
+                    {
+                        *total += response.headers()[name]
+                            .to_str()
+                            .unwrap()
+                            .parse::<u128>()
+                            .unwrap();
+                    }
                     samples.push(elapsed.as_secs_f64());
                 }
             }
+            #[cfg(feature = "tcp-metrics")]
+            eprintln!(
+                "SERVER_METRICS backend={label} method={method} bytes={size} samples={rounds} receive_mean_us={:.3} validate_mean_us={:.3}",
+                server_times[0] as f64 / rounds as f64 / 1000.0,
+                server_times[1] as f64 / rounds as f64 / 1000.0
+            );
             samples.sort_unstable_by(f64::total_cmp);
             let total: f64 = samples.iter().sum();
             let at = |q: f64| samples[((rounds - 1) as f64 * q) as usize] * 1e6;
@@ -199,12 +238,25 @@ fn dpdk_run(args: &[String]) {
     let local_ip = args[split + 1].parse().unwrap();
     let ip = args[split + 2].parse().unwrap();
     let pool = Mempool::create("bench_h1", 8192, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
-    let port = EthPort::init(0, &pool, 1024, 1024, 1500, -1).unwrap();
-    let engine = TcpEngine::new(EngineConfig {
+    let mut port = EthPort::init(0, &pool, 1024, 1024, 1500, -1).unwrap();
+    let tx_burst = u16::try_from(setting(
+        "BENCH_TX_BURST",
+        httpio::dpdk::port::DEFAULT_TX_BURST,
+    ))
+    .unwrap();
+    port.set_tx_burst_limit(tx_burst.try_into().unwrap());
+    let mut engine = TcpEngine::new(EngineConfig {
         local_ip,
         local_mac: port.mac_addr().unwrap(),
         gateway: None,
     });
+    let tx_budget = u16::try_from(setting(
+        "BENCH_TX_BUDGET",
+        httpio::dpdk::tcp::engine::DEFAULT_TX_BUDGET,
+    ))
+    .unwrap();
+    engine.set_tx_budget(tx_budget.try_into().unwrap());
+    eprintln!("tx_budget={tx_budget} tx_burst={tx_burst}");
     let (worker, join) = WorkerHandle::spawn(
         engine,
         port,
@@ -229,6 +281,8 @@ fn dpdk_run(args: &[String]) {
         config.capacity, config.initial_window_segments
     );
     let worker = worker.with_send_config(config);
+    #[cfg(feature = "tcp-metrics")]
+    let metrics = worker.metrics_report();
     runtime(false).block_on(async {
         if args[1] == "dpdk-h1" {
             let client = Builder::new().build(worker.clone());
@@ -259,5 +313,10 @@ fn dpdk_run(args: &[String]) {
     });
     drop(worker);
     join.wait();
+    #[cfg(feature = "tcp-metrics")]
+    eprintln!(
+        "TCP_METRICS {}",
+        serde_json::to_string(metrics.get().expect("worker metrics missing")).unwrap()
+    );
     dpdk::eal::cleanup();
 }

@@ -11,6 +11,12 @@ pub(crate) fn prepare(packet: &mut Mbuf) -> bool {
     if frame.len() != packet.pkt_len() as usize {
         return false;
     }
+    // Cheap eligibility checks precede parsing/checksumming. Pure ACKs,
+    // control packets and packets with options are handled by the normal
+    // RX path, which still validates their headers and checksums.
+    if !candidate(frame) {
+        return false;
+    }
     let Some(ether) = eth::EthHeader::parse(frame) else {
         return false;
     };
@@ -24,19 +30,12 @@ pub(crate) fn prepare(packet: &mut Mbuf) -> bool {
         return false;
     }
     let end = 14 + ip.total_length as usize;
-    if end > frame.len() || end < 54 {
+    if end != frame.len() {
         return false;
     }
-    if end <= 54 || end != frame.len() || frame[46] != 0x50 || frame[47] != tcp::flags::ACK {
-        return false;
-    }
-    let Some((header, len)) =
-        tcp::TcpHeader::parse(&frame[34..end], ip.src, ip.dst, !packet.rx_l4_cksum_good())
-    else {
-        return false;
-    };
-    // Keep control packets and TCP options out of aggregation. GRO requires ACK-only packets.
-    if header.flags != tcp::flags::ACK || len != 20 || end <= 54 || end != frame.len() {
+    // Eligibility is established, but the TCP checksum must still validate.
+    if tcp::TcpHeader::parse(&frame[34..end], ip.src, ip.dst, !packet.rx_l4_cksum_good()).is_none()
+    {
         return false;
     }
     unsafe {
@@ -52,6 +51,10 @@ pub(crate) fn prepare(packet: &mut Mbuf) -> bool {
     true
 }
 
+fn candidate(frame: &[u8]) -> bool {
+    frame.len() > 54 && frame[14] == 0x45 && frame[46] == 0x50 && frame[47] == tcp::flags::ACK
+}
+
 /// Takes ownership of the input pointers and returns the compacted count.
 /// Callers own exactly the first returned-count pointers afterward.
 pub(crate) unsafe fn merge(packets: &mut [*mut ffi::rte_mbuf], count: usize) -> usize {
@@ -62,4 +65,36 @@ pub(crate) unsafe fn merge(packets: &mut [*mut ffi::rte_mbuf], count: usize) -> 
         socket_id: 0,
     };
     unsafe { ffi::rte_gro_reassemble_burst(packets.as_mut_ptr(), count as u16, &params) as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_controls_options_and_truncation_before_validation() {
+        let mut frame = [0; 55];
+        frame[14] = 0x45;
+        frame[46] = 0x50;
+        frame[47] = tcp::flags::ACK;
+        assert!(candidate(&frame));
+        for length in 0..=54 {
+            assert!(!candidate(&frame[..length]));
+        }
+        for flags in [
+            tcp::flags::SYN,
+            tcp::flags::ACK | tcp::flags::PSH,
+            tcp::flags::ACK | tcp::flags::FIN,
+            tcp::flags::RST,
+        ] {
+            frame[47] = flags;
+            assert!(!candidate(&frame));
+        }
+        frame[47] = tcp::flags::ACK;
+        frame[14] = 0x46;
+        assert!(!candidate(&frame));
+        frame[14] = 0x45;
+        frame[46] = 0x60;
+        assert!(!candidate(&frame));
+    }
 }

@@ -114,6 +114,8 @@ enum Persist {
 }
 
 pub struct Tcb {
+    #[cfg(feature = "tcp-metrics")]
+    metrics_window: Option<(Instant, u8)>,
     pub tuple: FourTuple,
     pub state: TcpState,
 
@@ -204,6 +206,8 @@ impl Tcb {
             peer_mss: FALLBACK_PEER_MSS,
             local_mss: DEFAULT_MSS,
             initial_window_segments: 10,
+            #[cfg(feature = "tcp-metrics")]
+            metrics_window: None,
             tx_payload_limit: 0,
             peer_scale: None,
             retransmit: RetransmitQueue::default(),
@@ -295,6 +299,28 @@ impl Tcb {
     /// The engine applies this before the first SYN and every output poll.
     pub(crate) fn set_local_mss(&mut self, mss: u16) {
         self.local_mss = mss.min(DEFAULT_MSS);
+    }
+
+    #[cfg(feature = "tcp-metrics")]
+    pub(crate) fn record_window_limits(&mut self, now: Instant) {
+        let flight = self.flight_size();
+        let queued = !self.send_buffer.is_empty() && self.state.can_send();
+        let flags = u8::from(queued && flight >= self.congestion.cwnd())
+            | (u8::from(queued && flight >= self.snd_wnd) << 1);
+        super::metrics::record(|m| {
+            m.cwnd_peak_bytes = m.cwnd_peak_bytes.max(u64::from(self.congestion.cwnd()));
+            m.peer_window_peak_bytes = m.peer_window_peak_bytes.max(u64::from(self.snd_wnd));
+            if let Some((then, previous)) = self.metrics_window {
+                let ns = now.saturating_duration_since(then).as_nanos() as u64;
+                if previous & 1 != 0 {
+                    m.cwnd_limited_ns += ns;
+                }
+                if previous & 2 != 0 {
+                    m.peer_window_limited_ns += ns;
+                }
+            }
+        });
+        self.metrics_window = Some((now, flags));
     }
 
     pub(crate) fn set_initial_window(&mut self, segments: u16) {
@@ -629,6 +655,14 @@ impl Tcb {
 
         if ack.gt(self.snd_una) {
             let newly_acked = ack.distance(self.snd_una) as u32;
+            #[cfg(feature = "tcp-metrics")]
+            super::metrics::record(|m| {
+                m.advancing_acks += 1;
+                m.acked_bytes += u64::from(newly_acked);
+                let segments = (newly_acked as usize).div_ceil(usize::from(self.send_mss()).max(1));
+                m.ack_segments[super::metrics::bucket(segments)] += 1;
+                m.acks_over_two_mss += u64::from(newly_acked > 2 * u32::from(self.send_mss()));
+            });
             self.snd_una = ack;
             if let Some(rtt) = self.retransmit.ack_up_to(self.snd_una, now) {
                 self.rto.sample(rtt);
@@ -885,6 +919,8 @@ impl Tcb {
         // SYN-ACK retransmit only while still in SynReceived -- so "carry
         // ACK unless we're in SynSent" correctly distinguishes the two.
         if self.retransmit_now {
+            #[cfg(feature = "tcp-metrics")]
+            super::metrics::record(|m| m.retransmits += 1);
             self.retransmit_now = false;
             if let Some(seg) = self.retransmit.segments.front() {
                 let seq = seg.seq;
@@ -996,7 +1032,16 @@ impl Tcb {
             let seq = self.snd_nxt;
             self.snd_nxt = self.snd_nxt + data.len() as u32;
             self.retransmit.push(seq, data.clone(), false, false, now);
-            out.push(self.make_segment(seq, flags::ACK | flags::PSH, data, None));
+            // PSH only on the segment that empties the buffer. Receive
+            // aggregation (this stack's GRO, Linux GRO, hardware LRO) stops
+            // at a PSH, so setting it on every segment of a bulk write
+            // makes the peer process and acknowledge each one separately.
+            let push = if self.send_buffer.is_empty() {
+                flags::PSH
+            } else {
+                0
+            };
+            out.push(self.make_segment(seq, flags::ACK | push, data, None));
             self.ack_pending = false;
         }
 
@@ -1169,6 +1214,44 @@ mod tests {
         let _ack = tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::Established);
         tcb
+    }
+
+    #[test]
+    fn push_marks_only_the_segment_that_empties_the_send_buffer() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.set_nodelay(true);
+        tcb.send(Bytes::from(vec![0; 4000]));
+        let out = tcb.poll_output(now);
+        assert!(out.len() > 2);
+        let (last, rest) = out.split_last().unwrap();
+        // A PSH on every segment would stop the peer's receive aggregation
+        // at each one.
+        assert!(rest.iter().all(|seg| seg.flags & flags::PSH == 0));
+        assert_ne!(last.flags & flags::PSH, 0);
+    }
+
+    #[cfg(feature = "tcp-metrics")]
+    #[test]
+    fn metrics_track_ack_batches_and_elapsed_window_stalls() {
+        use crate::dpdk::tcp::metrics;
+        metrics::reset();
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.send(Bytes::from(vec![0; 100_000]));
+        tcb.poll_output(now);
+        tcb.record_window_limits(now);
+        let later = now + std::time::Duration::from_micros(10);
+        let ack = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
+        tcb.on_segment(&ack, Bytes::new(), later);
+        tcb.record_window_limits(later);
+        let stats = metrics::snapshot();
+        assert_eq!(stats.cwnd_limited_ns, 10_000);
+        assert_eq!(stats.peer_window_limited_ns, 0);
+        assert_eq!(stats.advancing_acks, 1);
+        assert_eq!(stats.acks_over_two_mss, 1);
+        assert_eq!(stats.ack_segments[metrics::bucket(10)], 1);
+        metrics::reset();
     }
 
     #[test]

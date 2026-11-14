@@ -508,6 +508,8 @@ impl WorkerConn {
 /// number of application threads all opening connections concurrently.
 #[derive(Clone)]
 pub struct WorkerHandle {
+    #[cfg(feature = "tcp-metrics")]
+    metrics: super::metrics::Report,
     send_config: SendConfig,
     ctrl_tx: CtrlTx,
     ready: ReadySender,
@@ -555,6 +557,11 @@ pub struct ConnEndpoints {
 }
 
 impl WorkerHandle {
+    #[cfg(feature = "tcp-metrics")]
+    pub fn metrics_report(&self) -> super::metrics::Report {
+        self.metrics.clone()
+    }
+
     /// Configures future connections opened through this handle. Existing
     /// connections and previously cloned handles retain their settings.
     pub fn with_send_config(mut self, config: SendConfig) -> Self {
@@ -586,7 +593,15 @@ impl WorkerHandle {
         let dma_writes = port.offloads().tso_max_payload > 0;
         let (notifier, app_ready) = app_wake::channel();
 
+        #[cfg(feature = "tcp-metrics")]
+        let metrics = super::metrics::Report::default();
+        #[cfg(feature = "tcp-metrics")]
+        let worker_metrics = metrics.clone();
         let join = dpdk::launch(worker_lcore, move || {
+            #[cfg(feature = "tcp-metrics")]
+            super::metrics::reset();
+            #[cfg(feature = "tcp-metrics")]
+            let started = Instant::now();
             run(
                 engine,
                 port,
@@ -598,10 +613,17 @@ impl WorkerHandle {
                 overflow,
                 notifier,
             );
+            #[cfg(feature = "tcp-metrics")]
+            {
+                super::metrics::record(|m| m.worker_ns = started.elapsed().as_nanos() as u64);
+                let _ = worker_metrics.0.set(super::metrics::snapshot());
+            }
         })?;
 
         Ok((
             WorkerHandle {
+                #[cfg(feature = "tcp-metrics")]
+                metrics,
                 send_config: SendConfig::default(),
                 ctrl_tx,
                 ready,
@@ -738,6 +760,8 @@ fn run(
     let mut work = HashSet::default();
     let mut closing = HashSet::default();
     while !stop.load(Ordering::Acquire) {
+        #[cfg(feature = "tcp-metrics")]
+        super::metrics::record(|m| m.worker_iterations += 1);
         notifier.retry();
         // 1. Register newly opened connections.
         while let Some(nc) = ctrl_rx.pop() {
@@ -838,14 +862,13 @@ fn run(
                 conn.pending_in = Some(b);
             }
             // Pull more only while nothing is stalled.
-            while conn.pending_in.is_none() {
-                let chunk = engine.recv(conn.tuple, RECV_CHUNK);
-                if chunk.is_empty() {
-                    break;
-                }
-                if let Err(Inbound::Data(b)) = conn.push_inbound(Inbound::Data(chunk)) {
-                    conn.pending_in = Some(b);
-                }
+            if conn.pending_in.is_none() {
+                engine.recv_each(conn.tuple, RECV_CHUNK, |chunk| {
+                    if let Err(Inbound::Data(b)) = conn.push_inbound(Inbound::Data(chunk)) {
+                        conn.pending_in = Some(b);
+                    }
+                    conn.pending_in.is_none()
+                });
             }
             // Peer FIN, once buffered data is fully delivered, becomes an
             // EOF terminal. The terminal signal goes out only after all
@@ -1154,6 +1177,8 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = mpsc::channel();
         let handle = WorkerHandle {
+            #[cfg(feature = "tcp-metrics")]
+            metrics: crate::dpdk::tcp::metrics::Report::default(),
             send_config: SendConfig::default(),
             ctrl_tx,
             local_ip: Ipv4Addr::UNSPECIFIED,

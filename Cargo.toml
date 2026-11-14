@@ -65,3 +65,16 @@ pkg-config = "0.3"
 # hyper's server side, for the DPDK TLS stream's end-to-end tests (an
 # in-process h1/h2 server over a fake TCP peer). Test builds only.
 hyper = { version = "1", features = ["server", "http1", "http2"] }
+
+# The stack's per-packet path crosses crate boundaries (bytes, hashbrown,
+# this crate's own modules) dozens of times; whole-program optimization is
+# worth 12-20% of engine CPU time in `bench_library`. Profiles apply only
+# when this crate is the workspace root: a binary that depends on httpio
+# has to set the same in its own Cargo.toml.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
+[features]
+# Diagnostic counters/timers; compiled out of normal builds.
+tcp-metrics = []

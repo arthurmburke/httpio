@@ -38,7 +38,12 @@ pub struct Offloads {
     pub tx_max_segments: usize,
 }
 
+/// Maximum number of packet pointers passed to one driver TX call.
+pub const MAX_TX_BURST: usize = 256;
+pub const DEFAULT_TX_BURST: usize = 64;
+
 pub struct EthPort {
+    tx_burst_limit: usize,
     offloads: Offloads,
     port_id: u16,
     mtu: u32,
@@ -179,6 +184,7 @@ impl EthPort {
         })?;
 
         Ok(Self {
+            tx_burst_limit: DEFAULT_TX_BURST,
             offloads,
             port_id,
             mtu,
@@ -187,8 +193,26 @@ impl EthPort {
         })
     }
 
+    /// Sets the driver TX call size, clamped to MAX_TX_BURST. This never
+    /// waits for a full batch; small writes and control packets go immediately.
+    pub fn set_tx_burst_limit(&mut self, packets: std::num::NonZeroU16) {
+        self.tx_burst_limit = usize::from(packets.get()).min(MAX_TX_BURST);
+    }
+
     pub fn offloads(&self) -> Offloads {
         self.offloads
+    }
+
+    /// Makes the stack behave as if the device had negotiated `offloads`,
+    /// without reconfiguring the device. For benchmarks and tests on
+    /// software devices (`net_ring`), where the harness plays the NIC:
+    /// it must then segment TSO packets and mark received checksums good
+    /// itself. Never use this on a device that carries real traffic.
+    #[doc(hidden)]
+    pub fn emulate_offloads(&mut self, offloads: Offloads) {
+        self.offloads = offloads;
+        self.tx_cksum_offload = offloads.tx_checksum;
+        self.rx_cksum_offload = offloads.rx_checksum;
     }
 
     /// Whether IPv4 + TCP TX checksum offload is active on this port. When
@@ -219,6 +243,24 @@ impl EthPort {
         self.rx_packets(max).collect()
     }
 
+    /// Receives up to `out.len()` packets into caller storage and returns
+    /// the filled prefix. The caller owns every returned packet and must
+    /// convert each to an [`Mbuf`] (or free it) exactly once. Unlike
+    /// [`EthPort::rx_packets`] this initializes and moves nothing, which
+    /// is what an idle poll costs.
+    pub(crate) fn rx_burst_raw<'a>(
+        &self,
+        out: &'a mut [std::mem::MaybeUninit<*mut ffi::rte_mbuf>],
+    ) -> &'a mut [*mut ffi::rte_mbuf] {
+        let max = out.len().min(usize::from(u16::MAX)) as u16;
+        // SAFETY: `out` has room for `max` pointers; the driver writes the
+        // first `received` of them.
+        unsafe {
+            let received = ffi::rte_eth_rx_burst(self.port_id, 0, out.as_mut_ptr().cast(), max);
+            std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), usize::from(received))
+        }
+    }
+
     /// Allocation-free RX batch. Unconsumed packets are freed on drop.
     pub fn rx_packets(&self, max: usize) -> impl ExactSizeIterator<Item = Mbuf> {
         let mut packets: [Option<Mbuf>; 64] = std::array::from_fn(|_| None);
@@ -241,14 +283,26 @@ impl EthPort {
     /// Keeps the caller's allocation; removes only packets owned by the NIC.
     pub fn tx_burst_in_place(&self, mbufs: &mut Vec<Mbuf>) {
         let mut accepted = 0;
+        let mut raw = [ptr::null_mut(); MAX_TX_BURST];
         while accepted < mbufs.len() {
-            let n = (mbufs.len() - accepted).min(64);
-            let mut raw = [ptr::null_mut(); 64];
+            let n = (mbufs.len() - accepted).min(self.tx_burst_limit);
             for (dst, packet) in raw.iter_mut().zip(&mbufs[accepted..accepted + n]) {
                 *dst = packet.as_raw();
             }
+            #[cfg(feature = "tcp-metrics")]
+            let metrics_start = std::time::Instant::now();
             let sent = unsafe { ffi::rte_eth_tx_burst(self.port_id, 0, raw.as_mut_ptr(), n as u16) }
                 as usize;
+            #[cfg(feature = "tcp-metrics")]
+            super::tcp::metrics::record(|m| {
+                m.tx_calls += 1;
+                m.tx_requested += n as u64;
+                m.tx_accepted += sent as u64;
+                m.tx_partial_calls += u64::from(sent < n);
+                m.tx_zero_calls += u64::from(sent == 0);
+                m.tx_batches[super::tcp::metrics::bucket(n)] += 1;
+                m.tx_driver_ns += metrics_start.elapsed().as_nanos() as u64;
+            });
             accepted += sent;
             if sent < n {
                 break;

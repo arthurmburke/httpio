@@ -100,53 +100,57 @@ fn engine_transmits_window_updates_and_final_reset() {
     {
         let pool =
             Mempool::create("engine-test", 4095, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
-        let port = EthPort::init(0, &pool, 128, 128, 1500, 0).unwrap();
-        // Partial transmission must retain the unsent suffix and free all
-        // received/abandoned buffers, without allocating batch storage.
-        let available = unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) };
-        let mut batch: Vec<_> = (0..2048u16)
-            .map(|id| {
-                let mut packet = Mbuf::alloc(&pool).unwrap();
-                packet.append(2).unwrap().copy_from_slice(&id.to_be_bytes());
-                packet
-            })
-            .collect();
-        let capacity = batch.capacity();
-        let (_, count) = count_allocations(|| port.tx_burst_in_place(&mut batch));
-        assert_eq!(count, 0);
-        assert!(!batch.is_empty(), "expected virtual ring backpressure");
-        let sent = 2048 - batch.len();
-        assert!(sent > 0);
-        assert_eq!(batch.capacity(), capacity);
-        assert_eq!(batch[0].data(), &(sent as u16).to_be_bytes());
-        let (_, count) = count_allocations(|| {
-            let mut received = 0;
-            while received < sent {
-                let packets = port.rx_packets(64);
-                assert!(packets.len() > 0);
-                for packet in packets {
-                    assert_eq!(packet.data(), &(received as u16).to_be_bytes());
-                    received += 1;
+        let mut port = EthPort::init(0, &pool, 128, 128, 1500, 0).unwrap();
+        for burst in [1, 32, 64, 128, 256, u16::MAX] {
+            port.set_tx_burst_limit(std::num::NonZeroU16::new(burst).unwrap());
+            // Partial transmission must retain the unsent suffix and free all
+            // received/abandoned buffers, without allocating batch storage.
+            let available = unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) };
+            let mut batch: Vec<_> = (0..2048u16)
+                .map(|id| {
+                    let mut packet = Mbuf::alloc(&pool).unwrap();
+                    packet.append(2).unwrap().copy_from_slice(&id.to_be_bytes());
+                    packet
+                })
+                .collect();
+            let capacity = batch.capacity();
+            let (_, count) = count_allocations(|| port.tx_burst_in_place(&mut batch));
+            assert_eq!(count, 0);
+            assert!(!batch.is_empty(), "expected virtual ring backpressure");
+            let sent = 2048 - batch.len();
+            assert!(sent > 0);
+            assert_eq!(batch.capacity(), capacity);
+            assert_eq!(batch[0].data(), &(sent as u16).to_be_bytes());
+            let (_, count) = count_allocations(|| {
+                let mut received = 0;
+                while received < sent {
+                    let packets = port.rx_packets(64);
+                    assert!(packets.len() > 0);
+                    for packet in packets {
+                        assert_eq!(packet.data(), &(received as u16).to_be_bytes());
+                        received += 1;
+                    }
                 }
+            });
+            assert_eq!(count, 0);
+            batch.clear();
+            assert_eq!(
+                unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },
+                available
+            );
+            for _ in 0..4 {
+                batch.push(Mbuf::alloc(&pool).unwrap());
             }
-        });
-        assert_eq!(count, 0);
-        batch.clear();
-        assert_eq!(
-            unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },
-            available
-        );
-        for _ in 0..4 {
-            batch.push(Mbuf::alloc(&pool).unwrap());
+            port.tx_burst_in_place(&mut batch);
+            let mut packets = port.rx_packets(64);
+            drop(packets.next());
+            drop(packets); // Drop the unconsumed suffix too.
+            assert_eq!(
+                unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },
+                available
+            );
         }
-        port.tx_burst_in_place(&mut batch);
-        let mut packets = port.rx_packets(64);
-        drop(packets.next());
-        drop(packets); // Drop the unconsumed suffix too.
-        assert_eq!(
-            unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },
-            available
-        );
+        port.set_tx_burst_limit(std::num::NonZeroU16::new(64).unwrap());
 
         let mut engine = TcpEngine::new(EngineConfig {
             local_ip: LOCAL_IP,
