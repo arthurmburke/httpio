@@ -6,7 +6,7 @@ use crate::core::hashmap::HashMap;
 use std::time::Instant;
 
 #[derive(Default)]
-pub(super) struct Timers {
+pub struct Timers {
     heap: Vec<(Instant, FourTuple)>,
     positions: HashMap<FourTuple, usize>,
 }

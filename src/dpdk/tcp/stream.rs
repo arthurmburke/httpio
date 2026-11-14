@@ -385,7 +385,7 @@ impl TcpStream {
     /// packets without copying them (see [`DmaWriter`]). A layer that
     /// produces its own output, such as TLS encryption, writes it into DMA
     /// memory exactly when this holds, else onto the ordinary heap.
-    pub(crate) fn dma_writes(&self) -> bool {
+    pub fn dma_writes(&self) -> bool {
         self.writer.is_some()
     }
 
@@ -843,7 +843,7 @@ impl TcpStream {
     /// [`poll_send`](Self::poll_send) should come from the ordinary heap.
     /// For callers that generate their bytes (e.g. masking) and want to
     /// write them once, straight into memory the engine can transmit.
-    pub(crate) fn dma_writer(&mut self) -> Option<&mut DmaWriter> {
+    pub fn dma_writer(&mut self) -> Option<&mut DmaWriter> {
         self.writer.as_mut()
     }
 
@@ -878,35 +878,13 @@ impl TcpStream {
 // no explicit teardown message is needed here.
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use crate::dpdk::tcp::worker::SendCredit;
-    use crate::dpdk::tcp::worker::inbound_channel;
-    use crate::dpdk::tcp::worker::{CmdRx, InboundTx, SEND_CAPACITY, command_channel};
-
-    pub(crate) fn fixture() -> (TcpStream, CmdRx, InboundTx, Arc<SendCredit>) {
-        let (cmd_tx, cmd_rx, credit) = command_channel();
-        let (inbound_tx, inbound_rx) = inbound_channel(credit.clone());
-        (
-            TcpStream {
-                cmd_tx,
-                inbound_rx,
-                flush: None,
-                wake: None,
-                state: StreamState::Open,
-                read_queue: VecDeque::new(),
-                writer: None,
-                lent: LentBody::Empty,
-            },
-            cmd_rx,
-            inbound_tx,
-            credit,
-        )
-    }
+    use crate::dpdk::tcp::worker::{CmdRx, InboundTx, SEND_CAPACITY};
 
     #[test]
     fn writes_stop_at_byte_limit_even_after_worker_drains_ring() {
-        let (mut stream, rx, _tx, credit) = fixture();
+        let (mut stream, rx, _tx, credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let data = vec![42; SEND_CAPACITY + 10];
         assert!(matches!(
@@ -932,7 +910,7 @@ pub(crate) mod tests {
 
     #[test]
     fn owned_send_preserves_suffix_and_order_across_credit_stalls() {
-        let (mut stream, rx, _tx, credit) = fixture();
+        let (mut stream, rx, _tx, credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         let original = Bytes::from(vec![7; SEND_CAPACITY + 3]);
         let mut data = Some(original.clone());
@@ -959,7 +937,7 @@ pub(crate) mod tests {
 
     #[test]
     fn repeated_writes_cannot_drain_unread_data_or_skip_terminal_message() {
-        let (mut stream, _rx, tx, _credit) = fixture();
+        let (mut stream, _rx, tx, _credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         for b in [b"first".as_slice(), b"second".as_slice()] {
             assert!(tx.push(Inbound::Data(Bytes::copy_from_slice(b))).is_ok());
@@ -988,7 +966,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reset_unblocks_writer_even_with_unread_data() {
-        let (mut stream, _rx, tx, credit) = fixture();
+        let (mut stream, _rx, tx, credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(
             tx.push(Inbound::Data(Bytes::from_static(b"unread")))
@@ -1006,7 +984,7 @@ pub(crate) mod tests {
 
     #[test]
     fn partial_read_keeps_only_one_staged_chunk() {
-        let (mut stream, _rx, tx, _) = fixture();
+        let (mut stream, _rx, tx, _) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(tx.push(Inbound::Data(Bytes::from_static(b"abcd"))).is_ok());
         assert!(tx.push(Inbound::Data(Bytes::from_static(b"ef"))).is_ok());
@@ -1030,7 +1008,7 @@ pub(crate) mod tests {
         crate::dpdk::tcp::app_wake::AppNotifier,
         Arc<AppWake>,
     ) {
-        let (mut stream, cmd_rx, inbound_tx, _credit) = fixture();
+        let (mut stream, cmd_rx, inbound_tx, _credit) = TcpStream::test_stream();
         let (notifier, ready) = crate::dpdk::tcp::app_wake::channel();
         let wake = ready.wake_handle();
         stream.wake = Some(Parker(wake.clone()));
@@ -1139,7 +1117,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_vectored_write_gathers_its_slices_into_one_send() {
-        let (mut stream, rx, _tx, _credit) = fixture();
+        let (mut stream, rx, _tx, _credit) = TcpStream::test_stream();
         assert!(stream.is_write_vectored());
         assert!(matches!(
             write_vectored(&mut stream, &[b"head", b"", b"body", b"tail"]),
@@ -1157,7 +1135,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_vectored_write_stops_mid_slice_at_the_byte_limit_and_resumes_in_order() {
-        let (mut stream, rx, _tx, credit) = fixture();
+        let (mut stream, rx, _tx, credit) = TcpStream::test_stream();
         credit.bytes.fetch_add(SEND_CAPACITY - 6, Ordering::AcqRel);
         assert!(matches!(
             write_vectored(&mut stream, &[b"abcd", b"efgh", b"ij"]),
@@ -1177,7 +1155,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_vectored_write_stops_when_the_ring_fills_and_stages_nothing_on_pending() {
-        let (mut stream, rx, _tx, _credit) = fixture();
+        let (mut stream, rx, _tx, _credit) = TcpStream::test_stream();
         let body = Bytes::from(vec![9; 100]);
         stream.lend_body(&body);
         // Leave room for exactly one command.
@@ -1206,7 +1184,7 @@ pub(crate) mod tests {
 
     #[test]
     fn lent_body_slices_go_out_uncopied_across_credit_stalls() {
-        let (mut stream, rx, _tx, credit) = fixture();
+        let (mut stream, rx, _tx, credit) = TcpStream::test_stream();
         let body = Bytes::from(vec![5; SEND_CAPACITY + 100]);
         stream.lend_body(&body);
         let head = b"POST / HTTP/1.1\r\n\r\n";
@@ -1270,7 +1248,7 @@ pub(crate) mod tests {
 
     #[test]
     fn slices_outside_the_lent_body_are_copied() {
-        let (mut stream, rx, _tx, _credit) = fixture();
+        let (mut stream, rx, _tx, _credit) = TcpStream::test_stream();
         let body = Bytes::from(vec![1; 64]);
         stream.lend_body(&body);
         // Same contents, different memory.
@@ -1313,7 +1291,7 @@ pub(crate) mod tests {
         use http_body_util::Full;
         use hyper_util::rt::TokioIo;
 
-        let (mut stream, rx, _tx, _credit) = fixture();
+        let (mut stream, rx, _tx, _credit) = TcpStream::test_stream();
         let body = Bytes::from(vec![b'x'; 100 * 1024]);
         stream.lend_body(&body);
         let runtime = tokio::runtime::Builder::new_current_thread()

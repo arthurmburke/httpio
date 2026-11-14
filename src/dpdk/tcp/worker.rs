@@ -615,8 +615,8 @@ impl WorkerHandle {
             );
             #[cfg(feature = "tcp-metrics")]
             {
-                super::metrics::record(|m| m.worker_ns = started.elapsed().as_nanos() as u64);
-                let _ = worker_metrics.0.set(super::metrics::snapshot());
+                crate::dpdk::metrics::record(|m| m.worker_ns = started.elapsed().as_nanos() as u64);
+                crate::dpdk::metrics::publish(&worker_metrics);
             }
         })?;
 
@@ -761,7 +761,7 @@ fn run(
     let mut closing = HashSet::default();
     while !stop.load(Ordering::Acquire) {
         #[cfg(feature = "tcp-metrics")]
-        super::metrics::record(|m| m.worker_iterations += 1);
+        crate::dpdk::metrics::record(|m| m.worker_iterations += 1);
         notifier.retry();
         // 1. Register newly opened connections.
         while let Some(nc) = ctrl_rx.pop() {

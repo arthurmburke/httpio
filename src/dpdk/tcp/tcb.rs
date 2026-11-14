@@ -252,7 +252,8 @@ impl Tcb {
         tcb
     }
 
-    pub(crate) fn set_peer_scale(&mut self, scale: Option<u8>) {
+    /// Records the window scale announced by the peer, capped at 14.
+    pub fn set_peer_scale(&mut self, scale: Option<u8>) {
         self.peer_scale = scale.map(|v| v.min(14));
     }
     fn receive_capacity(&self) -> u32 {
@@ -270,10 +271,13 @@ impl Tcb {
                 self.peer_scale.unwrap_or(0)
             }
     }
-    pub(crate) fn send_mss(&self) -> u16 {
+    /// Maximum TCP segment payload allowed by both endpoints.
+    pub fn send_mss(&self) -> u16 {
         self.peer_mss.min(self.local_mss)
     }
-    pub(crate) fn set_tx_payload_limit(&mut self, limit: usize) {
+    /// Sets the maximum combined payload for TCP segmentation offload.
+    /// Pass zero to disable offload.
+    pub fn set_tx_payload_limit(&mut self, limit: usize) {
         self.tx_payload_limit = limit;
     }
 
@@ -287,7 +291,8 @@ impl Tcb {
 
     // ---- application-facing operations ---------------------------------
 
-    pub(crate) fn buffered_send_bytes(&self) -> usize {
+    /// Bytes queued for transmission or still awaiting acknowledgment.
+    pub fn buffered_send_bytes(&self) -> usize {
         self.send_buffer.len() + self.retransmit.payload_bytes()
     }
 
@@ -297,7 +302,7 @@ impl Tcb {
 
     /// Bound segmentation by the local link and single-mbuf capacity.
     /// The engine applies this before the first SYN and every output poll.
-    pub(crate) fn set_local_mss(&mut self, mss: u16) {
+    pub fn set_local_mss(&mut self, mss: u16) {
         self.local_mss = mss.min(DEFAULT_MSS);
     }
 
@@ -307,7 +312,7 @@ impl Tcb {
         let queued = !self.send_buffer.is_empty() && self.state.can_send();
         let flags = u8::from(queued && flight >= self.congestion.cwnd())
             | (u8::from(queued && flight >= self.snd_wnd) << 1);
-        super::metrics::record(|m| {
+        crate::dpdk::metrics::record(|m| {
             m.cwnd_peak_bytes = m.cwnd_peak_bytes.max(u64::from(self.congestion.cwnd()));
             m.peer_window_peak_bytes = m.peer_window_peak_bytes.max(u64::from(self.snd_wnd));
             if let Some((then, previous)) = self.metrics_window {
@@ -323,7 +328,12 @@ impl Tcb {
         self.metrics_window = Some((now, flags));
     }
 
-    pub(crate) fn set_initial_window(&mut self, segments: u16) {
+    /// Sets the initial congestion window in segments for an active open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the connection is outside SYN-SENT or `segments` is zero.
+    pub fn set_initial_window(&mut self, segments: u16) {
         assert!(segments > 0);
         // Only configure active opens before the SYN/SYN-ACK exchange.
         assert_eq!(self.state, TcpState::SynSent);
@@ -402,21 +412,13 @@ impl Tcb {
     /// [`Mbuf::into_bytes`](crate::dpdk::Mbuf::into_bytes)); if accepted it
     /// moves into the reassembly buffer without being copied.
     pub fn on_segment(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
-        self.on_segment_with(hdr, payload.len(), || payload, now);
+        self.on_segment_chunks_with(hdr, payload.len(), || std::iter::once(payload), now);
     }
 
-    /// Materialize payload ownership only after TCP accepts the segment.
-    pub(crate) fn on_segment_with(
-        &mut self,
-        hdr: &TcpHeader,
-        payload_len: usize,
-        payload: impl FnOnce() -> Bytes,
-        now: Instant,
-    ) {
-        self.on_segment_chunks_with(hdr, payload_len, || std::iter::once(payload()), now);
-    }
-
-    pub(crate) fn on_segment_chunks_with<I: IntoIterator<Item = Bytes>>(
+    /// Processes an incoming segment whose payload spans multiple chunks.
+    /// `payload_len` must equal the total length of those chunks. The closure
+    /// runs only if TCP accepts some of the payload.
+    pub fn on_segment_chunks_with<I: IntoIterator<Item = Bytes>>(
         &mut self,
         hdr: &TcpHeader,
         payload_len: usize,
@@ -656,11 +658,11 @@ impl Tcb {
         if ack.gt(self.snd_una) {
             let newly_acked = ack.distance(self.snd_una) as u32;
             #[cfg(feature = "tcp-metrics")]
-            super::metrics::record(|m| {
+            crate::dpdk::metrics::record(|m| {
                 m.advancing_acks += 1;
                 m.acked_bytes += u64::from(newly_acked);
                 let segments = (newly_acked as usize).div_ceil(usize::from(self.send_mss()).max(1));
-                m.ack_segments[super::metrics::bucket(segments)] += 1;
+                m.ack_segments[crate::dpdk::metrics::bucket(segments)] += 1;
                 m.acks_over_two_mss += u64::from(newly_acked > 2 * u32::from(self.send_mss()));
             });
             self.snd_una = ack;
@@ -920,7 +922,7 @@ impl Tcb {
         // ACK unless we're in SynSent" correctly distinguishes the two.
         if self.retransmit_now {
             #[cfg(feature = "tcp-metrics")]
-            super::metrics::record(|m| m.retransmits += 1);
+            crate::dpdk::metrics::record(|m| m.retransmits += 1);
             self.retransmit_now = false;
             if let Some(seg) = self.retransmit.segments.front() {
                 let seq = seg.seq;
@@ -1143,7 +1145,7 @@ impl Tcb {
 
     /// Earliest armed timer. Locally queued transmissions have no RTO
     /// until NIC acceptance; the engine retries those through its ready set.
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+    pub fn next_deadline(&self) -> Option<Instant> {
         if self.is_closed() {
             return None;
         }
@@ -1234,7 +1236,7 @@ mod tests {
     #[cfg(feature = "tcp-metrics")]
     #[test]
     fn metrics_track_ack_batches_and_elapsed_window_stalls() {
-        use crate::dpdk::tcp::metrics;
+        use crate::dpdk::metrics;
         metrics::reset();
         let now = Instant::now();
         let mut tcb = establish(now);

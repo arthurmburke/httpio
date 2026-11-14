@@ -1,9 +1,9 @@
 //! Burst-local TCP/IPv4 GRO. Validate each original packet before DPDK
 //! merges it: merged checksums are intentionally not recomputed by GRO.
-use super::{eth, ipv4, tcp};
+use crate::dpdk::net::{eth, ipv4, tcp};
 use crate::dpdk::{Mbuf, ffi};
 
-pub(crate) fn prepare(packet: &mut Mbuf) -> bool {
+pub fn prepare(packet: &mut Mbuf) -> bool {
     if packet.rx_ip_cksum_bad() || packet.rx_l4_cksum_bad() {
         return false;
     }
@@ -57,7 +57,7 @@ fn candidate(frame: &[u8]) -> bool {
 
 /// Takes ownership of the input pointers and returns the compacted count.
 /// Callers own exactly the first returned-count pointers afterward.
-pub(crate) unsafe fn merge(packets: &mut [*mut ffi::rte_mbuf], count: usize) -> usize {
+pub unsafe fn merge(packets: &mut [*mut ffi::rte_mbuf], count: usize) -> usize {
     let params = ffi::rte_gro_param {
         gro_types: ffi::RTE_GRO_TCP_IPV4 as u64,
         max_flow_num: 64,

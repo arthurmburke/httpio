@@ -20,7 +20,7 @@ pub fn sum16(data: &[u8], seed: u32) -> u32 {
         sum += (*last as u32) << 8;
     }
     #[cfg(feature = "tcp-metrics")]
-    crate::dpdk::tcp::metrics::record(|m| {
+    crate::dpdk::metrics::record(|m| {
         m.checksum_calls += 1;
         m.checksum_bytes += data.len() as u64;
         m.checksum_ns += metrics_start.elapsed().as_nanos() as u64;

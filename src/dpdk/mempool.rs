@@ -12,7 +12,7 @@ use super::ffi;
 pub const DEFAULT_MBUF_DATA_ROOM_SIZE: u16 = 2048 + 128;
 
 pub struct Mempool {
-    pub(super) raw: *mut ffi::rte_mempool,
+    raw: *mut ffi::rte_mempool,
     data_room_size: u16,
 }
 

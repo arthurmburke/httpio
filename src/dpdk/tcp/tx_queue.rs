@@ -199,7 +199,7 @@ impl Payload {
     }
 
     /// Checksum over fragmented payload, preserving odd-byte boundaries.
-    pub(crate) fn checksum_sum(&self, mut sum: u32) -> u16 {
+    pub fn checksum_sum(&self, mut sum: u32) -> u16 {
         // A fragment of odd length leaves its last byte as the high half
         // of a word that the next fragment's first byte completes.
         let mut high: Option<u8> = None;

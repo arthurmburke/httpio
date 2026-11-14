@@ -294,13 +294,13 @@ impl EthPort {
             let sent = unsafe { ffi::rte_eth_tx_burst(self.port_id, 0, raw.as_mut_ptr(), n as u16) }
                 as usize;
             #[cfg(feature = "tcp-metrics")]
-            super::tcp::metrics::record(|m| {
+            super::metrics::record(|m| {
                 m.tx_calls += 1;
                 m.tx_requested += n as u64;
                 m.tx_accepted += sent as u64;
                 m.tx_partial_calls += u64::from(sent < n);
                 m.tx_zero_calls += u64::from(sent == 0);
-                m.tx_batches[super::tcp::metrics::bucket(n)] += 1;
+                m.tx_batches[super::metrics::bucket(n)] += 1;
                 m.tx_driver_ns += metrics_start.elapsed().as_nanos() as u64;
             });
             accepted += sent;

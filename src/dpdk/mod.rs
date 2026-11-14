@@ -9,6 +9,8 @@ pub mod http;
 pub mod lcore;
 pub mod mbuf;
 pub mod mempool;
+#[cfg(feature = "tcp-metrics")]
+mod metrics;
 pub mod net;
 pub mod port;
 pub mod tcp;

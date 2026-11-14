@@ -9,6 +9,8 @@
 //! minimal built-in ARP responder/resolver. With no gateway configured,
 //! every peer is assumed to be on the local Ethernet segment.
 
+mod gro;
+
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
@@ -325,7 +327,8 @@ impl TcpEngine {
         self.accept_queues.get_mut(&port)?.pop_front()
     }
 
-    pub(crate) fn buffered_send_bytes(&self, tuple: FourTuple) -> usize {
+    /// Bytes queued for transmission or still awaiting acknowledgment.
+    pub fn buffered_send_bytes(&self, tuple: FourTuple) -> usize {
         self.connections
             .get(&tuple)
             .map_or(0, |c| c.tcb.buffered_send_bytes())
@@ -373,7 +376,7 @@ impl TcpEngine {
 
     /// Hands every readable chunk to `deliver` until it returns `false` or
     /// nothing is left, with one connection lookup for the whole run.
-    pub(crate) fn recv_each(
+    pub fn recv_each(
         &mut self,
         tuple: FourTuple,
         max_len: usize,
@@ -413,7 +416,13 @@ impl TcpEngine {
         }
     }
 
-    pub(crate) fn set_initial_window(&mut self, tuple: FourTuple, segments: u16) {
+    /// Sets the initial congestion window for an active open before its
+    /// handshake completes. An unknown connection is ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a tracked connection is outside SYN-SENT or `segments` is zero.
+    pub fn set_initial_window(&mut self, tuple: FourTuple, segments: u16) {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             conn.tcb.set_initial_window(segments);
         }
@@ -492,7 +501,7 @@ impl TcpEngine {
             // each slot is converted once: here, or by `handle_gro` after
             // `into_raw` gives it back to the slot's pointer.
             let mut mbuf = unsafe { Mbuf::from_raw(burst[i]) };
-            if self.rx_gro && super::super::net::gro::prepare(&mut mbuf) {
+            if self.rx_gro && gro::prepare(&mut mbuf) {
                 let _ = mbuf.into_raw();
                 continue;
             }
@@ -575,7 +584,7 @@ impl TcpEngine {
             let room = MAX_PENDING_TX.saturating_sub(self.tx_batch.len() + self.pending_tx.len());
             #[cfg(feature = "tcp-metrics")]
             if conn.queued_tx != 0 {
-                super::metrics::record(|m| m.queued_tx_skips += 1);
+                crate::dpdk::metrics::record(|m| m.queued_tx_skips += 1);
             }
             if conn.queued_tx != 0 || room == 0 {
                 continue;
@@ -601,10 +610,10 @@ impl TcpEngine {
             conn.tcb
                 .poll_output_queued(now, &mut self.segments, room.min(output_budget));
             #[cfg(feature = "tcp-metrics")]
-            super::metrics::record(|m| {
+            crate::dpdk::metrics::record(|m| {
                 let n = self.segments.len();
                 if n > 0 {
-                    m.output_batches[super::metrics::bucket(n)] += 1;
+                    m.output_batches[crate::dpdk::metrics::bucket(n)] += 1;
                 }
                 m.output_packets += n as u64;
                 m.output_budget_exhausted +=
@@ -691,7 +700,9 @@ impl TcpEngine {
         // NIC acceptance can arm/restart RTO, so schedule only after TX.
         self.reschedule_processed(now);
         #[cfg(feature = "tcp-metrics")]
-        super::metrics::record(|m| m.engine_poll_ns += metrics_start.elapsed().as_nanos() as u64);
+        crate::dpdk::metrics::record(|m| {
+            m.engine_poll_ns += metrics_start.elapsed().as_nanos() as u64
+        });
     }
 
     /// Takes ownership of every packet in `packets`.
@@ -701,7 +712,7 @@ impl TcpEngine {
             return;
         }
         let merged = if count > 1 {
-            unsafe { super::super::net::gro::merge(packets, count) }
+            unsafe { gro::merge(packets, count) }
         } else {
             count
         };
@@ -750,13 +761,14 @@ impl TcpEngine {
         self.tx_batch.len() + self.pending_tx.len()
     }
 
-    pub(crate) fn updated_connections(&self) -> &[FourTuple] {
+    /// Connections processed during the most recent engine poll.
+    pub fn updated_connections(&self) -> &[FourTuple] {
         &self.updated
     }
 
     fn flush_tx(&mut self, port: &EthPort, pool: &Mempool, now: Instant) {
         #[cfg(feature = "tcp-metrics")]
-        super::metrics::record(|m| {
+        crate::dpdk::metrics::record(|m| {
             m.pending_tx_peak = m.pending_tx_peak.max(self.pending_tx_len() as u64)
         });
         while let Some(packet) = self.pending_tx.front() {
@@ -775,7 +787,7 @@ impl TcpEngine {
                 port.offloads().tx_max_segments,
             );
             #[cfg(feature = "tcp-metrics")]
-            super::metrics::record(|m| {
+            crate::dpdk::metrics::record(|m| {
                 m.packet_build_calls += 1;
                 m.packet_build_failures += u64::from(built.is_none());
                 m.packet_build_ns += metrics_start.elapsed().as_nanos() as u64;
@@ -1374,7 +1386,7 @@ mod tests {
 
     #[test]
     fn native_chains_tso_and_gro_preserve_payload_and_reclaim_pool() {
-        use crate::dpdk::net::{checksum, gro};
+        use crate::dpdk::net::checksum;
         use crate::dpdk::{eal, ffi};
         let cpu = unsafe { libc::sched_getcpu() };
         eal::init(&[

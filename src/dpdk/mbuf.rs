@@ -67,7 +67,7 @@ impl Mbuf {
 
     /// DMA-contiguous prefix of EAL-managed memory, capped by mbuf buf_len.
     /// Ordinary Rust heap memory is deliberately not treated as DMA mapped.
-    pub(crate) fn dma_prefix(data: &[u8]) -> Option<(usize, u64)> {
+    pub fn dma_prefix(data: &[u8]) -> Option<(usize, u64)> {
         if data.is_empty() || !eal_memory_span().contains(&(data.as_ptr() as usize)) {
             return None;
         }
@@ -210,7 +210,7 @@ impl Mbuf {
     }
 
     /// Internet checksum sum over a byte range, carrying odd bytes across segments.
-    pub(crate) fn checksum_sum(&self, start: usize, len: usize, mut sum: u32) -> u32 {
+    pub fn checksum_sum(&self, start: usize, len: usize, mut sum: u32) -> u32 {
         let mut skip = start;
         let mut remaining = len;
         let mut high = None;

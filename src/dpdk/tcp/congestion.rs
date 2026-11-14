@@ -29,7 +29,13 @@ impl CongestionControl {
         Self::with_initial_window(mss, 10)
     }
 
-    pub(crate) fn with_initial_window(mss: u16, segments: u16) -> Self {
+    /// Starts with the given number of MSS-sized segments.
+    /// Ten segments uses the RFC 6928 byte cap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `segments` is zero.
+    pub fn with_initial_window(mss: u16, segments: u16) -> Self {
         assert!(segments > 0);
         let mss = mss as u32;
         Self {

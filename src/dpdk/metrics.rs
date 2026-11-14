@@ -43,7 +43,7 @@ pub struct Metrics {
 
 thread_local! { static LOCAL: RefCell<Metrics> = RefCell::new(Metrics::default()); }
 
-pub(crate) fn record(f: impl FnOnce(&mut Metrics)) {
+pub fn record(f: impl FnOnce(&mut Metrics)) {
     LOCAL.with_borrow_mut(f);
 }
 /// Clear diagnostics on the calling thread, including directly driven engines.
@@ -55,7 +55,7 @@ pub fn reset() {
 pub fn snapshot() -> Metrics {
     LOCAL.with_borrow(Clone::clone)
 }
-pub(crate) fn bucket(n: usize) -> usize {
+pub fn bucket(n: usize) -> usize {
     if n <= 1 {
         0
     } else {
@@ -66,11 +66,15 @@ pub(crate) fn bucket(n: usize) -> usize {
 /// Does not keep a worker alive. Populated once the worker stops; read after
 /// dropping its handles and waiting for its WorkerJoin.
 #[derive(Clone, Default)]
-pub struct Report(pub(crate) Arc<OnceLock<Metrics>>);
+pub struct Report(Arc<OnceLock<Metrics>>);
 impl Report {
     pub fn get(&self) -> Option<&Metrics> {
         self.0.get()
     }
+}
+
+pub fn publish(report: &Report) {
+    let _ = report.0.set(snapshot());
 }
 
 #[cfg(test)]

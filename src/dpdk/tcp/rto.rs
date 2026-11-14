@@ -83,7 +83,7 @@ pub struct UnackedSegment {
     /// generate an RTT sample when it's finally acked.
     pub retransmitted: bool,
     pub retransmit_count: u32,
-    pub(crate) pending_transmit: bool,
+    pending_transmit: bool,
 }
 
 impl UnackedSegment {

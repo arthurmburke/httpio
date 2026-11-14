@@ -1044,7 +1044,6 @@ mod tests {
     use rustls::ServerConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use crate::dpdk::tcp::stream::tests::fixture;
     use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundTx, SendCredit};
 
     const CA: &[u8] = include_bytes!("tls_testdata/ca.pem");
@@ -1170,7 +1169,7 @@ mod tests {
     }
 
     fn pair(segments: &[usize]) -> (TcpStream, Peer) {
-        let (tcp, cmd_rx, inbound_tx, credit) = fixture();
+        let (tcp, cmd_rx, inbound_tx, credit) = TcpStream::test_stream();
         let peer = Peer {
             cmd_rx,
             inbound_tx,

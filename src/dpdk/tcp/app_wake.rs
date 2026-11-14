@@ -69,7 +69,7 @@ const IDLE_TURNS_BEFORE_EXIT: u32 = 4096;
 
 /// The application side of one worker's ready list, shared by its streams
 /// and its driver task.
-pub(crate) struct AppReady {
+pub struct AppReady {
     /// Popped only by the driver; the lock makes that safe to express and
     /// is never contended (`running` admits one driver at a time).
     rx: SpinLock<SpscRx<Arc<AppWake>, READY_CAP>>,
@@ -81,7 +81,7 @@ pub(crate) struct AppReady {
 
 /// One connection's wake-up state, shared by its `TcpStream`, the worker
 /// and (while a notification is in flight) the ready ring.
-pub(crate) struct AppWake {
+pub struct AppWake {
     ready: Arc<AppReady>,
     waker: SpinLock<Option<Waker>>,
     /// A notification for this connection is on its way to the driver.
@@ -89,14 +89,14 @@ pub(crate) struct AppWake {
 }
 
 /// The worker's end: pushes changed connections to the driver.
-pub(crate) struct AppNotifier {
+pub struct AppNotifier {
     tx: SpscTx<Arc<AppWake>, READY_CAP>,
     ready: Arc<AppReady>,
     /// Notifications the ring had no room for, oldest first.
     backlog: VecDeque<Arc<AppWake>>,
 }
 
-pub(crate) fn channel() -> (AppNotifier, Arc<AppReady>) {
+pub fn channel() -> (AppNotifier, Arc<AppReady>) {
     let (tx, rx) = spsc::channel();
     let ready = Arc::new(AppReady {
         rx: SpinLock::new(rx),
@@ -117,7 +117,7 @@ impl AppNotifier {
     /// Tells the application that `wake`'s connection changed. Call it
     /// *after* making the change visible (pushing to a ring, storing a
     /// flag). Coalesces: a connection already queued is not queued again.
-    pub(crate) fn notify(&mut self, wake: &Arc<AppWake>) {
+    pub fn notify(&mut self, wake: &Arc<AppWake>) {
         if wake.queued.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -129,7 +129,7 @@ impl AppNotifier {
     }
 
     /// Moves backlogged notifications onto the ring as it drains.
-    pub(crate) fn retry(&mut self) {
+    pub fn retry(&mut self) {
         while let Some(wake) = self.backlog.pop_front() {
             if let Err(wake) = self.tx.push(wake) {
                 self.backlog.push_front(wake);
@@ -141,7 +141,7 @@ impl AppNotifier {
     /// Worker shutdown: gets the remaining notifications to the driver if
     /// any stream is still waiting on them, giving up after a bounded spin
     /// in case the driver's runtime is already gone.
-    pub(crate) fn flush(&mut self) {
+    pub fn flush(&mut self) {
         for _ in 0..10_000_000u32 {
             self.retry();
             if self.backlog.is_empty() || self.ready.waiting.load(Ordering::SeqCst) == 0 {
@@ -153,7 +153,7 @@ impl AppNotifier {
 }
 
 impl AppReady {
-    pub(crate) fn wake_handle(self: &Arc<Self>) -> Arc<AppWake> {
+    pub fn wake_handle(self: &Arc<Self>) -> Arc<AppWake> {
         Arc::new(AppWake {
             ready: self.clone(),
             waker: SpinLock::new(None),
@@ -187,7 +187,7 @@ impl AppWake {
     ///
     /// Returns `false`, storing nothing, when no driver can run; the
     /// caller then has to keep itself awake.
-    pub(crate) fn park(&self, waker: &Waker) -> bool {
+    pub fn park(&self, waker: &Waker) -> bool {
         self.waker.with(|slot| match slot {
             Some(stored) if stored.will_wake(waker) => {}
             Some(stored) => *stored = waker.clone(),
@@ -220,13 +220,13 @@ impl AppWake {
     }
 
     /// Forgets the stored waker: the stream is going away.
-    pub(crate) fn unpark(&self) {
+    pub fn unpark(&self) {
         drop(self.take());
     }
 
     /// Wakes the stream directly. For changes made on an application
     /// thread (a flush request); the worker uses [`AppNotifier::notify`].
-    pub(crate) fn wake_now(&self) {
+    pub fn wake_now(&self) {
         if let Some(waker) = self.take() {
             waker.wake();
         }

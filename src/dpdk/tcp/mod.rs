@@ -1,4 +1,4 @@
-pub(crate) mod app_wake;
+mod app_wake;
 pub mod congestion;
 pub mod engine;
 pub mod rto;
@@ -13,4 +13,6 @@ pub mod tx_queue;
 pub mod worker;
 
 #[cfg(feature = "tcp-metrics")]
-pub mod metrics;
+pub mod metrics {
+    pub use crate::dpdk::metrics::{Metrics, Report, reset, snapshot};
+}
