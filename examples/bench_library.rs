@@ -289,9 +289,18 @@ fn dpdk(args: &[String]) {
         // to the receiver (retransmissions included), after segmentation.
         let loss: usize = std::env::var("BENCH_LIBRARY_LOSS").map_or(0, |v| v.parse().unwrap());
         let mut data_packets = 0usize;
+        // BENCH_LIBRARY_DELAY_US=N holds every packet N microseconds in each
+        // direction, for a round trip of 2N: a path where the receive
+        // window, not the CPU, sets the rate.
+        let delay = Duration::from_micros(
+            std::env::var("BENCH_LIBRARY_DELAY_US").map_or(0, |v| v.parse().unwrap()),
+        );
+        let mut a_due: std::collections::VecDeque<Instant> = Default::default();
+        let mut b_due: std::collections::VecDeque<Instant> = Default::default();
         let mut forward = |from: &EthPort,
                            to: &EthPort,
                            wire: &mut std::collections::VecDeque<Mbuf>,
+                           due: &mut std::collections::VecDeque<Instant>,
                            lossy: bool| {
             let first_new = wire.len();
             loop {
@@ -318,7 +327,14 @@ fn dpdk(args: &[String]) {
                     data_packets % loss != 0
                 });
             }
-            burst.extend(wire.drain(..wire.len().min(deliver)));
+            let mut ready = wire.len().min(deliver);
+            if !delay.is_zero() {
+                let now = Instant::now();
+                due.resize(wire.len(), now + delay);
+                ready = due.iter().take(ready).take_while(|at| **at <= now).count();
+                due.drain(..ready);
+            }
+            burst.extend(wire.drain(..ready));
             to.tx_burst_in_place(&mut burst);
             assert!(burst.is_empty(), "harness ring overflow");
         };
@@ -326,10 +342,14 @@ fn dpdk(args: &[String]) {
         let only: Option<usize> = std::env::var("BENCH_LIBRARY_BYTES")
             .ok()
             .map(|v| v.parse().unwrap());
-        for (case, size) in SIZES.into_iter().enumerate() {
-            if only.is_some_and(|only| only != size) {
-                continue;
-            }
+        // Any size is accepted, not only the standard ones.
+        let sizes = only.map_or(SIZES.to_vec(), |size| vec![size]);
+        // BENCH_LIBRARY_RECEIVE_WINDOW=N sets both engines' receive window.
+        let receive_window: Option<std::num::NonZeroU32> =
+            std::env::var("BENCH_LIBRARY_RECEIVE_WINDOW")
+                .ok()
+                .map(|v| v.parse().unwrap());
+        for (case, size) in sizes.into_iter().enumerate() {
             let mut a = TcpEngine::new(EngineConfig {
                 local_ip: "10.88.0.1".parse().unwrap(),
                 local_mac: a_port.mac_addr().unwrap(),
@@ -344,6 +364,10 @@ fn dpdk(args: &[String]) {
                 a.set_rx_gro(false);
                 b.set_rx_gro(false);
             }
+            if let Some(window) = receive_window {
+                a.set_receive_window(window);
+                b.set_receive_window(window);
+            }
             b.listen(80);
             let a_tuple = a
                 .connect("10.88.0.2".parse().unwrap(), 80, 2000 + case as u16)
@@ -354,9 +378,9 @@ fn dpdk(args: &[String]) {
             let start = Instant::now();
             while accepted.is_none() || a.state(a_tuple) != Some(TcpState::Established) {
                 a.poll_into(&a_port, &pool, Instant::now(), &mut a_events);
-                forward(&a_port, &b_port, &mut a_to_b, true);
+                forward(&a_port, &b_port, &mut a_to_b, &mut a_due, true);
                 b.poll_into(&b_port, &pool, Instant::now(), &mut b_events);
-                forward(&b_port, &a_port, &mut b_to_a, false);
+                forward(&b_port, &a_port, &mut b_to_a, &mut b_due, false);
                 if accepted.is_none() {
                     accepted = b.accept(80);
                 }
@@ -391,13 +415,13 @@ fn dpdk(args: &[String]) {
                         a.poll_into(&a_port, &pool, Instant::now(), &mut a_events)
                     });
                     timed(breakdown, &mut parts.forward_ns, || {
-                        forward(&a_port, &b_port, &mut a_to_b, true)
+                        forward(&a_port, &b_port, &mut a_to_b, &mut a_due, true)
                     });
                     timed(breakdown, &mut parts.rx_ns, || {
                         b.poll_into(&b_port, &pool, Instant::now(), &mut b_events)
                     });
                     timed(breakdown, &mut parts.forward_ns, || {
-                        forward(&b_port, &a_port, &mut b_to_a, false)
+                        forward(&b_port, &a_port, &mut b_to_a, &mut b_due, false)
                     });
                     timed(breakdown, &mut parts.app_ns, || {
                         loop {
@@ -425,6 +449,8 @@ fn dpdk(args: &[String]) {
             drop((a, b));
             a_to_b.clear();
             b_to_a.clear();
+            a_due.clear();
+            b_due.clear();
             drop(a_port.rx_packets(64));
             drop(b_port.rx_packets(64));
         }

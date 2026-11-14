@@ -24,8 +24,15 @@ const FALLBACK_PEER_MSS: u16 = 536;
 /// Local receive-window ceiling: without window scaling this stack is
 /// capped at 65535 like RFC 9293 §3.1 requires.
 const RECV_BUFFER_CAPACITY: u32 = 64 * 1024;
-const SCALED_RECV_CAPACITY: u32 = 1024 * 1024;
-const LOCAL_WINDOW_SCALE: u8 = 4;
+/// Default receive window with a peer that negotiated window scaling; see
+/// [`Tcb::set_receive_window`].
+pub const DEFAULT_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Largest receive window: the most a 16-bit window field can express at
+/// the maximum shift of 14 (RFC 7323 §2.3).
+pub const MAX_RECEIVE_WINDOW: u32 = 1 << 30;
+/// Smallest window scale offered. A window up to 1 MiB uses it; a larger
+/// one needs a larger shift.
+const MIN_WINDOW_SCALE: u8 = 4;
 /// RFC 9293 §3.10.7.4 / RFC 6191: 2*MSL time-wait duration; shortened well
 /// below the traditional 4 minutes for a lab/demo-scale stack.
 pub const TIME_WAIT_DURATION: Duration = Duration::from_secs(30);
@@ -150,6 +157,10 @@ pub struct Tcb {
     send_buffer: SendBuffer,
     recv_buffer: ReassemblyBuffer,
 
+    /// Receive window offered once the peer has negotiated scaling, and
+    /// the shift that expresses it. Fixed before the handshake.
+    rcv_capacity: u32,
+    rcv_scale: u8,
     /// Both ends offered SACK-permitted (RFC 2018).
     sack_ok: bool,
     /// Start of the out-of-order segment that arrived last: the SACK
@@ -241,6 +252,8 @@ impl Tcb {
             congestion: CongestionControl::new(DEFAULT_MSS),
             send_buffer: SendBuffer::default(),
             recv_buffer: ReassemblyBuffer::default(),
+            rcv_capacity: DEFAULT_RECEIVE_WINDOW,
+            rcv_scale: MIN_WINDOW_SCALE,
             sack_ok: false,
             sack_recent: None,
             sack_pending: false,
@@ -296,10 +309,34 @@ impl Tcb {
     }
     fn receive_capacity(&self) -> u32 {
         if self.peer_scale.is_some() {
-            SCALED_RECV_CAPACITY
+            self.rcv_capacity
         } else {
             RECV_BUFFER_CAPACITY
         }
+    }
+
+    /// Sets the receive window offered to a peer that negotiates window
+    /// scaling (clamped to 64 KiB..=1 GiB), and with it the scale shift
+    /// announced in the SYN. Call before the handshake segment goes out:
+    /// the shift cannot change afterwards.
+    ///
+    /// The window bounds what the peer may have in flight, so a transfer
+    /// cannot exceed one window per round trip: 1 MiB carries 8 Gbit/s at
+    /// 1 ms, but only 800 Mbit/s at 10 ms. It is also what the connection
+    /// can pin in the receive pool if the application stops reading: about
+    /// one mbuf per MSS of window.
+    pub fn set_receive_window(&mut self, bytes: u32) {
+        self.rcv_capacity = bytes.clamp(RECV_BUFFER_CAPACITY, MAX_RECEIVE_WINDOW);
+        // The smallest shift at which the 16-bit field covers the window.
+        let units = self.rcv_capacity.div_ceil(1 << 16);
+        self.rcv_scale = (units.next_power_of_two().trailing_zeros() as u8)
+            .clamp(MIN_WINDOW_SCALE, 14);
+    }
+
+    /// What the connection may have in flight right now: the smaller of
+    /// the congestion window and the peer's receive window.
+    pub fn send_window(&self) -> u32 {
+        self.snd_wnd.min(self.congestion.cwnd())
     }
     fn peer_window(&self, hdr: &TcpHeader) -> u32 {
         (hdr.window as u32)
@@ -1240,7 +1277,7 @@ impl Tcb {
             .receive_capacity()
             .saturating_sub(self.recv_buffer.readable_len() as u32);
         let scale = if flags & flags::SYN == 0 && self.peer_scale.is_some() {
-            LOCAL_WINDOW_SCALE
+            self.rcv_scale
         } else {
             0
         };
@@ -1270,7 +1307,7 @@ impl Tcb {
                 mss: seg.mss,
                 window_scale: (seg.flags & flags::SYN != 0
                     && (self.state == TcpState::SynSent || self.peer_scale.is_some()))
-                .then_some(LOCAL_WINDOW_SCALE),
+                .then_some(self.rcv_scale),
                 // Offered on every SYN; echoed on a SYN-ACK only to a peer
                 // that offered it.
                 sack_permitted: seg.flags & flags::SYN != 0
@@ -1655,6 +1692,53 @@ mod tests {
             assert_eq!(tcb.buffered_send_bytes(), 0);
             assert!(tcb.poll_output(late).is_empty());
         }
+    }
+
+    #[test]
+    fn a_configured_receive_window_sets_the_scale_and_admits_that_much_data() {
+        // (window, shift): the smallest shift whose 16-bit field covers it.
+        for (window, shift) in [
+            (1, 4),
+            (DEFAULT_RECEIVE_WINDOW, 4),
+            (DEFAULT_RECEIVE_WINDOW + 1, 5),
+            (4 << 20, 6),
+            (8 << 20, 7),
+            (u32::MAX, 14),
+        ] {
+            let mut tcb = Tcb::new_active(tuple());
+            tcb.set_receive_window(window);
+            let syn = tcb.poll_output(Instant::now());
+            assert_eq!(tcb.to_header(&syn[0]).options.window_scale, Some(shift));
+        }
+
+        let now = Instant::now();
+        let mut tcb = Tcb::new_active(tuple());
+        tcb.set_receive_window(8 << 20);
+        tcb.poll_output(now);
+        let mut reply = header(Seq::new(1000), tcb.snd_nxt, flags::SYN | flags::ACK, 65535);
+        reply.options.window_scale = Some(7);
+        tcb.on_segment(&reply, Bytes::new(), now);
+        let ack = tcb.poll_output(now);
+        assert_eq!(u32::from(ack[0].window) << 7, (8 << 20) - 128);
+
+        // 2 MiB in flight at once: twice what the default window admits.
+        let start = tcb.rcv_nxt;
+        for i in 0..2048u32 {
+            let seg = header(start + i * 1024, tcb.snd_nxt, flags::ACK, 65535);
+            tcb.on_segment(&seg, Bytes::from(vec![0; 1024]), now);
+        }
+        assert_eq!(tcb.readable_len(), 2 << 20);
+        assert_eq!(tcb.rcv_nxt, start + (2 << 20));
+        let ack = tcb.poll_output(now);
+        assert_eq!(u32::from(ack[0].window) << 7, 6 << 20);
+
+        // A peer without window scaling still gets 64 KiB, whatever is set.
+        let mut tcb = Tcb::new_active(tuple());
+        tcb.set_receive_window(8 << 20);
+        tcb.poll_output(now);
+        let reply = header(Seq::new(1000), tcb.snd_nxt, flags::SYN | flags::ACK, 65535);
+        tcb.on_segment(&reply, Bytes::new(), now);
+        assert_eq!(tcb.receive_capacity(), RECV_BUFFER_CAPACITY);
     }
 
     #[test]

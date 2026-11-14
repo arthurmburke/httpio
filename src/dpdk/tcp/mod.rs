@@ -6,6 +6,7 @@ pub mod rto;
 pub mod rx_queue;
 pub mod seq;
 pub mod socket;
+pub mod stack;
 pub mod state;
 pub mod stream;
 pub mod tcb;

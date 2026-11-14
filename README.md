@@ -73,6 +73,14 @@ IPv4 + TCP, no kernel network stack involved.
   After a timeout the outstanding data is resent as ACKs reopen the
   window. Delayed ACKs (every second segment, or 1 ms).
 
+- **Multiple cores**: `Stack::builder(port, ip).lcores(&[1, 2, 3, 4]).build()`
+  starts one worker per lcore, each with its own receive queue, engine and
+  NUMA-local mbuf pool, behind a single `WorkerHandle`. Callers open
+  connections exactly as with one worker; the handle gives each to the
+  worker its local port leads to, and `rte_flow` rules on the NIC send the
+  replies to that worker's queue. Local ports must come from 49152..=65535
+  when there is more than one worker. See `src/dpdk/steering.rs`.
+
 Not implemented (explicitly out of scope): timestamps, tail-loss
 probes, IPv6, IP fragmentation/options, multi-segment (chained) mbufs,
 a route table beyond the single default gateway.

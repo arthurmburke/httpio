@@ -36,7 +36,9 @@ use crate::core::spinlock::SpinLock;
 use crate::dpdk::DmaWriter;
 use crate::dpdk::tcp::app_wake::AppWake;
 use crate::dpdk::tcp::chunk::Chunk;
-use crate::dpdk::tcp::worker::{CmdTx, Command, Inbound, InboundMessage, InboundRx, WorkerHandle};
+use crate::dpdk::tcp::worker::{
+    CmdTx, Command, Inbound, InboundMessage, InboundRx, OpenError, WorkerHandle,
+};
 
 /// Per-connection TCP transport options. Attach to an HTTP request via
 /// `http::Extensions` (`request.extensions_mut().insert(TcpOptions {..})`)
@@ -319,11 +321,16 @@ impl TcpStream {
     ) -> io::Result<Self> {
         let endpoints = worker
             .open(remote_ip, remote_port, local_port, options.nodelay)
-            .ok_or_else(|| {
-                io::Error::new(
+            .map_err(|error| match error {
+                OpenError::Busy => io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "TCP worker control ring is full (worker overloaded or stalled)",
-                )
+                ),
+                OpenError::PortNotSteered => io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "local port is outside the range the NIC steers to a worker \
+                     (use 49152..=65535 with more than one worker)",
+                ),
             })?;
 
         let mut stream = Self {

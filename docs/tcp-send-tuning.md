@@ -16,6 +16,7 @@ use httpio::dpdk::http::client::builder::Builder;
 // `worker` comes from WorkerHandle::spawn(...).
 let worker = worker.with_send_config(SendConfig {
     capacity: NonZeroUsize::new(2 * 1024 * 1024).unwrap(),
+    max_capacity: NonZeroUsize::new(16 * 1024 * 1024).unwrap(),
     initial_window_segments: NonZeroU16::new(16).unwrap(),
 });
 let client = Builder::new().build(worker);
@@ -27,6 +28,32 @@ capacity and loss behavior you control. RTO still resets the congestion window
 to one MSS, fast recovery still reduces it, and the peer's advertised window
 always limits transmission. The initial window uses the smaller of the peer
 MSS and the local segment limit after handshake negotiation.
+
+The credit is not fixed. It starts at `capacity` (256 KiB by default) and
+the worker keeps it at twice the connection's usable send window, the
+smaller of its congestion window and the peer's receive window, up to
+`max_capacity` (4 MiB by default). A fixed credit caps a transfer at one
+credit per round trip however far the window has opened: 256 KiB is
+2 Gbit/s at 1 ms. Growth is followed at once; the credit shrinks only when
+the window has halved, and never below `capacity`. Set `max_capacity` equal
+to `capacity` for a fixed credit. This policy has unit tests but has not
+been measured end to end: the HTTP benchmark's link has no delay.
+
+The receive side has the matching limit: a peer can have one receive
+window in flight per round trip. The default window is 1 MiB (8 Gbit/s at
+1 ms, 800 Mbit/s at 10 ms). Raise it on the engine before spawning the
+worker, and size the mbuf pool for it: a connection whose application
+stops reading can hold a full window in receive mbufs, about one per 1460
+bytes.
+
+```rust
+engine.set_receive_window(std::num::NonZeroU32::new(8 * 1024 * 1024).unwrap());
+```
+
+In `bench_library` with a 10 ms emulated round trip
+(`BENCH_LIBRARY_DELAY_US=5000 BENCH_LIBRARY_BYTES=33554432`), a 32 MiB
+transfer ran at 0.76 Gbit/s with the 1 MiB window, 3.0 Gbit/s with 4 MiB
+and 5.4 Gbit/s with 8 MiB (`BENCH_LIBRARY_RECEIVE_WINDOW`).
 
 Credit counts queued plus unacknowledged logical bytes. Dequeuing a command
 does not restore credit: ACKs or discards do. Raising the limit does not

@@ -93,6 +93,53 @@ pub struct ArpEntry {
     pub updated: Instant,
 }
 
+/// Mappings learned by any of the engines sharing one multi-queue port.
+///
+/// An ARP reply is not TCP, so the NIC's steering does not apply to it: it
+/// arrives on whichever queue the device sends unmatched traffic to
+/// (queue 0), whichever engine asked. The engine that receives it
+/// publishes the mapping here, and the others find it here when their own
+/// table has no answer. Each engine still keeps its own table for the
+/// lookups on its hot path; this is consulted only on a miss or when an
+/// entry is due for refresh, so the lock is never contended in steady
+/// state.
+#[derive(Clone)]
+pub struct SharedNeighbors(std::sync::Arc<crate::core::spinlock::SpinLock<Vec<(Ipv4Addr, ArpEntry)>>>);
+
+impl Default for SharedNeighbors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedNeighbors {
+    pub fn new() -> Self {
+        Self(std::sync::Arc::new(crate::core::spinlock::SpinLock::new(
+            Vec::new(),
+        )))
+    }
+
+    fn get(&self, ip: Ipv4Addr) -> Option<ArpEntry> {
+        self.0
+            .with(|entries| entries.iter().find(|(known, _)| *known == ip).map(|(_, e)| *e))
+    }
+
+    fn publish(&self, ip: Ipv4Addr, entry: ArpEntry) {
+        self.0.with(|entries| {
+            if let Some((_, known)) = entries.iter_mut().find(|(known, _)| *known == ip) {
+                *known = entry;
+                return;
+            }
+            if entries.len() >= MAX_ENTRIES
+                && let Some(oldest) = (0..entries.len()).min_by_key(|&i| entries[i].1.updated)
+            {
+                entries.swap_remove(oldest);
+            }
+            entries.push((ip, entry));
+        });
+    }
+}
+
 /// The IPv4 -> Ethernet neighbour cache and the request state that fills it.
 ///
 /// All methods take the caller's clock (`now`), so behaviour is
@@ -106,6 +153,8 @@ pub struct ArpTable {
     /// [`drain_requests`](Self::drain_requests).
     pending_requests: Vec<Ipv4Addr>,
     next_sweep: Option<Instant>,
+    /// What the other engines on this port have learned, if there are any.
+    shared: Option<SharedNeighbors>,
 }
 
 impl Default for ArpTable {
@@ -121,6 +170,7 @@ impl ArpTable {
             last_request: HashMap::default(),
             pending_requests: Vec::new(),
             next_sweep: None,
+            shared: None,
         }
     }
 
@@ -137,19 +187,42 @@ impl ArpTable {
     /// (rate-limited) request and returns `None`; a valid one nearing expiry
     /// is returned and also re-requested so it is refreshed while in use.
     pub fn resolve(&mut self, ip: Ipv4Addr, now: Instant) -> Option<EthAddr> {
-        match self.entries.get(&ip) {
+        let fresh = |entry: &ArpEntry| age(entry.updated, now) < REFRESH_AFTER;
+        let mut entry = self.entries.get(&ip).copied();
+        // Nothing usable of our own, or it is due for refresh: another
+        // engine on this port may hold the answer, or a newer one. The
+        // reply to a request this engine sends is delivered to queue 0's
+        // engine, so this is also how such a request gets answered.
+        if !entry.as_ref().is_some_and(fresh)
+            && let Some(theirs) = self.shared.as_ref().and_then(|shared| shared.get(ip))
+            && entry.is_none_or(|ours| theirs.updated > ours.updated)
+        {
+            if !self.entries.contains_key(&ip) && self.entries.len() >= MAX_ENTRIES {
+                self.evict_oldest();
+            }
+            self.entries.insert(ip, theirs);
+            self.last_request.remove(&ip);
+            entry = Some(theirs);
+        }
+        match entry {
             Some(entry) if age(entry.updated, now) < ENTRY_TTL => {
-                let mac = entry.mac;
-                if age(entry.updated, now) >= REFRESH_AFTER {
+                if !fresh(&entry) {
                     self.request(ip, now);
                 }
-                Some(mac)
+                Some(entry.mac)
             }
             _ => {
                 self.request(ip, now);
                 None
             }
         }
+    }
+
+    /// Makes this table one of several serving the same port: what it
+    /// learns is published to `shared`, and what it lacks is looked up
+    /// there before it concludes an address is unresolved.
+    pub fn share(&mut self, shared: SharedNeighbors) {
+        self.shared = Some(shared);
     }
 
     /// Queues a request for `ip` unless one was sent within
@@ -190,17 +263,21 @@ impl ArpTable {
             return false; // an ARP probe's sender; not a mapping
         }
         let wanted = self.last_request.remove(&ip).is_some();
-        if let Some(entry) = self.entries.get_mut(&ip) {
-            *entry = ArpEntry { mac, updated: now };
-            return true;
+        let entry = ArpEntry { mac, updated: now };
+        if let Some(known) = self.entries.get_mut(&ip) {
+            *known = entry;
+        } else {
+            if !(wanted || addressed_to_us) {
+                return false;
+            }
+            if self.entries.len() >= MAX_ENTRIES {
+                self.evict_oldest();
+            }
+            self.entries.insert(ip, entry);
         }
-        if !(wanted || addressed_to_us) {
-            return false;
+        if let Some(shared) = &self.shared {
+            shared.publish(ip, entry);
         }
-        if self.entries.len() >= MAX_ENTRIES {
-            self.evict_oldest();
-        }
-        self.entries.insert(ip, ArpEntry { mac, updated: now });
         true
     }
 
@@ -279,6 +356,46 @@ mod tests {
         assert!(table.learn(PEER, MAC_A, false, now));
         assert_eq!(table.resolve(PEER, now), Some(MAC_A));
         assert_eq!(table.drain_requests().count(), 0);
+    }
+
+    #[test]
+    fn engines_sharing_a_port_use_each_others_replies() {
+        let now = Instant::now();
+        let shared = SharedNeighbors::new();
+        // `first` serves queue 0, where every ARP frame arrives.
+        let (mut first, mut second) = (ArpTable::new(), ArpTable::new());
+        first.share(shared.clone());
+        second.share(shared.clone());
+        let (peer, mac) = (Ipv4Addr::new(10, 0, 0, 2), EthAddr::new([2; 6]));
+
+        // The second engine asks; the reply is delivered to the first.
+        assert_eq!(second.resolve(peer, now), None);
+        assert_eq!(second.drain_requests().collect::<Vec<_>>(), [peer]);
+        assert!(first.learn(peer, mac, true, now));
+        assert_eq!(second.resolve(peer, now), Some(mac));
+        assert_eq!(second.drain_requests().count(), 0);
+        assert_eq!(first.resolve(peer, now), Some(mac));
+
+        // Due for refresh, the second engine asks again; the answer again
+        // reaches the first, and the second takes the newer entry instead
+        // of asking once more.
+        let later = now + REFRESH_AFTER;
+        assert_eq!(second.resolve(peer, later), Some(mac));
+        assert_eq!(second.drain_requests().count(), 1);
+        let moved = EthAddr::new([3; 6]);
+        assert!(first.learn(peer, moved, true, later));
+        let after = later + REQUEST_INTERVAL;
+        assert_eq!(second.resolve(peer, after), Some(moved));
+        assert_eq!(second.drain_requests().count(), 0);
+
+        // A shared entry expires like any other.
+        let expired = later + ENTRY_TTL;
+        assert_eq!(second.resolve(peer, expired), None);
+        assert_eq!(second.drain_requests().collect::<Vec<_>>(), [peer]);
+
+        // An engine that is not sharing sees none of it.
+        let mut alone = ArpTable::new();
+        assert_eq!(alone.resolve(peer, after), None);
     }
 
     #[test]

@@ -33,7 +33,8 @@ Ethernet/IP/TCP headers to fit in the first segment.
 
 Window scaling is offered on active opens and echoed on passive opens
 when the peer offers it. SYN windows remain unscaled. Negotiated connections
-use a 1 MiB receive buffer and advertise shift 4; peers without scaling
+use a 1 MiB receive buffer and advertise shift 4 by default
+(`TcpEngine::set_receive_window` raises both); peers without scaling
 retain the legacy 64 KiB buffer. Pool sizing must account for these larger
 receive windows and data retained by applications.
 

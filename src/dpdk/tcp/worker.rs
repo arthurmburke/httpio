@@ -40,6 +40,7 @@ use crate::dpdk::{self, EthPort, Mempool, WorkerJoin};
 use super::app_wake::{self, AppNotifier, AppReady, AppWake};
 use super::chunk::Chunk;
 use super::engine::TcpEngine;
+use crate::dpdk::steering::PortSteering;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple};
 
@@ -54,8 +55,12 @@ const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // Per-connection rings stay SPSC: exactly one thread owns each end (the
 // thread driving that connection's `TcpStream`, and the worker lcore).
-/// Default limit on queued plus unacknowledged application bytes per connection.
+/// Default starting (and smallest) limit on queued plus unacknowledged
+/// application bytes per connection.
 pub const SEND_CAPACITY: usize = 256 * 1024;
+/// Default ceiling the limit may grow to as the path proves it can carry
+/// more; see [`SendConfig::max_capacity`].
+pub const MAX_SEND_CAPACITY: usize = 4 * 1024 * 1024;
 
 /// Send-side limits for connections opened through a worker handle.
 /// Credit bounds queued plus unacknowledged bytes; it does not preallocate
@@ -63,7 +68,17 @@ pub const SEND_CAPACITY: usize = 256 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub struct SendConfig {
     /// Logical byte credit per connection, allocated only as data is queued.
+    /// This is where the credit starts and the least it ever is.
     pub capacity: std::num::NonZeroUsize,
+    /// The most the credit grows to. The worker keeps it at twice the
+    /// connection's usable send window (the smaller of its congestion
+    /// window and the peer's receive window), within these two bounds, so
+    /// there is always a window's worth queued behind what is in flight.
+    /// A fixed credit caps a transfer at one credit per round trip
+    /// however large the window: 256 KiB is 2 Gbit/s at 1 ms.
+    ///
+    /// Set it equal to `capacity` (or lower) for a fixed credit.
+    pub max_capacity: std::num::NonZeroUsize,
     /// Initial congestion window in segments. The default is ten; larger
     /// values are an explicit opt-in for provisioned, controlled networks.
     /// Loss recovery still reduces the window, including to one MSS on RTO.
@@ -74,6 +89,7 @@ impl Default for SendConfig {
     fn default() -> Self {
         Self {
             capacity: std::num::NonZeroUsize::new(SEND_CAPACITY).unwrap(),
+            max_capacity: std::num::NonZeroUsize::new(MAX_SEND_CAPACITY).unwrap(),
             initial_window_segments: std::num::NonZeroU16::new(10).unwrap(),
         }
     }
@@ -93,7 +109,11 @@ struct Wake {
 
 pub(crate) struct SendCredit {
     wake: Option<Wake>,
-    capacity: usize,
+    /// Current credit: written by the worker, read by the application.
+    limit: AtomicUsize,
+    /// Bounds within which the worker moves `limit`.
+    floor: usize,
+    ceiling: usize,
     app_gone: AtomicBool,
     pub(crate) bytes: AtomicUsize,
     pub(crate) failed: AtomicBool,
@@ -109,6 +129,26 @@ impl SendCredit {
             }
         }
     }
+    /// Moves the credit toward twice the usable send `window`. Returns
+    /// whether it grew, which a writer waiting for credit must hear about.
+    ///
+    /// It follows growth at once but shrinks only once the target has
+    /// halved: the congestion window moves with every ACK, and the
+    /// application reads this from another core.
+    fn retune(&self, window: u32) -> bool {
+        if self.ceiling <= self.floor {
+            return false;
+        }
+        let target = (window as usize)
+            .saturating_mul(2)
+            .clamp(self.floor, self.ceiling);
+        let current = self.limit.load(Ordering::Relaxed);
+        if target > current || target < current / 2 {
+            self.limit.store(target, Ordering::Release);
+        }
+        target > current
+    }
+
     fn clear_notification(&self) {
         if let Some(wake) = &self.wake {
             wake.queued.store(false, Ordering::Release);
@@ -127,7 +167,8 @@ impl CmdTx {
     }
     pub fn available_bytes(&self) -> usize {
         self.outstanding
-            .capacity
+            .limit
+            .load(Ordering::Acquire)
             .saturating_sub(self.outstanding.bytes.load(Ordering::Acquire))
     }
     pub fn len(&self) -> usize {
@@ -179,17 +220,22 @@ impl Drop for CmdTx {
 
 #[cfg(test)]
 pub(crate) fn command_channel() -> (CmdTx, CmdRx, Arc<SendCredit>) {
-    command_channel_with_wake(None, SEND_CAPACITY)
+    command_channel_with_wake(None, SEND_CAPACITY, SEND_CAPACITY)
 }
 
+/// `capacity` is the starting and smallest credit, `max_capacity` the most
+/// it may be retuned to (no more than `capacity` fixes it).
 fn command_channel_with_wake(
     wake: Option<Wake>,
     capacity: usize,
+    max_capacity: usize,
 ) -> (CmdTx, CmdRx, Arc<SendCredit>) {
     let (ring, rx) = spsc::channel();
     let outstanding = Arc::new(SendCredit {
         wake,
-        capacity,
+        limit: AtomicUsize::new(capacity),
+        floor: capacity,
+        ceiling: max_capacity.max(capacity),
         app_gone: AtomicBool::new(false),
         bytes: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
@@ -455,12 +501,13 @@ impl WorkerConn {
     }
 
     fn release_credit(&mut self, engine: &TcpEngine) {
-        let remaining = engine.buffered_send_bytes(self.tuple);
+        let (remaining, window) = engine.send_state(self.tuple);
         let released = self.engine_bytes - remaining;
         if released != 0 {
             self.outstanding.bytes.fetch_sub(released, Ordering::AcqRel);
             self.notify_app = true;
         }
+        self.notify_app |= self.outstanding.retune(window);
         self.engine_bytes = remaining;
     }
 
@@ -538,22 +585,52 @@ impl WorkerConn {
     }
 }
 
-/// Application-side handle to the worker, used to open connections; each
-/// open produces a fresh ring pair whose app-side halves become a
+/// The application side's channels to one worker.
+struct WorkerLink {
+    #[cfg(feature = "tcp-metrics")]
+    metrics: super::metrics::Report,
+    ctrl_tx: CtrlTx,
+    ready: ReadySender,
+    /// Worker -> application wake-ups for this worker's streams.
+    app_ready: Arc<AppReady>,
+    /// Published by the worker each iteration: total active opens so far.
+    /// A cross-core observability counter (e.g. to confirm h2 connection
+    /// reuse), not a live count.
+    connections_opened: Arc<AtomicU64>,
+}
+
+/// Why [`WorkerHandle::open`] could not start a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenError {
+    /// The worker's control ring is full: it is overloaded or stalled.
+    Busy,
+    /// The stack runs several workers and no worker's queue receives
+    /// traffic for this local port. Use a port in the ephemeral range
+    /// (49152..=65535), all of which are covered.
+    PortNotSteered,
+}
+
+/// Application-side handle to the TCP stack, used to open connections;
+/// each open produces a fresh ring pair whose app-side halves become a
 /// `TcpStream`.
+///
+/// The stack behind it is one worker lcore or several, each with its own
+/// receive queue and engine; the handle is the same either way and callers
+/// need not know which. With several, a connection is given to the worker
+/// whose queue the NIC delivers its local port to (see
+/// [`PortSteering`]), and stays there for life. Local ports taken in
+/// sequence therefore spread connections evenly over the workers.
 ///
 /// `Send + Sync`: the connection-open path goes through an MPSC control
 /// ring, so a single handle (e.g. behind an `Arc`) can be shared by any
 /// number of application threads all opening connections concurrently.
 #[derive(Clone)]
 pub struct WorkerHandle {
-    #[cfg(feature = "tcp-metrics")]
-    metrics: super::metrics::Report,
     send_config: SendConfig,
-    ctrl_tx: CtrlTx,
-    ready: ReadySender,
-    /// Worker -> application wake-ups for this worker's streams.
-    app_ready: Arc<AppReady>,
+    /// One per worker, indexed by the queue it serves.
+    links: Arc<[WorkerLink]>,
+    /// Which worker a local port belongs to.
+    steering: PortSteering,
     /// Whether streams copy writes into DMA memory, for the engine to
     /// attach to packets instead of copying again. On for ports with TSO,
     /// where one attachment replaces copying a segment of tens of
@@ -566,10 +643,6 @@ pub struct WorkerHandle {
     /// `WorkerLifetime`, which signals the worker without a racy strong-count
     /// check. The worker itself deliberately does not own this token.
     _lifetime: Arc<WorkerLifetime>,
-    /// Published by the worker each iteration: total active opens so far.
-    /// A cross-core observability counter (e.g. to confirm h2 connection
-    /// reuse), not a live count.
-    connections_opened: Arc<AtomicU64>,
 }
 
 struct WorkerLifetime {
@@ -596,9 +669,21 @@ pub struct ConnEndpoints {
 }
 
 impl WorkerHandle {
+    /// The first worker's report; see [`metrics_reports`](Self::metrics_reports).
     #[cfg(feature = "tcp-metrics")]
     pub fn metrics_report(&self) -> super::metrics::Report {
-        self.metrics.clone()
+        self.links[0].metrics.clone()
+    }
+
+    /// One report per worker, in queue order.
+    #[cfg(feature = "tcp-metrics")]
+    pub fn metrics_reports(&self) -> Vec<super::metrics::Report> {
+        self.links.iter().map(|link| link.metrics.clone()).collect()
+    }
+
+    /// How many worker lcores serve this handle.
+    pub fn workers(&self) -> usize {
+        self.links.len()
     }
 
     /// Configures future connections opened through this handle. Existing
@@ -617,9 +702,81 @@ impl WorkerHandle {
         pool: Mempool,
         worker_lcore: u32,
     ) -> Result<(Self, WorkerJoin), dpdk::lcore::LaunchError> {
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
+        let (handle, mut joins) = Self::spawn_all(vec![(engine, port, pool, worker_lcore)])?;
+        Ok((handle, joins.pop().expect("one worker, one join")))
+    }
+
+    /// Launches one worker per entry, `(engine, queue, pool, lcore)`, and
+    /// returns the single handle that fronts them all, plus a join handle
+    /// per worker. The queues are those of one port, from
+    /// [`EthPort::init_queues`], in queue order; give each worker its own
+    /// pool and an lcore on the device's NUMA socket ([`EthPort::socket`]).
+    /// See [`Stack`](super::stack::Stack) for a builder that does all of
+    /// that.
+    ///
+    /// The engines must share one local IP. They are made to share what
+    /// they learn from ARP, since replies reach only queue 0.
+    ///
+    /// # Panics
+    /// If `workers` is empty, the queues are not every queue of one port
+    /// in order, or the engines' local IPs differ.
+    pub fn spawn_all(
+        workers: Vec<(TcpEngine, EthPort, Mempool, u32)>,
+    ) -> Result<(Self, Vec<WorkerJoin>), dpdk::lcore::LaunchError> {
+        let (first_engine, first_port, ..) = workers.first().expect("at least one worker");
+        let local_ip = first_engine.local_ip();
+        let steering = first_port.steering();
+        let dma_writes = first_port.offloads().tso_max_payload > 0;
+        assert_eq!(
+            usize::from(steering.queues()),
+            workers.len(),
+            "one worker per queue of the port"
+        );
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
+        let neighbors = (workers.len() > 1).then(crate::dpdk::net::arp::SharedNeighbors::new);
+        let mut links = Vec::with_capacity(workers.len());
+        let mut joins = Vec::with_capacity(workers.len());
+        for (queue, (mut engine, port, pool, lcore)) in workers.into_iter().enumerate() {
+            assert_eq!(usize::from(port.queue_id()), queue, "queues in order");
+            assert_eq!(engine.local_ip(), local_ip, "workers share one local IP");
+            if let Some(neighbors) = &neighbors {
+                engine.share_neighbors(neighbors.clone());
+            }
+            match Self::launch(engine, port, pool, lcore, stop.clone()) {
+                Ok((link, join)) => {
+                    links.push(link);
+                    joins.push(join);
+                }
+                Err(error) => {
+                    // Stop the workers already running.
+                    stop.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            }
+        }
+        Ok((
+            WorkerHandle {
+                send_config: SendConfig::default(),
+                links: links.into(),
+                steering,
+                dma_writes,
+                local_ip,
+                _lifetime: Arc::new(WorkerLifetime { stop }),
+            },
+            joins,
+        ))
+    }
+
+    /// Starts one worker's loop on `worker_lcore`. The engine/port/pool
+    /// are moved to that lcore and owned there for the loop's lifetime.
+    fn launch(
+        engine: TcpEngine,
+        port: EthPort,
+        pool: Mempool,
+        worker_lcore: u32,
+        worker_stop: Arc<AtomicBool>,
+    ) -> Result<(WorkerLink, WorkerJoin), dpdk::lcore::LaunchError> {
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
         let connections_opened = Arc::new(AtomicU64::new(0));
         let worker_opened = connections_opened.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -628,8 +785,6 @@ impl WorkerHandle {
             tx: ready_tx,
             overflow: overflow.clone(),
         };
-        let local_ip = engine.local_ip();
-        let dma_writes = port.offloads().tso_max_payload > 0;
         let (notifier, app_ready) = app_wake::channel();
 
         #[cfg(feature = "tcp-metrics")]
@@ -660,16 +815,12 @@ impl WorkerHandle {
         })?;
 
         Ok((
-            WorkerHandle {
+            WorkerLink {
                 #[cfg(feature = "tcp-metrics")]
                 metrics,
-                send_config: SendConfig::default(),
                 ctrl_tx,
                 ready,
                 app_ready,
-                dma_writes,
-                local_ip,
-                _lifetime: Arc::new(WorkerLifetime { stop }),
                 connections_opened,
             },
             join,
@@ -680,15 +831,30 @@ impl WorkerHandle {
     /// app-side ring endpoints. The worker performs the active open;
     /// wait for `Inbound::Established` on `inbound_rx` before use.
     ///
-    /// Returns `None` if the control ring is full (worker not keeping up
-    /// with connection opens) after a bounded number of retries.
+    /// With several workers, the connection goes to the one whose queue
+    /// receives traffic for `local_port`.
+    ///
+    /// Fails with [`OpenError::Busy`] if that worker's control ring is
+    /// full (it is not keeping up with connection opens) after a bounded
+    /// number of retries, and with [`OpenError::PortNotSteered`] if no
+    /// worker's queue receives `local_port`.
     pub fn open(
         &self,
         remote_ip: Ipv4Addr,
         remote_port: u16,
         local_port: u16,
         nodelay: bool,
-    ) -> Option<ConnEndpoints> {
+    ) -> Result<ConnEndpoints, OpenError> {
+        let link = match &*self.links {
+            [only] => only,
+            links => {
+                let queue = self
+                    .steering
+                    .queue_of(local_port)
+                    .ok_or(OpenError::PortNotSteered)?;
+                &links[usize::from(queue)]
+            }
+        };
         let tuple = FourTuple {
             local_ip: self.local_ip,
             local_port,
@@ -698,13 +864,14 @@ impl WorkerHandle {
         let (cmd_tx, cmd_rx, outstanding) = command_channel_with_wake(
             Some(Wake {
                 tuple,
-                sender: self.ready.clone(),
+                sender: link.ready.clone(),
                 queued: AtomicBool::new(false),
             }),
             self.send_config.capacity.get(),
+            self.send_config.max_capacity.get(),
         );
         let (inbound_tx, inbound_rx) = inbound_channel(outstanding.clone());
-        let wake = self.app_ready.wake_handle();
+        let wake = link.app_ready.wake_handle();
 
         let mut msg = NewConn {
             remote_ip,
@@ -721,9 +888,9 @@ impl WorkerHandle {
         // bounded spin covers a transient full ring without blocking the
         // async runtime indefinitely.
         for _ in 0..1024 {
-            match self.ctrl_tx.push(msg) {
+            match link.ctrl_tx.push(msg) {
                 Ok(()) => {
-                    return Some(ConnEndpoints {
+                    return Ok(ConnEndpoints {
                         cmd_tx,
                         inbound_rx,
                         wake,
@@ -736,13 +903,16 @@ impl WorkerHandle {
                 }
             }
         }
-        None
+        Err(OpenError::Busy)
     }
 
     /// Total active opens the engine has performed so far (published by
     /// the worker lcore). Useful to confirm connection reuse.
     pub fn connections_opened(&self) -> u64 {
-        self.connections_opened.load(Ordering::Acquire)
+        self.links
+            .iter()
+            .map(|link| link.connections_opened.load(Ordering::Acquire))
+            .sum()
     }
 }
 
@@ -956,7 +1126,8 @@ mod tests {
     }
 
     fn fixture_with_wake(wake: Option<Wake>) -> (CmdTx, WorkerConn, TcpEngine) {
-        let (tx, cmd_rx, outstanding) = command_channel_with_wake(wake, SEND_CAPACITY);
+        let (tx, cmd_rx, outstanding) =
+            command_channel_with_wake(wake, SEND_CAPACITY, SEND_CAPACITY);
         let (inbound_tx, _rx) = spsc::channel();
         let mut engine = TcpEngine::new(super::super::engine::EngineConfig::default());
         let tuple = engine
@@ -1123,6 +1294,38 @@ mod tests {
     }
 
     #[test]
+    fn send_credit_follows_twice_the_send_window_within_its_bounds() {
+        let (tx, _rx, credit) = command_channel_with_wake(None, 1000, 8000);
+        assert_eq!(tx.available_bytes(), 1000);
+        // No window yet (handshake): the starting credit stands.
+        assert!(!credit.retune(0));
+        assert_eq!(tx.available_bytes(), 1000);
+        // Growth is followed at once and reported, so a waiting writer wakes.
+        assert!(credit.retune(3000));
+        assert_eq!(tx.available_bytes(), 6000);
+        assert!(credit.retune(1_000_000));
+        assert_eq!(tx.available_bytes(), 8000);
+        assert!(!credit.retune(u32::MAX));
+        // A small dip is ignored; a collapse (loss) is followed, down to
+        // the starting credit.
+        assert!(!credit.retune(2500));
+        assert_eq!(tx.available_bytes(), 8000);
+        assert!(!credit.retune(1500));
+        assert_eq!(tx.available_bytes(), 3000);
+        assert!(!credit.retune(1));
+        assert_eq!(tx.available_bytes(), 1000);
+        // Credit already used beyond a shrunken limit just blocks writers.
+        credit.bytes.store(5000, Ordering::Release);
+        assert_eq!(tx.available_bytes(), 0);
+        assert!(tx.push(Command::Send(Bytes::from_static(b"x"))).is_err());
+
+        // Equal bounds: a fixed credit.
+        let (tx, _rx, credit) = command_channel_with_wake(None, 1000, 1000);
+        assert!(!credit.retune(1_000_000));
+        assert_eq!(tx.available_bytes(), 1000);
+    }
+
+    #[test]
     fn moving_commands_to_engine_does_not_restore_send_credit() {
         let (tx, mut conn, mut engine) = fixture();
         assert!(
@@ -1158,7 +1361,7 @@ mod tests {
     #[test]
     fn configured_credit_is_bounded_and_replenished() {
         for capacity in [1024, 256 * 1024, 2 * 1024 * 1024] {
-            let (tx, rx, credit) = command_channel_with_wake(None, capacity);
+            let (tx, rx, credit) = command_channel_with_wake(None, capacity, capacity);
             assert_eq!(tx.available_bytes(), capacity);
             assert!(
                 tx.push(Command::Send(Bytes::from(vec![0; capacity])))
@@ -1210,24 +1413,88 @@ mod tests {
     }
 
     #[test]
+    fn a_handle_over_several_workers_routes_each_open_by_its_local_port() {
+        let link = || {
+            let (ctrl_tx, ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
+            let (tx, _rx) = mpsc::channel();
+            let link = WorkerLink {
+                #[cfg(feature = "tcp-metrics")]
+                metrics: crate::dpdk::tcp::metrics::Report::default(),
+                ctrl_tx,
+                ready: ReadySender {
+                    tx,
+                    overflow: Arc::new(AtomicBool::new(false)),
+                },
+                app_ready: app_wake::channel().1,
+                connections_opened: Arc::new(AtomicU64::new(0)),
+            };
+            (link, ctrl_rx)
+        };
+        let handle = |links: Vec<WorkerLink>| WorkerHandle {
+            send_config: SendConfig::default(),
+            steering: PortSteering::new(links.len() as u16),
+            links: links.into(),
+            local_ip: Ipv4Addr::UNSPECIFIED,
+            dma_writes: false,
+            _lifetime: Arc::new(WorkerLifetime {
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+        };
+        let remote = Ipv4Addr::new(10, 0, 0, 2);
+
+        let ((link0, rx0), (link1, rx1), (link2, rx2)) = (link(), link(), link());
+        let workers = handle(vec![link0, link1, link2]);
+        assert_eq!(workers.workers(), 3);
+        let steering = PortSteering::new(3);
+        let rings = [&rx0, &rx1, &rx2];
+        // Ports taken in sequence, as the HTTP client takes them, reach
+        // every worker; each open lands on the worker its port leads to.
+        let mut opened = [0usize; 3];
+        for local_port in 49152..49152 + 64 {
+            assert!(workers.open(remote, 80, local_port, true).is_ok());
+            let queue = usize::from(steering.queue_of(local_port).unwrap());
+            let registered = rings[queue].pop().expect("routed to the owning worker");
+            assert_eq!(registered.local_port, local_port);
+            assert!(rings.iter().all(|ring| ring.pop().is_none()));
+            opened[queue] += 1;
+        }
+        assert!(opened.iter().all(|&count| count >= 16), "{opened:?}");
+        // No queue receives a port outside the steered range.
+        assert_eq!(
+            workers.open(remote, 80, 1234, true).err(),
+            Some(OpenError::PortNotSteered)
+        );
+        assert!(rings.iter().all(|ring| ring.pop().is_none()));
+
+        // A single worker receives everything, so any port will do.
+        let (only, rx) = link();
+        let single = handle(vec![only]);
+        assert!(single.open(remote, 80, 1234, true).is_ok());
+        assert_eq!(rx.pop().unwrap().local_port, 1234);
+    }
+
+    #[test]
     fn dropping_a_cloned_handle_does_not_stop_the_worker() {
         let (ctrl_tx, _ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = mpsc::channel();
         let handle = WorkerHandle {
-            #[cfg(feature = "tcp-metrics")]
-            metrics: crate::dpdk::tcp::metrics::Report::default(),
             send_config: SendConfig::default(),
-            ctrl_tx,
+            links: Arc::new([WorkerLink {
+                #[cfg(feature = "tcp-metrics")]
+                metrics: crate::dpdk::tcp::metrics::Report::default(),
+                ctrl_tx,
+                ready: ReadySender {
+                    tx,
+                    overflow: Arc::new(AtomicBool::new(false)),
+                },
+                app_ready: app_wake::channel().1,
+                connections_opened: Arc::new(AtomicU64::new(0)),
+            }]),
+            steering: PortSteering::single(),
             local_ip: Ipv4Addr::UNSPECIFIED,
-            ready: ReadySender {
-                tx,
-                overflow: Arc::new(AtomicBool::new(false)),
-            },
-            app_ready: app_wake::channel().1,
             dma_writes: false,
             _lifetime: Arc::new(WorkerLifetime { stop: stop.clone() }),
-            connections_opened: Arc::new(AtomicU64::new(0)),
         };
 
         drop(handle.clone());

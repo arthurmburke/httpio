@@ -271,14 +271,20 @@ fn dpdk_run(args: &[String]) {
         )
         .try_into()
         .unwrap(),
+        max_capacity: setting(
+            "BENCH_SEND_MAX_CAPACITY",
+            httpio::dpdk::tcp::worker::MAX_SEND_CAPACITY,
+        )
+        .try_into()
+        .unwrap(),
         initial_window_segments: u16::try_from(setting("BENCH_INITIAL_WINDOW", 10))
             .unwrap()
             .try_into()
             .unwrap(),
     };
     eprintln!(
-        "send_capacity={} initial_window_segments={}",
-        config.capacity, config.initial_window_segments
+        "send_capacity={} send_max_capacity={} initial_window_segments={}",
+        config.capacity, config.max_capacity, config.initial_window_segments
     );
     let worker = worker.with_send_config(config);
     #[cfg(feature = "tcp-metrics")]

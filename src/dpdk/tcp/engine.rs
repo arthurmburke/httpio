@@ -191,6 +191,7 @@ pub struct TcpEngine {
     tx_budget: usize,
     config: EngineConfig,
     rx_gro: bool,
+    receive_window: u32,
     listeners: HashSet<u16>,
     connections: HashMap<FourTuple, Conn>,
     connections_opened: u64,
@@ -228,6 +229,7 @@ impl TcpEngine {
             tx_budget: DEFAULT_TX_BUDGET,
             config,
             rx_gro: true,
+            receive_window: super::tcb::DEFAULT_RECEIVE_WINDOW,
             listeners: HashSet::default(),
             connections: HashMap::default(),
             connections_opened: 0,
@@ -261,6 +263,27 @@ impl TcpEngine {
     }
 
     /// Enable/disable burst-local receive aggregation for workload comparisons.
+    /// Makes this engine one of several serving the same multi-queue
+    /// port, each on its own queue. ARP replies reach only one queue's
+    /// engine, so they resolve next hops through a shared table; see
+    /// [`SharedNeighbors`](crate::dpdk::net::arp::SharedNeighbors).
+    pub fn share_neighbors(&mut self, shared: crate::dpdk::net::arp::SharedNeighbors) {
+        self.arp.share(shared);
+    }
+
+    /// Receive window offered by connections opened or accepted from now
+    /// on, to peers that negotiate window scaling (clamped to
+    /// 64 KiB..=1 GiB; the default is 1 MiB). A peer can have at most one
+    /// window in flight, so raise this for fast paths with millisecond
+    /// round trips: throughput is bounded by window / round-trip time.
+    ///
+    /// Size the mbuf pool to match. A connection whose application stops
+    /// reading can hold a full window in receive mbufs, about one per
+    /// 1460 bytes, on top of what its inbound ring already holds.
+    pub fn set_receive_window(&mut self, bytes: std::num::NonZeroU32) {
+        self.receive_window = bytes.get();
+    }
+
     pub fn set_rx_gro(&mut self, enabled: bool) {
         self.rx_gro = enabled;
     }
@@ -306,10 +329,9 @@ impl TcpEngine {
         match self.connections.entry(tuple) {
             std::collections::hash_map::Entry::Occupied(_) => return None,
             std::collections::hash_map::Entry::Vacant(v) => {
-                let conn = v.insert(Conn::new(
-                    Tcb::new_active(tuple),
-                    AcceptState::NotApplicable,
-                ));
+                let mut tcb = Tcb::new_active(tuple);
+                tcb.set_receive_window(self.receive_window);
+                let conn = v.insert(Conn::new(tcb, AcceptState::NotApplicable));
                 // Has a SYN to send.
                 Self::mark_active(&mut self.active, conn, tuple);
             }
@@ -326,6 +348,15 @@ impl TcpEngine {
 
     pub fn accept(&mut self, port: u16) -> Option<FourTuple> {
         self.accept_queues.get_mut(&port)?.pop_front()
+    }
+
+    /// [`TcpEngine::buffered_send_bytes`] and the connection's usable send
+    /// window (the smaller of its congestion window and the peer's
+    /// receive window), with one lookup.
+    pub fn send_state(&self, tuple: FourTuple) -> (usize, u32) {
+        self.connections.get(&tuple).map_or((0, 0), |c| {
+            (c.tcb.buffered_send_bytes(), c.tcb.send_window())
+        })
     }
 
     /// Bytes queued for transmission or still awaiting acknowledgment.
@@ -984,6 +1015,7 @@ impl TcpEngine {
         if is_bare_syn && self.listeners.contains(&tcp_hdr.dst_port) {
             let peer_mss = tcp_hdr.options.mss.unwrap_or(536);
             let mut tcb = Tcb::new_from_listen(tuple, Seq::new(tcp_hdr.seq), peer_mss);
+            tcb.set_receive_window(self.receive_window);
             tcb.set_peer_scale(tcp_hdr.options.window_scale);
             tcb.set_peer_sack(tcp_hdr.options.sack_permitted);
             // Has a SYN-ACK to send.
