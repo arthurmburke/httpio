@@ -40,11 +40,11 @@ mod dpdk_app {
     use http::{Method, Request};
 
     use httpio::dpdk::http::client::builder::Builder;
-    use httpio::dpdk::tcp::stream::{FlushHandle, TcpOptions};
     use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
     use httpio::dpdk::net::eth::EthAddr;
     use httpio::dpdk::tcp::engine::EngineConfig;
     use httpio::dpdk::tcp::engine::TcpEngine;
+    use httpio::dpdk::tcp::stream::{FlushHandle, TcpOptions};
     use httpio::dpdk::tcp::worker::WorkerHandle;
     use httpio::dpdk::{self, EthPort, Mempool};
     use httpio::http::codec::{Empty, Raw};

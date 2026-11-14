@@ -1044,7 +1044,7 @@ mod tests {
     use rustls::ServerConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundTx, SendCredit};
+    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundSender, SendCredit};
 
     const CA: &[u8] = include_bytes!("tls_testdata/ca.pem");
     const CERT: &[u8] = include_bytes!("tls_testdata/server.pem");
@@ -1057,7 +1057,7 @@ mod tests {
     /// (cycled), so records can be cut anywhere.
     struct Peer {
         cmd_rx: CmdRx,
-        inbound_tx: InboundTx,
+        inbound_tx: InboundSender,
         credit: Arc<SendCredit>,
         unread: Bytes,
         client_closed: bool,
@@ -1080,7 +1080,7 @@ mod tests {
                 let segment: Vec<u8> = self.out.iter().take(n).copied().collect();
                 if self
                     .inbound_tx
-                    .push(Inbound::Data(Bytes::from(segment)))
+                    .push(Inbound::Data(Bytes::from(segment)).into())
                     .is_err()
                 {
                     return false;
@@ -1094,7 +1094,7 @@ mod tests {
         /// Ends TCP without `close_notify`.
         fn fin(&mut self) {
             assert!(self.push_out());
-            assert!(self.inbound_tx.push(Inbound::Eof).is_ok());
+            assert!(self.inbound_tx.push(Inbound::Eof.into()).is_ok());
         }
     }
 
@@ -1163,7 +1163,7 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             ready!(Pin::new(&mut *this).poll_flush(cx))?;
-            let _ = this.inbound_tx.push(Inbound::Eof);
+            let _ = this.inbound_tx.push(Inbound::Eof.into());
             Poll::Ready(Ok(()))
         }
     }

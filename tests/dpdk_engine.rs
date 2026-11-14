@@ -201,9 +201,15 @@ fn engine_transmits_window_updates_and_final_reset() {
         output(&port);
         peer.seq += 1;
         peer.flags = tcp::flags::ACK;
+        let mut events = Vec::new();
         for segment in 0..64 {
             inject_tcp(&port, &pool, &peer, &[42; 1024]);
-            engine.poll(&port, &pool, now);
+            let (_, allocations) =
+                count_allocations(|| engine.poll_into(&port, &pool, now, &mut events));
+            // Wait until the reassembly queue has grown to hold 64 entries.
+            if segment >= 48 {
+                assert_eq!(allocations, 0, "steady-state RX allocated");
+            }
             let acks = output(&port);
             peer.seq += 1024;
             // One packet per poll: every second in-order segment is
@@ -216,7 +222,6 @@ fn engine_transmits_window_updates_and_final_reset() {
             }
         }
         // Pure ACKs and rejected payloads must not allocate Bytes owners.
-        let mut events = Vec::new();
         for _ in 0..3 {
             inject_tcp(&port, &pool, &peer, &[]);
             let (_, count) = count_allocations(|| engine.poll_into(&port, &pool, now, &mut events));
@@ -230,7 +235,20 @@ fn engine_transmits_window_updates_and_final_reset() {
         output(&port);
 
         // An otherwise idle TCB must be reactivated by an application read.
-        assert_eq!(engine.recv(tuple, 1024).len(), 1024);
+        let (empty, allocations) = count_allocations(|| engine.recv(tuple, 0));
+        assert!(empty.is_empty());
+        assert_eq!(allocations, 0);
+        let (prefix, allocations) = count_allocations(|| engine.recv(tuple, 256));
+        assert_eq!(&prefix[..], &[42; 256]);
+        assert_eq!(allocations, 1);
+        let (suffix, allocations) = count_allocations(|| engine.recv(tuple, 1024));
+        assert_eq!(&suffix[..], &[42; 768]);
+        assert_eq!(allocations, 0, "split reads must share the mbuf owner");
+        assert_eq!(
+            unsafe { prefix.as_ptr().add(prefix.len()) },
+            suffix.as_ptr()
+        );
+        drop((prefix, suffix));
         engine.poll(&port, &pool, now);
         let update = output(&port);
         assert_eq!(update.len(), 1);

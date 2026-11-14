@@ -366,9 +366,10 @@ mod tests {
         for count in 1..=MAX_SACK_BLOCKS as u32 {
             let mut h = header(None);
             for i in 0..count {
-                h.options
-                    .sack
-                    .push((u32::MAX - 500).wrapping_add(i * 1000), u32::MAX.wrapping_add(i * 1000));
+                h.options.sack.push(
+                    (u32::MAX - 500).wrapping_add(i * 1000),
+                    u32::MAX.wrapping_add(i * 1000),
+                );
             }
             assert_eq!(h.wire_len(), 20 + 4 + 8 * count as usize);
             let wire = build(&h, &[], false);

@@ -14,3 +14,11 @@ pub mod http;
 /// The kernel-socket WebSocket client: tokio-tungstenite behind the
 /// transport-agnostic [`http::websocket::WebSocket`] trait.
 pub mod tungstenite;
+
+#[cfg(all(test, dpdk))]
+#[path = "../tests/support/allocations.rs"]
+mod allocations;
+
+#[cfg(all(test, dpdk))]
+#[global_allocator]
+static TEST_ALLOCATOR: allocations::CountingAllocator = allocations::CountingAllocator;

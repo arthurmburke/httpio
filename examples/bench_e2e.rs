@@ -494,9 +494,9 @@ mod dpdk_mode {
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicU16, Ordering};
 
-    use httpio::dpdk::tcp::stream::{TcpOptions, TcpStream};
     use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
     use httpio::dpdk::tcp::engine::{EngineConfig, TcpEngine};
+    use httpio::dpdk::tcp::stream::{TcpOptions, TcpStream};
     use httpio::dpdk::tcp::worker::WorkerHandle;
     use httpio::dpdk::{self, EthPort, Mempool};
 

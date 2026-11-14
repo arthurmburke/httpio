@@ -1,27 +1,25 @@
 //! Receive-side reassembly: buffers out-of-order segments and delivers
 //! in-order bytes to the application as gaps get filled.
 //!
-//! Zero-copy: received payloads arrive as refcounted slices of the RX mbuf
-//! (see [`Mbuf::into_bytes`](crate::dpdk::Mbuf::into_bytes)) and move through
-//! the ready queue and out to the application by refcount -- the payload is
-//! never copied. The flip side is that a buffered or application-held chunk
-//! pins its whole mbuf (data room ~2KB) until dropped, so pool sizing must
-//! cover the receive window plus whatever the application retains.
+//! Queued payloads keep their mbuf alive while it is buffered. Borrowed
+//! reads can copy directly from it, while owned reads can turn it into a
+//! zero-copy `Bytes` at the API boundary.
 
 use std::collections::{BTreeMap, VecDeque};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 
 use super::seq::Seq;
 use crate::dpdk::net::tcp::{MAX_SACK_BLOCKS, SackBlocks};
+use crate::dpdk::tcp::chunk::Chunk;
 
 #[derive(Default)]
 pub struct ReassemblyBuffer {
     /// TCP sequence order, including wraparound. Accepted segments are
     /// within one receive window (less than half the sequence space).
-    out_of_order: BTreeMap<Seq, Bytes>,
+    out_of_order: BTreeMap<Seq, Chunk>,
     /// In-order chunks ready for the application to `recv()`.
-    ready: VecDeque<Bytes>,
+    ready: VecDeque<Chunk>,
     /// Total bytes across `ready` (kept incrementally to avoid summing).
     ready_len: usize,
 }
@@ -72,7 +70,9 @@ mod tests {
         );
         // The latest arrival's range leads, wherever it lies.
         assert_eq!(
-            buffer.sack_blocks(Some(next + 100 + 5 * 200 + 60)).as_slice(),
+            buffer
+                .sack_blocks(Some(next + 100 + 5 * 200 + 60))
+                .as_slice(),
             [block(5), block(0), block(1), block(2)]
         );
         assert_eq!(
@@ -111,20 +111,28 @@ impl ReassemblyBuffer {
         self.ready_len
     }
 
-    /// Removes up to `max_len` in-order bytes. Returns a `Bytes` sharing
-    /// the reassembly buffer's storage (zero-copy slice of the front
-    /// chunk); callers loop to drain more.
+    /// Removes up to `max_len` in-order bytes from the front chunk.
     pub fn read(&mut self, max_len: usize) -> Bytes {
-        let Some(front) = self.ready.front_mut() else {
-            return Bytes::new();
-        };
-        let n = max_len.min(front.len());
-        let out = front.split_to(n);
-        if front.is_empty() {
-            self.ready.pop_front();
+        self.read_chunk(max_len)
+            .map_or_else(Bytes::new, Chunk::into_bytes)
+    }
+
+    pub(super) fn read_chunk(&mut self, max_len: usize) -> Option<Chunk> {
+        if max_len == 0 {
+            return None;
         }
+        let chunk = self.ready.pop_front()?;
+        let n = max_len.min(chunk.len());
         self.ready_len -= n;
-        out
+        if n == chunk.len() {
+            return Some(chunk);
+        }
+        // Only a length-limited owned read can split an mbuf. Share its
+        // Bytes owner with the remainder so it is boxed at most once.
+        let mut remainder = chunk.into_bytes();
+        let prefix = remainder.split_to(n);
+        self.ready.push_front(Chunk::Bytes(remainder));
+        Some(Chunk::Bytes(prefix))
     }
 
     /// Inserts a received segment `[seq, seq+data.len())` given the
@@ -134,10 +142,12 @@ impl ReassemblyBuffer {
     ///
     /// Segments (or portions of them) at or before `rcv_nxt` are
     /// duplicates and dropped; segments strictly after `rcv_nxt` are
-    /// buffered until the gap closes. `data` is an owned, mbuf-backed
-    /// `Bytes` and is stored (or prefix-trimmed via an O(1) slice) by
-    /// refcount -- no copy.
+    /// buffered until the gap closes.
     pub fn insert(&mut self, seq: Seq, data: Bytes, rcv_nxt: Seq) -> Seq {
+        self.insert_chunk(seq, Chunk::Bytes(data), rcv_nxt)
+    }
+
+    pub(super) fn insert_chunk(&mut self, seq: Seq, mut data: Chunk, rcv_nxt: Seq) -> Seq {
         if data.is_empty() {
             return rcv_nxt;
         }
@@ -146,12 +156,12 @@ impl ReassemblyBuffer {
             return rcv_nxt; // entirely duplicate
         }
 
-        let (seq, data): (Seq, Bytes) = if seq.lt(rcv_nxt) {
+        let seq = if seq.lt(rcv_nxt) {
             // Partially duplicate: trim the already-delivered prefix.
-            let skip = rcv_nxt.distance(seq).unsigned_abs() as usize;
-            (rcv_nxt, data.slice(skip..))
+            data.advance(rcv_nxt.distance(seq).unsigned_abs() as usize);
+            rcv_nxt
         } else {
-            (seq, data)
+            seq
         };
 
         let mut rcv_nxt = rcv_nxt;
@@ -168,28 +178,28 @@ impl ReassemblyBuffer {
         rcv_nxt
     }
 
-    fn push_ready(&mut self, chunk: Bytes) {
+    fn push_ready(&mut self, chunk: Chunk) {
         self.ready_len += chunk.len();
         self.ready.push_back(chunk);
     }
 
     /// After advancing `rcv_nxt`, pulls any now-contiguous buffered
     /// segments into `ready`, repeating until the next gap. Buffered
-    /// chunks move into `ready` by refcount (only a possible prefix trim,
-    /// which is an O(1) slice).
+    /// chunks move into `ready` with a possible prefix trim.
     fn drain_contiguous(&mut self, mut rcv_nxt: Seq) -> Seq {
         while let Some((&start, _)) = self.out_of_order.first_key_value() {
             let start_seq = start;
             if start_seq.gt(rcv_nxt) {
                 break; // still a gap
             }
-            let data = self.out_of_order.remove(&start).unwrap();
+            let mut data = self.out_of_order.remove(&start).unwrap();
             let end = start_seq + data.len() as u32;
             if end.leq(rcv_nxt) {
                 continue; // fully-duplicate leftover, drop
             }
             let skip = rcv_nxt.distance(start_seq).unsigned_abs() as usize;
-            self.push_ready(data.slice(skip..));
+            data.advance(skip);
+            self.push_ready(data);
             rcv_nxt = end;
         }
         rcv_nxt

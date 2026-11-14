@@ -4,12 +4,11 @@
 //! `crate::tcp::worker`): writes push `Command`s, reads pop `Inbound`
 //! messages. There is no lock and no shared engine access on this side.
 //!
-//! Zero-copy path: [`AsyncRead`]/[`AsyncWrite`] must copy (a borrowed write
-//! slice into an owned `Bytes`, an owned `Bytes` into the caller's read
-//! buffer), so a caller that already holds -- or wants -- owned [`Bytes`] can
-//! use [`send`](TcpStream::send)/[`recv`](TcpStream::recv) instead, which move
-//! the `Bytes` straight across the ring with no copy at this boundary. hyper's
-//! header/handshake framing keeps using the `AsyncRead`/`AsyncWrite` impls.
+//! [`AsyncRead`] copies directly from the receive mbuf into the caller's
+//! buffer. [`recv`](TcpStream::recv) hands the mbuf to [`Bytes`] so the caller
+//! can keep the data without copying it. [`send`](TcpStream::send) moves
+//! owned bytes across the ring, while [`AsyncWrite`] copies borrowed writes
+//! into storage the worker can keep.
 //!
 //! Waiting: when a read has no data yet (or a write can't enqueue because
 //! the command ring or send credit is exhausted), the stream stores its
@@ -22,7 +21,6 @@
 //! runtime built without the I/O driver (`enable_time` only): tokio's I/O
 //! driver makes an `epoll_wait` call on its own schedule.
 
-use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io::{self, IoSlice};
 use std::net::Ipv4Addr;
@@ -37,7 +35,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::core::spinlock::SpinLock;
 use crate::dpdk::DmaWriter;
 use crate::dpdk::tcp::app_wake::AppWake;
-use crate::dpdk::tcp::worker::{CmdTx, Command, Inbound, InboundRx, WorkerHandle};
+use crate::dpdk::tcp::chunk::Chunk;
+use crate::dpdk::tcp::worker::{CmdTx, Command, Inbound, InboundMessage, InboundRx, WorkerHandle};
 
 /// Per-connection TCP transport options. Attach to an HTTP request via
 /// `http::Extensions` (`request.extensions_mut().insert(TcpOptions {..})`)
@@ -157,7 +156,7 @@ impl Drop for Parker {
 /// ```
 ///
 /// Everything but `Connecting` and `Open` is terminal for the receive
-/// side. Bytes already in `read_queue` are still delivered first.
+/// side. Bytes already in `read_chunk` are still delivered first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamState {
     /// The handshake is in flight.
@@ -165,10 +164,10 @@ enum StreamState {
     /// The handshake completed and the peer may still send.
     Open,
     /// The peer finished sending (or the worker went away) after the
-    /// handshake: reads end cleanly once `read_queue` drains.
+    /// handshake: reads end cleanly once `read_chunk` drains.
     Eof,
     /// The connection was reset, or the handshake failed: reads error once
-    /// `read_queue` drains and writes error at once.
+    /// `read_chunk` drains and writes error at once.
     Reset,
     /// The worker refused the open: the 4-tuple is already in use.
     AddrInUse,
@@ -294,9 +293,8 @@ pub struct TcpStream {
     /// only in tests that build a stream without a worker.
     wake: Option<Parker>,
     state: StreamState,
-    /// In-order received chunks not yet delivered to the reader (copied out
-    /// by `poll_read`, or handed over as-is by `poll_recv`).
-    read_queue: VecDeque<Bytes>,
+    /// The next in-order chunk, including any unread suffix of a partial read.
+    read_chunk: Option<Chunk>,
     /// Where `poll_write` copies borrowed data on a port with TSO, so the
     /// engine attaches it to packets without a second copy; `None`
     /// otherwise, and the data goes to the ordinary heap.
@@ -334,7 +332,7 @@ impl TcpStream {
             flush: flush.map(|flush| flush.attach(&endpoints.wake)),
             wake: Some(Parker(endpoints.wake)),
             state: StreamState::Connecting,
-            read_queue: VecDeque::new(),
+            read_chunk: None,
             writer: endpoints.dma_writes.then(DmaWriter::new),
             lent: LentBody::Empty,
         };
@@ -490,8 +488,8 @@ impl TcpStream {
     fn try_recv(&mut self) -> Poll<io::Result<Option<Bytes>>> {
         self.drain_flush();
         self.drain_inbound();
-        if let Some(chunk) = self.read_queue.pop_front() {
-            return Poll::Ready(Ok(Some(chunk)));
+        if let Some(chunk) = self.read_chunk.take() {
+            return Poll::Ready(Ok(Some(chunk.into_bytes())));
         }
         match self.state {
             StreamState::Reset => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
@@ -546,17 +544,17 @@ impl TcpStream {
         // pushed in between are still queued.) `is_closed()` is true when
         // either end is dropped; from the receiver that means the sender.
         let sender_gone = self.inbound_rx.is_closed();
-        while self.read_queue.is_empty() {
-            let Some(msg) = self.inbound_rx.pop() else {
+        while self.read_chunk.is_none() {
+            let Some(msg) = self.inbound_rx.pop_chunk() else {
                 break;
             };
             match msg {
-                Inbound::Data(bytes) => {
-                    if !bytes.is_empty() {
-                        self.read_queue.push_back(bytes);
+                InboundMessage::Data(chunk) => {
+                    if !chunk.is_empty() {
+                        self.read_chunk = Some(chunk);
                     }
                 }
-                control => self.on_control(control),
+                InboundMessage::Control(control) => self.on_control(control),
             }
         }
         // If the worker dropped its inbound sender (connection reaped),
@@ -633,25 +631,25 @@ impl TcpStream {
         // with a large buffer should not need a poll per segment.
         let mut wrote = false;
         while buf.remaining() > 0 {
-            if this.read_queue.is_empty() && wrote {
+            if this.read_chunk.is_none() && wrote {
                 this.drain_inbound();
             }
-            let Some(front) = this.read_queue.front_mut() else {
+            let Some(front) = this.read_chunk.as_mut() else {
                 break;
             };
             let n = front.len().min(buf.remaining());
-            buf.put_slice(&front[..n]);
+            buf.put_slice(&front.as_slice()[..n]);
             front.advance(n);
             wrote = true;
             if front.is_empty() {
-                this.read_queue.pop_front();
+                this.read_chunk = None;
             }
         }
 
         if wrote {
             return Poll::Ready(Ok(()));
         }
-        // `read_queue` is empty here: surface how the inbound side ended.
+        // `read_chunk` is empty here: surface how the inbound side ended.
         match this.state {
             StreamState::Reset => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
             StreamState::Connecting | StreamState::Open => Poll::Pending,
@@ -854,7 +852,7 @@ impl TcpStream {
     pub(crate) fn test_stream() -> (
         TcpStream,
         crate::dpdk::tcp::worker::CmdRx,
-        crate::dpdk::tcp::worker::InboundTx,
+        crate::dpdk::tcp::worker::InboundSender,
         Arc<crate::dpdk::tcp::worker::SendCredit>,
     ) {
         let (cmd_tx, cmd_rx, credit) = crate::dpdk::tcp::worker::command_channel();
@@ -865,7 +863,7 @@ impl TcpStream {
             flush: None,
             wake: None,
             state: StreamState::Open,
-            read_queue: VecDeque::new(),
+            read_chunk: None,
             writer: None,
             lent: LentBody::Empty,
         };
@@ -880,7 +878,7 @@ impl TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dpdk::tcp::worker::{CmdRx, InboundTx, SEND_CAPACITY};
+    use crate::dpdk::tcp::worker::{CmdRx, InboundSender, SEND_CAPACITY};
 
     #[test]
     fn writes_stop_at_byte_limit_even_after_worker_drains_ring() {
@@ -940,9 +938,12 @@ mod tests {
         let (mut stream, _rx, tx, _credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         for b in [b"first".as_slice(), b"second".as_slice()] {
-            assert!(tx.push(Inbound::Data(Bytes::copy_from_slice(b))).is_ok());
+            assert!(
+                tx.push(Inbound::Data(Bytes::copy_from_slice(b)).into())
+                    .is_ok()
+            );
         }
-        assert!(tx.push(Inbound::Reset).is_ok());
+        assert!(tx.push(Inbound::Reset.into()).is_ok());
         drop(tx);
         for _ in 0..100 {
             assert!(matches!(
@@ -950,7 +951,7 @@ mod tests {
                 Poll::Ready(Ok(0))
             ));
         }
-        assert_eq!(stream.read_queue.len(), 1);
+        assert!(stream.read_chunk.is_some());
         assert_eq!(stream.inbound_rx.len(), 2);
         assert_eq!(stream.state, StreamState::Open);
         for expected in [b"first".as_slice(), b"second".as_slice()] {
@@ -969,7 +970,7 @@ mod tests {
         let (mut stream, _rx, tx, credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         assert!(
-            tx.push(Inbound::Data(Bytes::from_static(b"unread")))
+            tx.push(Inbound::Data(Bytes::from_static(b"unread")).into())
                 .is_ok()
         );
         stream.drain_inbound();
@@ -979,15 +980,24 @@ mod tests {
         let mut data = Some(Bytes::from_static(b"x"));
         assert!(matches!(stream.poll_send(&mut cx, &mut data),
             Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::ConnectionReset));
-        assert_eq!(stream.read_queue.front().unwrap(), b"unread".as_slice());
+        assert_eq!(
+            stream.read_chunk.as_ref().unwrap().as_slice(),
+            b"unread".as_slice()
+        );
     }
 
     #[test]
     fn partial_read_keeps_only_one_staged_chunk() {
         let (mut stream, _rx, tx, _) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(tx.push(Inbound::Data(Bytes::from_static(b"abcd"))).is_ok());
-        assert!(tx.push(Inbound::Data(Bytes::from_static(b"ef"))).is_ok());
+        assert!(
+            tx.push(Inbound::Data(Bytes::from_static(b"abcd")).into())
+                .is_ok()
+        );
+        assert!(
+            tx.push(Inbound::Data(Bytes::from_static(b"ef")).into())
+                .is_ok()
+        );
         let mut storage = [0; 2];
         let mut buf = ReadBuf::new(&mut storage);
         assert!(matches!(
@@ -996,7 +1006,10 @@ mod tests {
         ));
         assert_eq!(buf.filled(), b"ab");
         stream.drain_inbound();
-        assert_eq!(stream.read_queue.front().unwrap(), b"cd".as_slice());
+        assert_eq!(
+            stream.read_chunk.as_ref().unwrap().as_slice(),
+            b"cd".as_slice()
+        );
         assert_eq!(stream.inbound_rx.len(), 1);
     }
 
@@ -1004,7 +1017,7 @@ mod tests {
     fn parked_fixture() -> (
         TcpStream,
         CmdRx,
-        InboundTx,
+        InboundSender,
         crate::dpdk::tcp::app_wake::AppNotifier,
         Arc<AppWake>,
     ) {
@@ -1027,7 +1040,7 @@ mod tests {
             while next < CHUNKS {
                 notifier.retry();
                 let chunk = Bytes::copy_from_slice(&next.to_be_bytes());
-                if inbound_tx.push(Inbound::Data(chunk)).is_ok() {
+                if inbound_tx.push(Inbound::Data(chunk).into()).is_ok() {
                     notifier.notify(&wake);
                     next += 1;
                     // Pause now and then so the reader really does wait.

@@ -169,10 +169,16 @@ fn emulated_nic(
         ffi::RTE_MBUF_F_RX_IP_CKSUM_GOOD as u64 | ffi::RTE_MBUF_F_RX_L4_CKSUM_GOOD as u64;
     let raw = packet.as_raw();
     // SAFETY: `packet` is a live, uniquely owned mbuf.
-    let (flags, tx_offload, segments) =
-        unsafe { ((*raw).ol_flags, (*raw).__bindgen_anon_3.tx_offload, (*raw).nb_segs) };
+    let (flags, tx_offload, segments) = unsafe {
+        (
+            (*raw).ol_flags,
+            (*raw).__bindgen_anon_3.tx_offload,
+            (*raw).nb_segs,
+        )
+    };
     if segments == 1 && flags & ffi::RTE_MBUF_F_TX_TCP_SEG == 0 {
-        let tx = ffi::RTE_MBUF_F_TX_IPV4 | ffi::RTE_MBUF_F_TX_IP_CKSUM | ffi::RTE_MBUF_F_TX_TCP_CKSUM;
+        let tx =
+            ffi::RTE_MBUF_F_TX_IPV4 | ffi::RTE_MBUF_F_TX_IP_CKSUM | ffi::RTE_MBUF_F_TX_TCP_CKSUM;
         unsafe { (*raw).ol_flags = (flags & !tx) | GOOD };
         out.push_back(packet);
         return;
@@ -197,8 +203,7 @@ fn emulated_nic(
         let mut wire = Mbuf::alloc(pool).expect("harness pool exhausted");
         let buf = wire.append((header_len + n) as u16).unwrap();
         buf[..header_len].copy_from_slice(&scratch[..header_len]);
-        buf[header_len..]
-            .copy_from_slice(&scratch[header_len + offset..header_len + offset + n]);
+        buf[header_len..].copy_from_slice(&scratch[header_len + offset..header_len + offset + n]);
         buf[16..18].copy_from_slice(&((header_len - 14 + n) as u16).to_be_bytes());
         buf[38..42].copy_from_slice(&seq.wrapping_add(offset as u32).to_be_bytes());
         // FIN and PSH belong to the last wire packet only.
@@ -277,7 +282,8 @@ fn dpdk(args: &[String]) {
         let mut burst: Vec<Mbuf> = Vec::with_capacity(64);
         // BENCH_LIBRARY_DELIVER=1 hands an engine one packet per poll, which
         // is what a poll loop faster than the packet rate sees.
-        let deliver: usize = std::env::var("BENCH_LIBRARY_DELIVER").map_or(64, |v| v.parse().unwrap());
+        let deliver: usize =
+            std::env::var("BENCH_LIBRARY_DELIVER").map_or(64, |v| v.parse().unwrap());
         assert!((1..=64).contains(&deliver));
         // BENCH_LIBRARY_LOSS=N drops every Nth data packet from the sender
         // to the receiver (retransmissions included), after segmentation.
@@ -373,52 +379,48 @@ fn dpdk(args: &[String]) {
             } else {
                 Bytes::from((0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>())
             };
-            run(
-                label,
-                size,
-                |_, output, parts| {
-                    timed(breakdown, &mut parts.app_ns, || {
-                        a.send(a_tuple, payload.clone())
+            run(label, size, |_, output, parts| {
+                timed(breakdown, &mut parts.app_ns, || {
+                    a.send(a_tuple, payload.clone())
+                });
+                let mut received = 0;
+                let mut replied = false;
+                let start = Instant::now();
+                loop {
+                    timed(breakdown, &mut parts.tx_ns, || {
+                        a.poll_into(&a_port, &pool, Instant::now(), &mut a_events)
                     });
-                    let mut received = 0;
-                    let mut replied = false;
-                    let start = Instant::now();
-                    loop {
-                        timed(breakdown, &mut parts.tx_ns, || {
-                            a.poll_into(&a_port, &pool, Instant::now(), &mut a_events)
-                        });
-                        timed(breakdown, &mut parts.forward_ns, || {
-                            forward(&a_port, &b_port, &mut a_to_b, true)
-                        });
-                        timed(breakdown, &mut parts.rx_ns, || {
-                            b.poll_into(&b_port, &pool, Instant::now(), &mut b_events)
-                        });
-                        timed(breakdown, &mut parts.forward_ns, || {
-                            forward(&b_port, &a_port, &mut b_to_a, false)
-                        });
-                        timed(breakdown, &mut parts.app_ns, || {
-                            loop {
-                                let chunk = b.recv(b_tuple, size - received);
-                                if chunk.is_empty() {
-                                    break;
-                                }
-                                output[received..received + chunk.len()].copy_from_slice(&chunk);
-                                received += chunk.len();
+                    timed(breakdown, &mut parts.forward_ns, || {
+                        forward(&a_port, &b_port, &mut a_to_b, true)
+                    });
+                    timed(breakdown, &mut parts.rx_ns, || {
+                        b.poll_into(&b_port, &pool, Instant::now(), &mut b_events)
+                    });
+                    timed(breakdown, &mut parts.forward_ns, || {
+                        forward(&b_port, &a_port, &mut b_to_a, false)
+                    });
+                    timed(breakdown, &mut parts.app_ns, || {
+                        loop {
+                            let chunk = b.recv(b_tuple, size - received);
+                            if chunk.is_empty() {
+                                break;
                             }
-                            if received == size && !replied {
-                                b.send(b_tuple, Bytes::from_static(&[1]));
-                                replied = true;
-                            }
-                        });
-                        let reply = timed(breakdown, &mut parts.app_ns, || a.recv(a_tuple, 1));
-                        if !reply.is_empty() {
-                            assert_eq!(reply.as_ref(), &[1]);
-                            break;
+                            output[received..received + chunk.len()].copy_from_slice(&chunk);
+                            received += chunk.len();
                         }
-                        assert!(start.elapsed() < Duration::from_secs(5), "transfer stalled");
+                        if received == size && !replied {
+                            b.send(b_tuple, Bytes::from_static(&[1]));
+                            replied = true;
+                        }
+                    });
+                    let reply = timed(breakdown, &mut parts.app_ns, || a.recv(a_tuple, 1));
+                    if !reply.is_empty() {
+                        assert_eq!(reply.as_ref(), &[1]);
+                        break;
                     }
-                },
-            );
+                    assert!(start.elapsed() < Duration::from_secs(5), "transfer stalled");
+                }
+            });
             // Discard residual ACK/window updates before creating the next pair.
             drop((a, b));
             a_to_b.clear();

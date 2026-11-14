@@ -1561,17 +1561,17 @@ mod tests {
 
     // ---- The zero-copy TCP transport. ----
 
-    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundTx};
+    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundSender};
 
     /// The worker's ends of a test [`TcpStream`]'s rings.
     struct Wire {
         cmd_rx: CmdRx,
-        inbound_tx: InboundTx,
+        inbound_tx: InboundSender,
     }
 
     impl Wire {
         fn push(&self, chunk: Bytes) {
-            assert!(self.inbound_tx.push(Inbound::Data(chunk)).is_ok());
+            assert!(self.inbound_tx.push(Inbound::Data(chunk).into()).is_ok());
         }
 
         /// Everything the client has sent so far, concatenated.
@@ -1906,7 +1906,7 @@ mod tests {
         let (mut ws, wire) = tcp_client(Bytes::new());
         // Half a frame, then the peer's FIN.
         wire.push(Bytes::from_static(&[0x82, 5, b'h']));
-        assert!(wire.inbound_tx.push(Inbound::Eof).is_ok());
+        assert!(wire.inbound_tx.push(Inbound::Eof.into()).is_ok());
         assert!(matches!(
             poll_message(&mut ws),
             Poll::Ready(Err(WebSocketError::UncleanClose))
@@ -1916,7 +1916,7 @@ mod tests {
     #[test]
     fn a_reset_over_tcp_surfaces_as_an_io_error() {
         let (mut ws, wire) = tcp_client(Bytes::new());
-        assert!(wire.inbound_tx.push(Inbound::Reset).is_ok());
+        assert!(wire.inbound_tx.push(Inbound::Reset.into()).is_ok());
         assert!(matches!(
             poll_message(&mut ws),
             Poll::Ready(Err(WebSocketError::Io(std::io::ErrorKind::ConnectionReset)))
@@ -1943,7 +1943,11 @@ mod tests {
                 Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
                 .to_vec();
             reply.extend(server_frame(0x81, b"welcome"));
-            assert!(inbound_tx.push(Inbound::Data(Bytes::from(reply))).is_ok());
+            assert!(
+                inbound_tx
+                    .push(Inbound::Data(Bytes::from(reply)).into())
+                    .is_ok()
+            );
             Wire { cmd_rx, inbound_tx }
         });
 

@@ -9,6 +9,7 @@ use bytes::Bytes;
 
 use crate::dpdk::net::tcp::{TcpHeader, TcpOptions, flags};
 
+use super::chunk::Chunk;
 use super::congestion::CongestionControl;
 use super::rto::{MAX_RETRANSMITS, MAX_RTO, RetransmitQueue, RtoEstimator};
 use super::rx_queue::ReassemblyBuffer;
@@ -402,8 +403,13 @@ impl Tcb {
     }
 
     pub fn recv(&mut self, max_len: usize) -> Bytes {
-        let data = self.recv_buffer.read(max_len);
-        if !data.is_empty() && self.state.can_receive() {
+        self.recv_chunk(max_len)
+            .map_or_else(Bytes::new, Chunk::into_bytes)
+    }
+
+    pub(super) fn recv_chunk(&mut self, max_len: usize) -> Option<Chunk> {
+        let data = self.recv_buffer.read_chunk(max_len)?;
+        if self.state.can_receive() {
             // Announce newly freed space without waiting for another peer
             // packet, but only when the peer needs it: its window is shut,
             // or it holds at most half the buffer and the read doubled
@@ -416,7 +422,7 @@ impl Tcb {
                 self.ack_pending = true;
             }
         }
-        data
+        Some(data)
     }
 
     pub fn readable_len(&self) -> usize {
@@ -456,6 +462,21 @@ impl Tcb {
     /// `payload_len` must equal the total length of those chunks. The closure
     /// runs only if TCP accepts some of the payload.
     pub fn on_segment_chunks_with<I: IntoIterator<Item = Bytes>>(
+        &mut self,
+        hdr: &TcpHeader,
+        payload_len: usize,
+        payload: impl FnOnce() -> I,
+        now: Instant,
+    ) {
+        self.on_segment_rx(
+            hdr,
+            payload_len,
+            || payload().into_iter().map(Chunk::Bytes),
+            now,
+        );
+    }
+
+    pub(super) fn on_segment_rx<I: IntoIterator<Item = Chunk>>(
         &mut self,
         hdr: &TcpHeader,
         payload_len: usize,
@@ -557,7 +578,7 @@ impl Tcb {
         }
     }
 
-    fn on_segment_general<I: IntoIterator<Item = Bytes>>(
+    fn on_segment_general<I: IntoIterator<Item = Chunk>>(
         &mut self,
         hdr: &TcpHeader,
         payload_len: u32,
@@ -655,7 +676,7 @@ impl Tcb {
                     data.truncate(remaining.min(data.len()));
                     remaining -= data.len();
                     let end = chunk_seq + data.len() as u32;
-                    self.rcv_nxt = self.recv_buffer.insert(chunk_seq, data, self.rcv_nxt);
+                    self.rcv_nxt = self.recv_buffer.insert_chunk(chunk_seq, data, self.rcv_nxt);
                     chunk_seq = end;
                 }
             }
@@ -678,8 +699,8 @@ impl Tcb {
             }
             if self.sack_ok && !in_order {
                 self.sack_pending = true;
-                self.sack_recent = (seq.gt(expected) && self.recv_buffer.has_out_of_order())
-                    .then_some(seq);
+                self.sack_recent =
+                    (seq.gt(expected) && self.recv_buffer.has_out_of_order()).then_some(seq);
             }
         }
 
@@ -1089,8 +1110,7 @@ impl Tcb {
             self.retransmit.push(seq, Bytes::new(), false, true, now);
             self.state = self.state.on_fin_sent();
             out.push(self.make_segment(seq, flags::FIN | flags::ACK, Bytes::new(), None));
-        } else if (self.ack_pending && out.is_empty()) || (self.sack_pending && out.len() < limit)
-        {
+        } else if (self.ack_pending && out.is_empty()) || (self.sack_pending && out.len() < limit) {
             self.ack_sent();
             out.push(self.make_segment(self.snd_nxt, flags::ACK, Bytes::new(), None));
         }
@@ -1492,7 +1512,8 @@ mod tests {
         let now = Instant::now();
         let mut tcb = establish_with_sack(now, true);
         let start = tcb.rcv_nxt;
-        let segment = |tcb: &Tcb, offset: u32| header(start + offset, tcb.snd_nxt, flags::ACK, u16::MAX);
+        let segment =
+            |tcb: &Tcb, offset: u32| header(start + offset, tcb.snd_nxt, flags::ACK, u16::MAX);
 
         let hdr = segment(&tcb, 1000);
         tcb.on_segment(&hdr, Bytes::from(vec![1; 500]), now);
@@ -1547,7 +1568,9 @@ mod tests {
         // The peer holds everything except the first and third segments.
         let mut ack = header(tcb.rcv_nxt, base, flags::ACK, u16::MAX);
         ack.options.sack.push((base + 1460).0, (base + 2 * 1460).0);
-        ack.options.sack.push((base + 3 * 1460).0, (base + 10 * 1460).0);
+        ack.options
+            .sack
+            .push((base + 3 * 1460).0, (base + 10 * 1460).0);
         tcb.on_segment(&ack, Bytes::new(), now);
         assert!(tcb.congestion.in_fast_recovery());
         assert!(tcb.has_pending_output());
@@ -1585,7 +1608,9 @@ mod tests {
 
         // On the wire it was eight packets; the second was lost.
         let mut ack = header(tcb.rcv_nxt, base + 1460, flags::ACK, u16::MAX);
-        ack.options.sack.push((base + 2 * 1460).0, (base + 8 * 1460).0);
+        ack.options
+            .sack
+            .push((base + 2 * 1460).0, (base + 8 * 1460).0);
         tcb.on_segment(&ack, Bytes::new(), now);
         let out = tcb.poll_output(now);
         assert_eq!(out.len(), 1);

@@ -24,6 +24,7 @@ use crate::dpdk::net::eth::EthAddr;
 use crate::dpdk::net::{arp, eth, ipv4, tcp};
 use crate::dpdk::{EthPort, Mbuf, Mempool};
 
+use super::chunk::Chunk;
 use super::seq::Seq;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple, OutSegment, Tcb};
@@ -382,15 +383,20 @@ impl TcpEngine {
         max_len: usize,
         mut deliver: impl FnMut(Bytes) -> bool,
     ) {
+        self.recv_each_chunk(tuple, max_len, |chunk| deliver(chunk.into_bytes()));
+    }
+
+    pub(super) fn recv_each_chunk(
+        &mut self,
+        tuple: FourTuple,
+        max_len: usize,
+        mut deliver: impl FnMut(Chunk) -> bool,
+    ) {
         let Some(conn) = self.connections.get_mut(&tuple) else {
             return;
         };
         let mut any = false;
-        loop {
-            let data = conn.tcb.recv(max_len);
-            if data.is_empty() {
-                break;
-            }
+        while let Some(data) = conn.tcb.recv_chunk(max_len) {
             any = true;
             if !deliver(data) {
                 break;
@@ -941,7 +947,7 @@ impl TcpEngine {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             let start = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + hdr_len;
             let end = eth::ETH_HDR_LEN + total_len;
-            conn.tcb.on_segment_chunks_with(
+            conn.tcb.on_segment_rx(
                 &tcp_hdr,
                 payload_len,
                 || {
@@ -957,10 +963,10 @@ impl TcpEngine {
                         if n == 0 {
                             return None;
                         }
-                        let bytes = segment.into_bytes().slice(skip..skip + n);
+                        let chunk = Chunk::packet(segment, skip, n);
                         skip = 0;
                         remaining -= n;
-                        Some(bytes)
+                        Some(chunk)
                     })
                 },
                 now,
@@ -1565,14 +1571,51 @@ mod tests {
             let packet = unsafe { Mbuf::from_raw(raw[0]) };
             assert_eq!(packet.pkt_len(), 54 + 3003);
             engine.handle_frame(packet, true, true, now);
-            let mut received = Vec::new();
-            while engine.readable_len(tuple) != 0 {
-                received.extend_from_slice(&engine.recv(tuple, 65536));
-            }
-            assert_eq!(received.len(), 3003);
-            for (i, chunk) in received.chunks(1001).enumerate() {
-                assert!(chunk.iter().all(|b| *b == i as u8));
-            }
+            use crate::dpdk::tcp::stream::TcpStream;
+            use crate::dpdk::tcp::worker::InboundMessage;
+            use std::pin::Pin;
+            use std::task::{Context, Poll, Waker};
+            use tokio::io::{AsyncRead, ReadBuf};
+
+            let (mut stream, _commands, inbound, _) = TcpStream::test_stream();
+            engine.recv_each_chunk(tuple, usize::MAX, |chunk| {
+                assert!(matches!(chunk, Chunk::Packet { .. }));
+                assert!(inbound.push(InboundMessage::Data(chunk)).is_ok());
+                true
+            });
+            let mut cx = Context::from_waker(Waker::noop());
+            // Cross a segment boundary and leave a suffix of the second
+            // mbuf staged. Borrowed reads must not allocate a Bytes owner.
+            let mut storage = [0; 1500];
+            let mut buf = ReadBuf::new(&mut storage);
+            let (result, allocations) = crate::allocations::count_allocations(|| {
+                Pin::new(&mut stream).poll_read(&mut cx, &mut buf)
+            });
+            assert!(matches!(result, Poll::Ready(Ok(()))));
+            assert_eq!(allocations, 0);
+            assert_eq!(buf.filled().len(), 1500);
+            assert!(buf.filled()[..1001].iter().all(|&byte| byte == 0));
+            assert!(buf.filled()[1001..].iter().all(|&byte| byte == 1));
+            assert_eq!(available(), baseline - 2);
+
+            // An owned read of the staged suffix makes one Bytes owner.
+            let (result, allocations) =
+                crate::allocations::count_allocations(|| stream.poll_recv(&mut cx));
+            let Poll::Ready(Ok(Some(suffix))) = result else {
+                panic!("expected the staged suffix");
+            };
+            assert_eq!(allocations, 1);
+            assert_eq!(suffix.len(), 502);
+            assert!(suffix.iter().all(|&byte| byte == 1));
+            let slice = suffix.slice(1..);
+            drop(suffix);
+            assert_eq!(available(), baseline - 2);
+            std::thread::spawn(move || drop(slice)).join().unwrap();
+            assert_eq!(available(), baseline - 1);
+
+            // Abandoning an unread ring entry returns its mbuf too.
+            drop(inbound);
+            drop(stream);
             assert_eq!(available(), baseline);
 
             // Corrupted payloads are never eligible for GRO or accepted by TCP.
