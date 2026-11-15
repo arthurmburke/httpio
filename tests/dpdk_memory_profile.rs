@@ -538,6 +538,22 @@ mod dpdk {
                 Fixture::finish_tx,
             ));
         }
+        // The worker's half of a copied write: `TcpStream` copies into a
+        // `from_owner` buffer on the application thread (outside the
+        // window), so the engine's retransmit clone must not allocate.
+        let staged = std::cell::RefCell::new(None);
+        rows.push(profile(
+            "tx_copy_shared_1024",
+            iterations,
+            &mut f,
+            |_| *staged.borrow_mut() = Some(Bytes::from_owner(DATA[..1024].to_vec())),
+            |f| {
+                let bytes = staged.borrow_mut().take().unwrap();
+                f.engine.send(f.tuple, bytes);
+                f.poll();
+            },
+            Fixture::finish_tx,
+        ));
         for row in &rows {
             if matches!(
                 row.scenario,
@@ -547,6 +563,7 @@ mod dpdk {
                     | "rx_ack"
                     | "rx_rejected"
                     | "tx_owned_1024"
+                    | "tx_copy_shared_1024"
                     | "tx_2_fragments"
             ) {
                 assert_eq!(

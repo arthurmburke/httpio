@@ -57,6 +57,7 @@ engine construction and the initial handshake.
 | `rx_data_1024` | Receive, read and release 1,024 bytes |
 | `tx_owned_1024` | Send a static owned `Bytes` and build/transmit its packet |
 | `tx_copied_1024` | Copy 1,024 borrowed bytes into `Bytes`, then send (models the transport write copy, not the async ring) |
+| `tx_copy_shared_1024` | Send 1,024 bytes copied, outside the window, the way `TcpStream` copies a write (`Bytes::from_owner`); the worker's half of `tx_copied_1024`, asserted allocation-free |
 | `tx_2_fragments` | Send two static slices totaling 1,024 bytes within inline metadata |
 | `tx_4_fragments` | Send four static slices totaling 1,024 bytes and allocate overflow metadata |
 | `tx_32_fragments` | Send 32 static slices totaling 1,024 bytes; exercises overflow metadata |

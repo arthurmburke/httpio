@@ -842,7 +842,12 @@ impl TcpStream {
                     let take = part.len().min(len - heap.len());
                     heap.extend_from_slice(&part[..take]);
                 }
-                Bytes::from(heap)
+                // Shared from the start: the worker clones every segment
+                // into its retransmit queue, and the first clone of a
+                // Vec-backed `Bytes` allocates its refcount -- a malloc on
+                // the lcore. `from_owner` pays for it here, on the app
+                // thread, and its clones never allocate.
+                Bytes::from_owner(heap)
             }
         };
         let n = chunk.len();
@@ -969,6 +974,41 @@ impl TcpStream {
 mod tests {
     use super::*;
     use crate::dpdk::tcp::worker::{CmdRx, InboundSender, SEND_CAPACITY};
+
+    /// The worker clones each sent chunk into its retransmit queue (and
+    /// slices it into segments). That must never allocate on the lcore, so
+    /// every chunk arrives already shared -- including the heap copy a write
+    /// without DMA memory makes, and a caller's Vec-backed `Bytes`.
+    #[test]
+    fn sent_chunks_clone_on_the_worker_without_allocating() {
+        use crate::allocations::count_allocations;
+        let (mut stream, rx, _tx, _credit) = TcpStream::test_stream();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut check = |what: &str| {
+            let Some(Command::Send(sent)) = rx.pop() else {
+                panic!("{what}: nothing sent")
+            };
+            let (_, allocations) = count_allocations(|| {
+                let retransmit = std::hint::black_box(sent.clone());
+                let segment = std::hint::black_box(sent.slice(..sent.len() / 2));
+                drop((retransmit, segment));
+            });
+            assert_eq!(allocations, 0, "{what}: the worker's clone allocated");
+        };
+
+        assert!(matches!(
+            Pin::new(&mut stream).poll_write(&mut cx, &[1; 1024]),
+            Poll::Ready(Ok(1024))
+        ));
+        check("poll_write heap copy");
+
+        let mut owned = Some(Bytes::from(vec![2; 1024]));
+        assert!(matches!(
+            stream.poll_send(&mut cx, &mut owned),
+            Poll::Ready(Ok(()))
+        ));
+        check("poll_send of a Vec-backed Bytes");
+    }
 
     #[test]
     fn writes_stop_at_byte_limit_even_after_worker_drains_ring() {
