@@ -100,25 +100,26 @@ fn each_queue_carries_the_connections_whose_ports_lead_to_it() {
 
         // Frames each client queue was handed, to show both were used.
         let mut delivered = [0usize; 2];
-        let mut pump = |engine0: &mut TcpEngine, engine1: &mut TcpEngine, server: &mut TcpEngine| {
-            let now = Instant::now();
-            engine0.poll(&queue0, &pool0, now);
-            engine1.poll(&queue1, &pool1, now);
-            // After a poll, what is in a ring port's queue is what its
-            // engine transmitted. Client to server: one queue there.
-            for queue in [&queue0, &queue1] {
-                let frames = queue.rx_burst(64);
-                assert!(server_port.tx_burst(frames).is_empty());
-            }
-            server.poll(&server_port, &server_pool, now);
-            // Server to client: the NIC picks the queue.
-            for frame in server_port.rx_burst(64) {
-                let queue = nic_queue(steering, frame.data());
-                delivered[queue] += 1;
-                let port: &EthPort = [&queue0, &queue1][queue];
-                assert!(port.tx_burst(vec![frame]).is_empty());
-            }
-        };
+        let mut pump =
+            |engine0: &mut TcpEngine, engine1: &mut TcpEngine, server: &mut TcpEngine| {
+                let now = Instant::now();
+                engine0.poll(&queue0, &pool0, now);
+                engine1.poll(&queue1, &pool1, now);
+                // After a poll, what is in a ring port's queue is what its
+                // engine transmitted. Client to server: one queue there.
+                for queue in [&queue0, &queue1] {
+                    let frames = queue.rx_burst(64);
+                    assert!(server_port.tx_burst(frames).is_empty());
+                }
+                server.poll(&server_port, &server_pool, now);
+                // Server to client: the NIC picks the queue.
+                for frame in server_port.rx_burst(64) {
+                    let queue = nic_queue(steering, frame.data());
+                    delivered[queue] += 1;
+                    let port: &EthPort = [&queue0, &queue1][queue];
+                    assert!(port.tx_burst(vec![frame]).is_empty());
+                }
+            };
 
         // Two local ports, one leading to each queue; each engine opens
         // the connection whose port is its own.

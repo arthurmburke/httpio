@@ -40,9 +40,9 @@ use crate::dpdk::{self, EthPort, Mempool, WorkerJoin};
 use super::app_wake::{self, AppNotifier, AppReady, AppWake};
 use super::chunk::Chunk;
 use super::engine::TcpEngine;
-use crate::dpdk::steering::PortSteering;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple};
+use crate::dpdk::steering::PortSteering;
 
 /// Control ring depth (concurrent connection opens in flight).
 const CTRL_CAP: usize = 256;

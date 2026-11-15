@@ -104,7 +104,9 @@ pub struct ArpEntry {
 /// entry is due for refresh, so the lock is never contended in steady
 /// state.
 #[derive(Clone)]
-pub struct SharedNeighbors(std::sync::Arc<crate::core::spinlock::SpinLock<Vec<(Ipv4Addr, ArpEntry)>>>);
+pub struct SharedNeighbors(
+    std::sync::Arc<crate::core::spinlock::SpinLock<Vec<(Ipv4Addr, ArpEntry)>>>,
+);
 
 impl Default for SharedNeighbors {
     fn default() -> Self {
@@ -120,8 +122,12 @@ impl SharedNeighbors {
     }
 
     fn get(&self, ip: Ipv4Addr) -> Option<ArpEntry> {
-        self.0
-            .with(|entries| entries.iter().find(|(known, _)| *known == ip).map(|(_, e)| *e))
+        self.0.with(|entries| {
+            entries
+                .iter()
+                .find(|(known, _)| *known == ip)
+                .map(|(_, e)| *e)
+        })
     }
 
     fn publish(&self, ip: Ipv4Addr, entry: ArpEntry) {

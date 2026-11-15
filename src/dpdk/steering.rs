@@ -96,7 +96,9 @@ mod tests {
 
     /// What a NIC programmed with `rules` does with a destination port.
     fn nic_queue(rules: &[FlowRule], port: u16) -> Option<u16> {
-        let mut hits = rules.iter().filter(|rule| port & rule.mask == rule.dst_port);
+        let mut hits = rules
+            .iter()
+            .filter(|rule| port & rule.mask == rule.dst_port);
         let hit = hits.next().map(|rule| rule.queue);
         assert!(hits.next().is_none(), "port {port} matches two rules");
         hit
@@ -139,7 +141,6 @@ mod tests {
             // power of two: the smallest share is half the largest.
             let (least, most) = (owned.iter().min().unwrap(), owned.iter().max().unwrap());
             assert!(*least >= total / usize::from(queues) / 2 && least * 2 >= *most);
-
         }
     }
 }

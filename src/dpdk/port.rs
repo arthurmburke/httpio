@@ -395,7 +395,8 @@ impl EthPort {
         // SAFETY: `out` has room for `max` pointers; the driver writes the
         // first `received` of them.
         unsafe {
-            let received = ffi::rte_eth_rx_burst(self.port_id, self.queue_id, out.as_mut_ptr().cast(), max);
+            let received =
+                ffi::rte_eth_rx_burst(self.port_id, self.queue_id, out.as_mut_ptr().cast(), max);
             std::slice::from_raw_parts_mut(out.as_mut_ptr().cast(), usize::from(received))
         }
     }
@@ -404,11 +405,14 @@ impl EthPort {
     pub fn rx_packets(&self, max: usize) -> impl ExactSizeIterator<Item = Mbuf> {
         let mut packets: [Option<Mbuf>; 64] = std::array::from_fn(|_| None);
         let mut raw = [ptr::null_mut(); 64];
-        let received =
-            unsafe {
-                ffi::rte_eth_rx_burst(self.port_id, self.queue_id, raw.as_mut_ptr(), max.min(64) as u16)
-            }
-                as usize;
+        let received = unsafe {
+            ffi::rte_eth_rx_burst(
+                self.port_id,
+                self.queue_id,
+                raw.as_mut_ptr(),
+                max.min(64) as u16,
+            )
+        } as usize;
         for i in 0..received {
             packets[i] = Some(unsafe { Mbuf::from_raw(raw[i]) });
         }

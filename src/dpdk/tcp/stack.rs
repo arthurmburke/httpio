@@ -141,8 +141,7 @@ impl StackBuilder {
     /// handle then waits for them.
     pub fn build(mut self) -> Result<(WorkerHandle, StackJoin), StackError> {
         if self.lcores.is_empty() {
-            self.lcores
-                .extend(crate::dpdk::first_worker_lcore());
+            self.lcores.extend(crate::dpdk::first_worker_lcore());
         }
         if self.lcores.is_empty() {
             return Err(StackError::NoLcores);

@@ -329,8 +329,8 @@ impl Tcb {
         self.rcv_capacity = bytes.clamp(RECV_BUFFER_CAPACITY, MAX_RECEIVE_WINDOW);
         // The smallest shift at which the 16-bit field covers the window.
         let units = self.rcv_capacity.div_ceil(1 << 16);
-        self.rcv_scale = (units.next_power_of_two().trailing_zeros() as u8)
-            .clamp(MIN_WINDOW_SCALE, 14);
+        self.rcv_scale =
+            (units.next_power_of_two().trailing_zeros() as u8).clamp(MIN_WINDOW_SCALE, 14);
     }
 
     /// What the connection may have in flight right now: the smaller of

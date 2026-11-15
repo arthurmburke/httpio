@@ -1,7 +1,11 @@
 //! Application-writable EAL memory that freezes into immutable, DMA-capable Bytes.
 use super::ffi;
 use bytes::Bytes;
-use std::{ptr::NonNull, slice};
+use std::ptr::NonNull;
+use std::slice;
+use std::sync::Arc;
+
+use crate::core::spinlock::SpinLock;
 
 pub struct DmaBuffer {
     ptr: NonNull<u8>,
@@ -64,7 +68,7 @@ pub struct DmaWriter {
     current: Option<Block>,
     /// Blocks whose slices have all been dropped, pushed from whichever
     /// thread dropped the last one.
-    spares: std::sync::Arc<crate::core::spinlock::SpinLock<Vec<DmaBuffer>>>,
+    spares: Arc<SpinLock<Vec<DmaBuffer>>>,
 }
 
 struct Block {
@@ -82,7 +86,7 @@ unsafe impl Sync for Block {}
 /// Owns a block while slices of it are alive, then returns it for reuse.
 struct Lease {
     buffer: Option<DmaBuffer>,
-    home: std::sync::Arc<crate::core::spinlock::SpinLock<Vec<DmaBuffer>>>,
+    home: Arc<crate::core::spinlock::SpinLock<Vec<DmaBuffer>>>,
 }
 
 impl AsRef<[u8]> for Lease {
@@ -98,7 +102,7 @@ impl Drop for Lease {
         };
         // Kept only while a writer still exists to use it (it holds the
         // other reference to `home`) and has room; otherwise freed here.
-        if std::sync::Arc::strong_count(&self.home) > 1 {
+        if Arc::strong_count(&self.home) > 1 {
             self.home.with(|spares| {
                 if spares.len() < MAX_SPARES {
                     spares.push(buffer);
@@ -118,7 +122,7 @@ impl DmaWriter {
     pub fn new() -> Self {
         Self {
             current: None,
-            spares: std::sync::Arc::new(crate::core::spinlock::SpinLock::new(Vec::new())),
+            spares: Arc::new(crate::core::spinlock::SpinLock::new(Vec::new())),
         }
     }
 
