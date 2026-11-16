@@ -984,7 +984,7 @@ mod tests {
         use crate::allocations::count_allocations;
         let (mut stream, rx, _tx, _credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let mut check = |what: &str| {
+        let check = |what: &str| {
             let Some(Command::Send(sent)) = rx.pop() else {
                 panic!("{what}: nothing sent")
             };

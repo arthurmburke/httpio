@@ -33,6 +33,7 @@ use crate::core::hashmap::HashMap;
 use crate::core::hashset::HashSet;
 use crate::core::mpsc;
 use crate::core::mpsc::{MpscRx, MpscTx};
+use crate::core::signal::{Signal, SignalHandle};
 use crate::core::spsc;
 use crate::core::spsc::{SpscRx, SpscTx};
 use crate::dpdk::{self, EthPort, Mempool, WorkerJoin};
@@ -42,6 +43,7 @@ use super::chunk::Chunk;
 use super::engine::TcpEngine;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple};
+use crate::dpdk::net::arp::SharedNeighbors;
 use crate::dpdk::steering::PortSteering;
 
 /// Control ring depth (concurrent connection opens in flight).
@@ -642,17 +644,7 @@ pub struct WorkerHandle {
     /// Shared only by application-side handles. Dropping the final clone drops
     /// `WorkerLifetime`, which signals the worker without a racy strong-count
     /// check. The worker itself deliberately does not own this token.
-    _lifetime: Arc<WorkerLifetime>,
-}
-
-struct WorkerLifetime {
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for WorkerLifetime {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-    }
+    _lifetime: Signal,
 }
 
 /// The app-side endpoints of one connection's ring pair, returned by
@@ -732,8 +724,9 @@ impl WorkerHandle {
             workers.len(),
             "one worker per queue of the port"
         );
-        let stop = Arc::new(AtomicBool::new(false));
-        let neighbors = (workers.len() > 1).then(crate::dpdk::net::arp::SharedNeighbors::new);
+        let stop = Signal::new();
+        let handle = stop.downgrade();
+        let neighbors = (workers.len() > 1).then(SharedNeighbors::new);
         let mut links = Vec::with_capacity(workers.len());
         let mut joins = Vec::with_capacity(workers.len());
         for (queue, (mut engine, port, pool, lcore)) in workers.into_iter().enumerate() {
@@ -742,14 +735,14 @@ impl WorkerHandle {
             if let Some(neighbors) = &neighbors {
                 engine.share_neighbors(neighbors.clone());
             }
-            match Self::launch(engine, port, pool, lcore, stop.clone()) {
+            match Self::launch(engine, port, pool, lcore, handle.clone()) {
                 Ok((link, join)) => {
                     links.push(link);
                     joins.push(join);
                 }
                 Err(error) => {
                     // Stop the workers already running.
-                    stop.store(true, Ordering::Release);
+                    handle.set(true);
                     return Err(error);
                 }
             }
@@ -761,7 +754,7 @@ impl WorkerHandle {
                 steering,
                 dma_writes,
                 local_ip,
-                _lifetime: Arc::new(WorkerLifetime { stop }),
+                _lifetime: stop,
             },
             joins,
         ))
@@ -774,7 +767,7 @@ impl WorkerHandle {
         port: EthPort,
         pool: Mempool,
         worker_lcore: u32,
-        worker_stop: Arc<AtomicBool>,
+        worker_stop: SignalHandle,
     ) -> Result<(WorkerLink, WorkerJoin), dpdk::lcore::LaunchError> {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
         let connections_opened = Arc::new(AtomicU64::new(0));
@@ -953,7 +946,7 @@ fn run(
     port: EthPort,
     pool: Mempool,
     ctrl_rx: CtrlRx,
-    stop: Arc<AtomicBool>,
+    stop: SignalHandle,
     connections_opened: Arc<AtomicU64>,
     ready_rx: MpscRx<FourTuple, READY_CAP>,
     overflow: Arc<AtomicBool>,
@@ -968,7 +961,7 @@ fn run(
     let mut events = Vec::new();
     let mut work = HashSet::default();
     let mut closing = HashSet::default();
-    while !stop.load(Ordering::Acquire) {
+    while !stop.get() {
         #[cfg(feature = "tcp-metrics")]
         crate::dpdk::metrics::record(|m| m.worker_iterations += 1);
         notifier.retry();
@@ -1436,9 +1429,7 @@ mod tests {
             links: links.into(),
             local_ip: Ipv4Addr::UNSPECIFIED,
             dma_writes: false,
-            _lifetime: Arc::new(WorkerLifetime {
-                stop: Arc::new(AtomicBool::new(false)),
-            }),
+            _lifetime: Signal::new(),
         };
         let remote = Ipv4Addr::new(10, 0, 0, 2);
 
@@ -1476,7 +1467,8 @@ mod tests {
     #[test]
     fn dropping_a_cloned_handle_does_not_stop_the_worker() {
         let (ctrl_tx, _ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Signal::new();
+        let sig_handle = stop.downgrade();
         let (tx, _rx) = mpsc::channel();
         let handle = WorkerHandle {
             send_config: SendConfig::default(),
@@ -1494,13 +1486,13 @@ mod tests {
             steering: PortSteering::single(),
             local_ip: Ipv4Addr::UNSPECIFIED,
             dma_writes: false,
-            _lifetime: Arc::new(WorkerLifetime { stop: stop.clone() }),
+            _lifetime: stop,
         };
 
         drop(handle.clone());
-        assert!(!stop.load(Ordering::Acquire));
+        assert!(!sig_handle.get());
 
         drop(handle);
-        assert!(stop.load(Ordering::Acquire));
+        assert!(sig_handle.get());
     }
 }

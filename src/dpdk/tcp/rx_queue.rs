@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 
 use super::seq::Seq;
 use crate::dpdk::net::tcp::{MAX_SACK_BLOCKS, SackBlocks};
