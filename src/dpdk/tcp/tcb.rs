@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 use std::net::Ipv4Addr;
-use std::time::{Duration, Instant};
+use crate::dpdk::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -1766,7 +1766,7 @@ mod tests {
         tcb.send(Bytes::from(vec![0; 100_000]));
         tcb.poll_output(now);
         tcb.record_window_limits(now);
-        let later = now + std::time::Duration::from_micros(10);
+        let later = now + Duration::from_micros(10);
         let ack = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
         tcb.on_segment(&ack, Bytes::new(), later);
         tcb.record_window_limits(later);

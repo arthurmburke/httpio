@@ -25,7 +25,7 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use crate::dpdk::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -53,7 +53,7 @@ const CMD_CAP: usize = 1024;
 /// Per-connection inbound ring depth (queued received chunks + events).
 const IN_CAP: usize = 1024;
 /// How long to wait for a peer FIN before reaping a connection whose app-side handle is gone.
-const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const REAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Per-connection rings stay SPSC: exactly one thread owns each end (the
 // thread driving that connection's `TcpStream`, and the worker lcore).
@@ -1198,7 +1198,7 @@ mod tests {
             }
         });
         let mut work = HashSet::default();
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut received = 0;
         while received < 10000 || !conns[&tuple].outstanding.app_gone.load(Ordering::Acquire) {
             assert!(

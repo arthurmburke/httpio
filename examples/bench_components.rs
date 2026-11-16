@@ -13,7 +13,7 @@
 
 use std::hint::black_box;
 use std::io::{Read, Write};
-use std::time::Instant;
+use httpio::dpdk::time::Instant;
 
 fn main() {
     kernel::run();

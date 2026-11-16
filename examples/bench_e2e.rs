@@ -519,7 +519,7 @@ mod dpdk_mode {
     /// One thread owns the port and the engine and spins on them: no worker
     /// lcore, no rings, no async runtime.
     pub fn run_raw(args: &[String]) {
-        use std::time::Instant;
+        use httpio::dpdk::time::{Duration as StackDuration, Instant};
 
         use bytes::Bytes;
         use httpio::dpdk::Mbuf;
@@ -575,7 +575,7 @@ mod dpdk_mode {
                     }
                     assert!(start.elapsed().as_secs() < 5, "no ARP reply");
                 }
-                samples.push(start.elapsed());
+                samples.push(start.elapsed().into());
             }
             super::row(&label, "arp_rtt", "rx_polls", polls as f64 / ROUNDS as f64);
             super::report_latency(&label, "arp_rtt", samples);
@@ -585,7 +585,7 @@ mod dpdk_mode {
             // thread to wake and none of this crate's TCP code.
             let mut samples = Vec::with_capacity(ROUNDS);
             let mut polls = 0u64;
-            let mut tx_time = std::time::Duration::ZERO;
+            let mut tx_time = StackDuration::ZERO;
             let syn = tcp::TcpHeader {
                 src_port: 29_999,
                 dst_port: 9,
@@ -633,7 +633,7 @@ mod dpdk_mode {
                     }
                     assert!(start.elapsed().as_secs() < 5, "no reset for the probe");
                 }
-                samples.push(start.elapsed());
+                samples.push(start.elapsed().into());
             }
             super::row(
                 &label,
@@ -665,7 +665,7 @@ mod dpdk_mode {
                 let message = Bytes::from_static(&[0xa5u8; 64]);
                 let mut samples = Vec::with_capacity(ROUNDS);
                 let mut polls = 0u64;
-                let mut first_poll = std::time::Duration::ZERO;
+                let mut first_poll = StackDuration::ZERO;
                 for round in 0..ROUNDS + ROUNDS / 10 {
                     let start = Instant::now();
                     engine.send(tuple, message.clone());
@@ -682,7 +682,7 @@ mod dpdk_mode {
                         assert!(start.elapsed().as_secs() < 5, "echo timed out");
                     }
                     if round >= ROUNDS / 10 {
-                        samples.push(start.elapsed());
+                        samples.push(start.elapsed().into());
                     }
                 }
                 super::row(
@@ -723,7 +723,7 @@ mod dpdk_mode {
                     }
                     assert!(start.elapsed().as_secs() < 5, "connect timed out");
                 }
-                samples.push(start.elapsed());
+                samples.push(start.elapsed().into());
                 engine.close(tuple);
             }
             super::report_latency(&label, "connect_first20", samples[..20].to_vec());

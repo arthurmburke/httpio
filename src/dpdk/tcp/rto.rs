@@ -1,7 +1,7 @@
 //! Retransmission timeout estimation (RFC 6298, the Jacobson/Karels
 //! algorithm) and the per-connection retransmit queue.
 
-use std::time::{Duration, Instant};
+use crate::dpdk::time::{Duration, Instant};
 
 use super::tx_queue::Payload;
 

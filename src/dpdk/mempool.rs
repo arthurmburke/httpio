@@ -42,8 +42,7 @@ impl Mempool {
         data_room_size: u16,
         socket_id: i32,
     ) -> Result<Self, MempoolCreateError> {
-        let c_name = CString::new(name)
-            .map_err(|_| MempoolCreateError)?;
+        let c_name = CString::new(name).map_err(|_| MempoolCreateError)?;
         // SAFETY: c_name lives for the duration of the call; DPDK copies
         // the name internally. priv_size=0 -- no per-mbuf private data.
         let raw = unsafe {

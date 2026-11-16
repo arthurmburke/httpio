@@ -6,7 +6,7 @@
 #![cfg(dpdk)]
 
 use std::net::Ipv4Addr;
-use std::time::Instant;
+use httpio::dpdk::time::Instant;
 
 use bytes::Bytes;
 use httpio::dpdk::net::arp::SharedNeighbors;

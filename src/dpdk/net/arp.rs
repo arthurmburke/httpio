@@ -7,10 +7,9 @@
 //! [`ArpTable`] is the resolver's state: learned `IPv4 -> MAC` mappings
 //! that expire, plus the bookkeeping for the requests that fill it.
 
-use std::{
-    net::Ipv4Addr,
-    time::{Duration, Instant},
-};
+use std::net::Ipv4Addr;
+
+use crate::dpdk::time::{Duration, Instant};
 
 use gxhash::HashMap;
 

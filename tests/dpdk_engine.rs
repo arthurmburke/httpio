@@ -17,7 +17,7 @@ use httpio::dpdk::{
     },
 };
 use std::net::Ipv4Addr;
-use std::time::{Duration, Instant};
+use httpio::dpdk::time::{Duration, Instant};
 
 const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);

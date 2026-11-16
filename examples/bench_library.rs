@@ -3,7 +3,7 @@
 //! BENCH_LIBRARY_ROUNDS=1000, BENCH_LIBRARY_BREAKDOWN=1 for diagnostic timings.
 use std::hint::black_box;
 use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use httpio::dpdk::time::{Duration, Instant};
 
 const SIZES: [usize; 5] = [64, 1460, 16 * 1024, 64 * 1024, 1024 * 1024];
 

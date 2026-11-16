@@ -121,7 +121,12 @@ mod imp {
         let mut connections = Vec::new();
         let mut events = Vec::new();
         while !stop.load(Ordering::Relaxed) {
-            engine.poll_into(&port, &pool, Instant::now(), &mut events);
+            engine.poll_into(
+                &port,
+                &pool,
+                httpio::dpdk::time::Instant::now(),
+                &mut events,
+            );
             connections.extend(std::iter::from_fn(|| engine.accept(80)));
             let mut bytes = 0;
             for &connection in &connections {
@@ -184,9 +189,8 @@ mod imp {
             let count = Arc::new(AtomicU64::new(0));
             received.push(count.clone());
             let stop = stop.clone();
-            sink_joins.push(
-                dpdk::launch(sink_lcores[q], move || sink(port, pool, count, stop)).unwrap(),
-            );
+            sink_joins
+                .push(dpdk::launch(sink_lcores[q], move || sink(port, pool, count, stop)).unwrap());
         }
 
         let pools: Vec<_> = (0..workers).map(|q| pool(format!("worker{q}"))).collect();
@@ -222,7 +226,9 @@ mod imp {
         let connections = workers * per_worker;
         // CPUs this process may use that no EAL lcore occupies. Read from a
         // fresh thread's view of the machine: this one is pinned.
-        let lcore_cpus: Vec<usize> = CoreIterator::default().map(|core| core.id as usize).collect();
+        let lcore_cpus: Vec<usize> = CoreIterator::default()
+            .map(|core| core.id as usize)
+            .collect();
         let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
         let spare_cpus: Arc<Vec<usize>> = Arc::new(
             (0..online)
@@ -298,7 +304,11 @@ mod imp {
         let elapsed = measured.elapsed().as_secs_f64();
 
         let gbit = |bytes: u64| bytes as f64 * 8.0 / elapsed / 1e9;
-        let per_queue: Vec<f64> = after.iter().zip(&before).map(|(a, b)| gbit(a - b)).collect();
+        let per_queue: Vec<f64> = after
+            .iter()
+            .zip(&before)
+            .map(|(a, b)| gbit(a - b))
+            .collect();
         let total: f64 = per_queue.iter().sum();
         println!("workers\tconnections\ttotal_gbit_s\tper_worker_gbit_s");
         println!(

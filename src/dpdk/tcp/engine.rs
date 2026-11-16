@@ -13,7 +13,7 @@ mod gro;
 
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
-use std::time::{Duration, Instant};
+use crate::dpdk::time::{Duration, Instant};
 
 use bytes::Bytes;
 
