@@ -6,6 +6,7 @@ mod allocations;
 static ALLOCATOR: allocations::CountingAllocator = allocations::CountingAllocator;
 use allocations::count_allocations;
 use bytes::Bytes;
+use httpio::dpdk::time::{Duration, Instant};
 use httpio::dpdk::{
     EthPort, Mbuf, Mempool, eal,
     mempool::DEFAULT_MBUF_DATA_ROOM_SIZE,
@@ -17,7 +18,6 @@ use httpio::dpdk::{
     },
 };
 use std::net::Ipv4Addr;
-use httpio::dpdk::time::{Duration, Instant};
 
 const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);

@@ -13,7 +13,7 @@
 //! Sums and products saturate rather than overflow; a `u64` of nanoseconds
 //! covers 584 years.
 
-use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Mul, ShlAssign, Sub, SubAssign};
 
 /// A span of time, in nanoseconds.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -220,11 +220,20 @@ mod tests {
         assert_eq!(d * 2, Duration::from_millis(400));
         assert_eq!(d * 7 / 8, Duration::from_millis(175));
         assert_eq!(d / 4, Duration::from_millis(50));
-        assert_eq!(d.abs_diff(Duration::from_millis(350)), Duration::from_millis(150));
+        assert_eq!(
+            d.abs_diff(Duration::from_millis(350)),
+            Duration::from_millis(150)
+        );
         assert_eq!(d + d, Duration::from_millis(400));
         assert_eq!(d - Duration::from_secs(1), Duration::ZERO);
-        assert_eq!(d.clamp(Duration::from_secs(1), Duration::from_secs(2)), Duration::from_secs(1));
-        assert_eq!((d.as_nanos(), d.as_micros(), d.as_millis()), (200_000_000, 200_000, 200));
+        assert_eq!(
+            d.clamp(Duration::from_secs(1), Duration::from_secs(2)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            (d.as_nanos(), d.as_micros(), d.as_millis()),
+            (200_000_000, 200_000, 200)
+        );
         assert_eq!(Duration::from_secs(90).as_secs(), 90);
         assert_eq!(Duration::MAX * 2, Duration::MAX);
         assert_eq!(Duration::MAX + d, Duration::MAX);
@@ -242,10 +251,16 @@ mod tests {
         let later = start + Duration::from_secs(1);
         assert!(later > start);
         assert_eq!(later - start, Duration::from_secs(1));
-        assert_eq!(later.saturating_duration_since(start), Duration::from_secs(1));
+        assert_eq!(
+            later.saturating_duration_since(start),
+            Duration::from_secs(1)
+        );
         assert_eq!(start.saturating_duration_since(later), Duration::ZERO);
         assert_eq!(start.checked_duration_since(later), None);
-        assert_eq!(later.checked_duration_since(start), Some(Duration::from_secs(1)));
+        assert_eq!(
+            later.checked_duration_since(start),
+            Some(Duration::from_secs(1))
+        );
         assert_eq!(later - Duration::from_secs(1), start);
         let mut moving = start;
         moving += Duration::from_millis(5);

@@ -22,10 +22,10 @@
 //! endpoints are `Send`, so a fresh pair is created on the app thread and
 //! one half of each is shipped to the worker inside the control message.
 
+use crate::core::time::{Duration, Instant};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use crate::dpdk::time::{Duration, Instant};
 
 use bytes::Bytes;
 

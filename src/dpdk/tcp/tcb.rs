@@ -1,9 +1,9 @@
 //! The Transmission Control Block: all per-connection state, and the RFC
 //! 9293 §3.10 segment-processing state machine.
 
+use crate::core::time::{Duration, Instant};
 use std::cell::Cell;
 use std::net::Ipv4Addr;
-use crate::dpdk::time::{Duration, Instant};
 
 use bytes::Bytes;
 

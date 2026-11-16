@@ -11,9 +11,9 @@
 
 mod gro;
 
+use crate::core::time::{Duration, Instant};
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
-use crate::dpdk::time::{Duration, Instant};
 
 use bytes::Bytes;
 

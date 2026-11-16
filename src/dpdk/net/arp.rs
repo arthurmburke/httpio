@@ -9,7 +9,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::dpdk::time::{Duration, Instant};
+use crate::core::time::{Duration, Instant};
 
 use gxhash::HashMap;
 

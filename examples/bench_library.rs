@@ -1,9 +1,9 @@
 //! Isolated, established-connection software TCP comparison. No AF_PACKET.
 //! `bench_library kernel` or `bench_library dpdk <EAL args>`.
 //! BENCH_LIBRARY_ROUNDS=1000, BENCH_LIBRARY_BREAKDOWN=1 for diagnostic timings.
+use httpio::dpdk::time::{Duration, Instant};
 use std::hint::black_box;
 use std::io::{Read, Write};
-use httpio::dpdk::time::{Duration, Instant};
 
 const SIZES: [usize; 5] = [64, 1460, 16 * 1024, 64 * 1024, 1024 * 1024];
 

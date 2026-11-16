@@ -3,7 +3,7 @@
 
 use super::tcb::FourTuple;
 use crate::core::hashmap::HashMap;
-use crate::dpdk::time::Instant;
+use crate::core::time::Instant;
 
 #[derive(Default)]
 pub struct Timers {
@@ -97,8 +97,8 @@ impl Timers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::time::Duration;
     use std::net::Ipv4Addr;
-    use crate::dpdk::time::Duration;
 
     fn tuple(port: u16) -> FourTuple {
         FourTuple {
