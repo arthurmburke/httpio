@@ -1,9 +1,9 @@
 //! Receive-side reassembly: buffers out-of-order segments and delivers
 //! in-order bytes to the application as gaps get filled.
 //!
-//! Queued payloads keep their mbuf alive while it is buffered. Borrowed
-//! reads can copy directly from it, while owned reads can turn it into a
-//! zero-copy `Bytes` at the API boundary.
+//! Queued payloads keep their mbuf alive while it is buffered. Reads hand
+//! out views of it ([`Chunk`]), which share the mbuf without allocating;
+//! only the `Bytes`-returning read boxes an owner for it.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -111,28 +111,42 @@ impl ReassemblyBuffer {
         self.ready_len
     }
 
-    /// Removes up to `max_len` in-order bytes from the front chunk.
+    /// Removes up to `max_len` in-order bytes from the front chunk, as
+    /// `Bytes`. A packet buffer gets its `Bytes` owner here; a read that
+    /// takes only part of one shares that owner with what is left, so the
+    /// buffer is boxed at most once.
     pub fn read(&mut self, max_len: usize) -> Bytes {
-        self.read_chunk(max_len)
-            .map_or_else(Bytes::new, Chunk::into_bytes)
+        if max_len == 0 {
+            return Bytes::new();
+        }
+        let Some(chunk) = self.ready.pop_front() else {
+            return Bytes::new();
+        };
+        let mut bytes = chunk.into_bytes();
+        let n = max_len.min(bytes.len());
+        self.ready_len -= n;
+        if n == bytes.len() {
+            return bytes;
+        }
+        let prefix = bytes.split_to(n);
+        self.ready.push_front(Chunk::Bytes(bytes));
+        prefix
     }
 
+    /// Removes up to `max_len` in-order bytes from the front chunk. A read
+    /// that takes only part of a packet buffer shares it with what is
+    /// left, through the buffer's own reference count: nothing allocates.
     pub(super) fn read_chunk(&mut self, max_len: usize) -> Option<Chunk> {
         if max_len == 0 {
             return None;
         }
-        let chunk = self.ready.pop_front()?;
-        let n = max_len.min(chunk.len());
+        let front = self.ready.front_mut()?;
+        let n = max_len.min(front.len());
         self.ready_len -= n;
-        if n == chunk.len() {
-            return Some(chunk);
+        if n == front.len() {
+            return self.ready.pop_front();
         }
-        // Only a length-limited owned read can split an mbuf. Share its
-        // Bytes owner with the remainder so it is boxed at most once.
-        let mut remainder = chunk.into_bytes();
-        let prefix = remainder.split_to(n);
-        self.ready.push_front(Chunk::Bytes(remainder));
-        Some(Chunk::Bytes(prefix))
+        Some(front.split_to(n))
     }
 
     /// Inserts a received segment `[seq, seq+data.len())` given the

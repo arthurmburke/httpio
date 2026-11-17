@@ -1617,7 +1617,7 @@ mod tests {
             });
             let mut cx = Context::from_waker(Waker::noop());
             // Cross a segment boundary and leave a suffix of the second
-            // mbuf staged. Borrowed reads must not allocate a Bytes owner.
+            // mbuf staged. Borrowed reads must not allocate.
             let mut storage = [0; 1500];
             let mut buf = ReadBuf::new(&mut storage);
             let (result, allocations) = crate::allocations::count_allocations(|| {
@@ -1630,17 +1630,45 @@ mod tests {
             assert!(buf.filled()[1001..].iter().all(|&byte| byte == 1));
             assert_eq!(available(), baseline - 2);
 
-            // An owned read of the staged suffix makes one Bytes owner.
-            let (result, allocations) =
-                crate::allocations::count_allocations(|| stream.poll_recv(&mut cx));
-            let Poll::Ready(Ok(Some(suffix))) = result else {
-                panic!("expected the staged suffix");
-            };
+            // A chunk read hands out the staged suffix as a view of its
+            // mbuf. Splitting, slicing and cloning it share that mbuf
+            // through its own reference count: nothing is allocated.
+            let ((suffix, head, middle, copy), allocations) =
+                crate::allocations::count_allocations(|| {
+                    let Poll::Ready(Ok(Some(mut suffix))) = stream.poll_recv_chunk(&mut cx) else {
+                        panic!("expected the staged suffix");
+                    };
+                    let head = suffix.split_to(100);
+                    let middle = suffix.slice(1..);
+                    let copy = head.clone();
+                    (suffix, head, middle, copy)
+                });
+            assert_eq!(allocations, 0);
+            assert!(matches!(suffix, Chunk::Packet(_)));
+            assert_eq!(
+                (head.len(), suffix.len(), middle.len(), copy.len()),
+                (100, 402, 401, 100)
+            );
+            assert_eq!(head.as_ptr(), copy.as_ptr());
+            assert_eq!(unsafe { head.as_ptr().add(100) }, suffix.as_ptr());
+            assert_eq!(unsafe { suffix.as_ptr().add(1) }, middle.as_ptr());
+            for part in [&suffix, &head, &middle, &copy] {
+                assert!(part.iter().all(|&byte| byte == 1));
+            }
+            // Every part holds the mbuf, on whichever thread it ends up.
+            drop((suffix, head));
+            assert_eq!(available(), baseline - 2);
+            std::thread::spawn(move || drop(copy)).join().unwrap();
+            assert_eq!(available(), baseline - 2);
+
+            // Only converting to Bytes makes an owner, once.
+            let (owned, allocations) =
+                crate::allocations::count_allocations(|| middle.into_bytes());
             assert_eq!(allocations, 1);
-            assert_eq!(suffix.len(), 502);
-            assert!(suffix.iter().all(|&byte| byte == 1));
-            let slice = suffix.slice(1..);
-            drop(suffix);
+            assert_eq!(owned.len(), 401);
+            assert!(owned.iter().all(|&byte| byte == 1));
+            let slice = owned.slice(1..);
+            drop(owned);
             assert_eq!(available(), baseline - 2);
             std::thread::spawn(move || drop(slice)).join().unwrap();
             assert_eq!(available(), baseline - 1);

@@ -51,7 +51,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::client::Client;
-use crate::dpdk::tcp::stream::{RecvChunk, TcpStream};
+use crate::dpdk::tcp::chunk::Chunk;
+use crate::dpdk::tcp::stream::TcpStream;
 use crate::http::errors::{
     HttpError::{self, InvalidHeaderValue},
     WebSocketError,
@@ -816,7 +817,7 @@ impl UpgradedTransport {
 struct ChunkReader {
     /// The unparsed rest of the latest chunk, still in its packet buffer.
     /// Empty whenever [`next_frame`](Self::next_frame) returns `None`.
-    chunk: RecvChunk,
+    chunk: Chunk,
     /// Length of the [`Payload::InChunk`] frame last returned, which still
     /// sits at the front of `chunk`; dropped on the next `next_frame`.
     lent: usize,
@@ -862,7 +863,7 @@ impl ChunkReader {
 
     /// Supplies the next received chunk, once `next_frame` has asked for
     /// more input.
-    fn push(&mut self, chunk: RecvChunk) {
+    fn push(&mut self, chunk: Chunk) {
         debug_assert!(
             self.chunk.is_empty() && self.lent == 0,
             "chunk pushed before the last was used"
@@ -946,7 +947,7 @@ impl ChunkReader {
                         let n = self.chunk.len();
                         head[..n].copy_from_slice(&self.chunk);
                         *filled = n;
-                        self.chunk = RecvChunk::default();
+                        self.chunk = Chunk::new();
                         return Ok(None);
                     }
                 }
@@ -979,7 +980,7 @@ impl ChunkReader {
         let mut payload = BytesMut::with_capacity(header.payload_len);
         payload.extend_from_slice(&self.chunk);
         let remaining = header.payload_len - self.chunk.len();
-        self.chunk = RecvChunk::default();
+        self.chunk = Chunk::new();
         self.state = RecvState::Payload {
             fin: header.fin,
             opcode: header.opcode,
@@ -2094,7 +2095,6 @@ mod tests {
     #[ignore = "initializes EAL; run alone"]
     fn frames_in_a_packet_buffer_allocate_only_what_they_hand_out() {
         use crate::allocations::count_allocations;
-        use crate::dpdk::tcp::chunk::Chunk;
         use crate::dpdk::tcp::worker::InboundMessage;
         use crate::dpdk::{Mbuf, Mempool, eal, ffi, mempool::DEFAULT_MBUF_DATA_ROOM_SIZE};
 

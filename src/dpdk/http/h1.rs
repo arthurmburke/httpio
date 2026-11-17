@@ -4,7 +4,8 @@
 //! Why: hyper speaks through `AsyncRead`/`AsyncWrite`, which forces a copy
 //! in each direction at the [`TcpStream`] boundary (a borrowed write slice
 //! into owned memory, an owned received chunk into hyper's read buffer).
-//! This codec instead moves owned [`Bytes`] both ways:
+//! This codec instead moves owned buffers both ways, [`Bytes`] out and
+//! [`Chunk`]s in:
 //!
 //! - **Requests**: the request line and headers are serialised once, in
 //!   place, into one buffer -- DMA memory when the port attaches it to
@@ -15,10 +16,13 @@
 //!   first received chunk; only a head that straddles chunks is gathered
 //!   into a contiguous buffer, and then only its own bytes are copied. Body
 //!   data is handed out as slices of the received chunks (refcounted views
-//!   of NIC packet buffers), never copied.
+//!   of NIC packet buffers), never copied. Up to that hand-off a packet
+//!   buffer is shared through its own reference count, so nothing is
+//!   allocated per packet; only a slice the caller takes as `Bytes` gets a
+//!   `Bytes` owner ([`Body::poll_slice`] hands out the view instead).
 //!
-//! The codec runs over any [`Transport`], a two-method owned-`Bytes` I/O
-//! trait: plain [`TcpStream`], [`TlsStream`] (where the `Bytes` are
+//! The codec runs over any [`Transport`], a two-method owned-buffer I/O
+//! trait: plain [`TcpStream`], [`TlsStream`] (where the buffers are
 //! plaintext and the copies that remain are the TLS layer's), and an
 //! in-memory transport for the unit tests here.
 //!
@@ -38,13 +42,14 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, Response, StatusCode, Version, request, response};
 use serde::de::DeserializeOwned;
 
 use crate::dpdk::DmaWriter;
+use crate::dpdk::tcp::chunk::Chunk;
 use crate::dpdk::tcp::stream::TcpStream;
 use crate::dpdk::tls::TlsStream;
 use crate::http::codec::{self, EncodedBody};
@@ -67,9 +72,9 @@ pub const MAX_TRAILERS_SIZE: usize = 64 * 1024;
 /// data has arrived. Larger bodies still collect; the buffer just grows.
 const MAX_COLLECT_RESERVE: u64 = 16 * 1024 * 1024;
 
-/// Owned-[`Bytes`] I/O the codec runs over. Mirrors [`TcpStream`]'s
-/// zero-copy inherent methods, so a TLS stream offering the same two
-/// methods can carry the codec too.
+/// Owned-buffer I/O the codec runs over: [`Bytes`] out, [`Chunk`]s in.
+/// Mirrors [`TcpStream`]'s zero-copy inherent methods, so a TLS stream
+/// offering the same two can carry the codec too.
 pub trait Transport {
     /// Sends `data`; on `Ready(Ok)` it has been taken. On `Pending` it holds
     /// the unsent suffix.
@@ -77,7 +82,11 @@ pub trait Transport {
     -> Poll<io::Result<()>>;
 
     /// Receives the next chunk. `Ok(None)` is a clean end of input.
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>>;
+    ///
+    /// A [`Chunk`] rather than `Bytes` so that a transport reading packet
+    /// buffers hands them over as they are: wrapping one in `Bytes` costs
+    /// a heap allocation per packet, which the codec has no use for.
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Chunk>>>;
 }
 
 impl Transport for TcpStream {
@@ -89,14 +98,15 @@ impl Transport for TcpStream {
         TcpStream::poll_send(self, cx, data)
     }
 
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
-        TcpStream::poll_recv(self, cx)
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Chunk>>> {
+        TcpStream::poll_recv_chunk(self, cx)
     }
 }
 
 /// Over TLS the codec exchanges plaintext `Bytes` with the TLS stream,
 /// which encrypts each buffer it is sent straight into the memory it
-/// transmits from and hands decrypted records back as owned `Bytes`.
+/// transmits from and hands decrypted records back as owned `Bytes`
+/// (already shared heap memory, so wrapping them in a [`Chunk`] is free).
 impl Transport for TlsStream {
     fn poll_send(
         &mut self,
@@ -106,8 +116,8 @@ impl Transport for TlsStream {
         TlsStream::poll_send(self, cx, data)
     }
 
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
-        TlsStream::poll_recv(self, cx)
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Chunk>>> {
+        TlsStream::poll_recv(self, cx).map_ok(|plaintext| plaintext.map(Chunk::from))
     }
 }
 
@@ -754,7 +764,7 @@ fn parse_decimal(digits: &[u8]) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-async fn recv<T: Transport + Unpin>(io: &mut T) -> Result<Option<Bytes>, H1Error> {
+async fn recv<T: Transport + Unpin>(io: &mut T) -> Result<Option<Chunk>, H1Error> {
     poll_fn(|cx| io.poll_recv(cx))
         .await
         .map_err(|e| H1Error::Io(e.kind()))
@@ -861,13 +871,16 @@ impl HeadReader {
     /// Takes the next received chunk. Returns the head, and the bytes
     /// after it in `chunk`, once `chunk` completes it; `None` while more
     /// is needed.
-    fn feed(&mut self, chunk: Bytes) -> Result<Option<(response::Parts, Bytes)>, H1Error> {
+    fn feed(&mut self, mut chunk: Chunk) -> Result<Option<(response::Parts, Chunk)>, H1Error> {
         if chunk.is_empty() {
             return Ok(None);
         }
         if let HeadBuffer::Direct = self.state {
             match parse_head(&chunk)? {
-                Parsed::Complete { parts, len } => return Ok(Some((parts, chunk.slice(len..)))),
+                Parsed::Complete { parts, len } => {
+                    chunk.advance(len);
+                    return Ok(Some((parts, chunk)));
+                }
                 Parsed::Partial if chunk.len() > MAX_HEAD_SIZE => {
                     return Err(H1Error::HeadTooLarge);
                 }
@@ -896,7 +909,8 @@ impl HeadReader {
             }
             match parse_head(buf)? {
                 Parsed::Complete { parts, len } if len == buf.len() => {
-                    return Ok(Some((parts, chunk.slice(at..))));
+                    chunk.advance(at);
+                    return Ok(Some((parts, chunk)));
                 }
                 // httparse ends a head at its first empty line, exactly as
                 // `HeadEnd` does, so this cannot happen; refuse rather
@@ -917,8 +931,8 @@ impl HeadReader {
 #[cfg(test)]
 async fn read_head<T: Transport + Unpin>(
     io: &mut T,
-    pending: Bytes,
-) -> Result<(response::Parts, Bytes), H1Error> {
+    pending: Chunk,
+) -> Result<(response::Parts, Chunk), H1Error> {
     let mut reader = HeadReader::new();
     if let Some(done) = reader.feed(pending)? {
         return Ok(done);
@@ -949,7 +963,7 @@ impl ResponseReader {
 
     /// Takes the next received chunk. Returns the final head, and the
     /// bytes after it in `chunk`, once `chunk` completes it.
-    fn feed(&mut self, mut chunk: Bytes) -> Result<Option<(response::Parts, Bytes)>, H1Error> {
+    fn feed(&mut self, mut chunk: Chunk) -> Result<Option<(response::Parts, Chunk)>, H1Error> {
         loop {
             let Some((parts, rest)) = self.head.feed(chunk)? else {
                 return Ok(None);
@@ -1081,7 +1095,7 @@ fn hex_digit(b: u8) -> Option<u64> {
 impl Chunked {
     /// Consumes framing bytes from the front of `buf`, stopping at payload
     /// (`Data`), at the end of the body, or when `buf` runs out.
-    fn consume_framing(&mut self, buf: &mut Bytes) -> Result<(), H1Error> {
+    fn consume_framing(&mut self, buf: &mut Chunk) -> Result<(), H1Error> {
         let mut used = 0;
         let mut result = Ok(());
         while !matches!(self, Chunked::Data { .. } | Chunked::End) {
@@ -1207,8 +1221,9 @@ impl Chunked {
 impl Decoder {
     /// Decodes from the front of `buf`: returns the next payload slice, or
     /// `None` once `buf` holds no more payload (it is then empty, or the
-    /// body has ended and the rest is ignored).
-    fn decode(&mut self, buf: &mut Bytes) -> Result<Option<Bytes>, H1Error> {
+    /// body has ended and the rest is ignored). A slice shares `buf`'s
+    /// storage; splitting it off allocates nothing.
+    fn decode(&mut self, buf: &mut Chunk) -> Result<Option<Chunk>, H1Error> {
         loop {
             match self {
                 Decoder::Done | Decoder::Failed => {
@@ -1288,7 +1303,7 @@ pub struct Body<T> {
     /// `None` once the body has finished.
     io: Option<T>,
     /// Received bytes not yet decoded.
-    buffered: Bytes,
+    buffered: Chunk,
     decoder: Decoder,
     /// The `Content-Length`, when there is one, to size `collect`.
     length_hint: Option<u64>,
@@ -1298,7 +1313,7 @@ pub struct Body<T> {
 }
 
 impl<T: Transport + Unpin> Body<T> {
-    fn new(io: T, buffered: Bytes, decoder: Decoder) -> Self {
+    fn new(io: T, buffered: Chunk, decoder: Decoder) -> Self {
         let length_hint = match decoder {
             Decoder::Length { remaining } => Some(remaining),
             _ => None,
@@ -1327,7 +1342,7 @@ impl<T: Transport + Unpin> Body<T> {
         if self.decoder.is_finished() {
             self.io = None;
             self.upload = None;
-            self.buffered = Bytes::new();
+            self.buffered.clear();
         }
     }
 
@@ -1353,16 +1368,29 @@ impl<T: Transport + Unpin> Body<T> {
         }
     }
 
-    fn fail(&mut self, error: H1Error) -> Poll<Option<Result<Bytes, H1Error>>> {
+    fn fail<D>(&mut self, error: H1Error) -> Poll<Option<Result<D, H1Error>>> {
         self.decoder = Decoder::Failed;
         self.release_if_finished();
         Poll::Ready(Some(Err(error)))
     }
 
-    /// The next payload slice; `None` at the clean end of the body. A
-    /// connection that ends before the framed end yields
+    /// The next payload slice as [`Bytes`]; `None` at the clean end of the
+    /// body. A connection that ends before the framed end yields
     /// [`H1Error::Truncated`].
+    ///
+    /// This is [`poll_slice`](Self::poll_slice) converted for a caller
+    /// that needs `Bytes`: a slice of a packet buffer gets its heap-
+    /// allocated `Bytes` owner here, one allocation per slice.
     pub fn poll_chunk(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, H1Error>>> {
+        self.poll_slice(cx)
+            .map(|item| item.map(|slice| slice.map(Chunk::into_bytes)))
+    }
+
+    /// The next payload slice, still a view of the buffer it was received
+    /// in: no copy, and no allocation for a packet buffer. `None` at the
+    /// clean end of the body. A connection that ends before the framed end
+    /// yields [`H1Error::Truncated`].
+    pub fn poll_slice(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Chunk, H1Error>>> {
         if let Err(e) = self.drive_upload(cx) {
             return self.fail(e);
         }
@@ -1397,22 +1425,31 @@ impl<T: Transport + Unpin> Body<T> {
         }
     }
 
-    /// The next payload slice; `None` at the clean end of the body.
+    /// The next payload slice as [`Bytes`]; `None` at the clean end of the
+    /// body. See [`poll_chunk`](Self::poll_chunk).
     pub async fn chunk(&mut self) -> Option<Result<Bytes, H1Error>> {
         poll_fn(|cx| self.poll_chunk(cx)).await
     }
 
+    /// The next payload slice; `None` at the clean end of the body. See
+    /// [`poll_slice`](Self::poll_slice).
+    pub async fn slice(&mut self) -> Option<Result<Chunk, H1Error>> {
+        poll_fn(|cx| self.poll_slice(cx)).await
+    }
+
     /// Reads the whole body. A body that arrived as one slice is returned
-    /// as is (no copy); otherwise the slices are concatenated, each byte
-    /// copied once. Slices are copied as they arrive rather than gathered
-    /// first, so each received packet buffer is released right away
-    /// instead of all of them being pinned until the end.
+    /// as is (no copy; a packet buffer becomes `Bytes`, which is the one
+    /// allocation); otherwise the slices are concatenated, each byte
+    /// copied once out of the buffer it was received in, with no
+    /// allocation per slice. Slices are copied as they arrive rather than
+    /// gathered first, so each received packet buffer is released right
+    /// away instead of all of them being pinned until the end.
     pub async fn collect(mut self) -> Result<Bytes, H1Error> {
-        let Some(first) = self.chunk().await.transpose()? else {
+        let Some(first) = self.slice().await.transpose()? else {
             return Ok(Bytes::new());
         };
-        let Some(second) = self.chunk().await.transpose()? else {
-            return Ok(first);
+        let Some(second) = self.slice().await.transpose()? else {
+            return Ok(first.into_bytes());
         };
         let reserve = self
             .length_hint
@@ -1423,8 +1460,8 @@ impl<T: Transport + Unpin> Body<T> {
         out.extend_from_slice(&first);
         out.extend_from_slice(&second);
         drop((first, second));
-        while let Some(chunk) = self.chunk().await.transpose()? {
-            out.extend_from_slice(&chunk);
+        while let Some(slice) = self.slice().await.transpose()? {
+            out.extend_from_slice(&slice);
         }
         Ok(out.freeze())
     }
@@ -1502,12 +1539,12 @@ mod tests {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+        fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Chunk>>> {
             if self.stall_now(cx) {
                 return Poll::Pending;
             }
             match self.reads.pop_front() {
-                Some(Read::Data(bytes)) => Poll::Ready(Ok(Some(bytes))),
+                Some(Read::Data(bytes)) => Poll::Ready(Ok(Some(bytes.into()))),
                 Some(Read::Error(kind)) => Poll::Ready(Err(kind.into())),
                 None => Poll::Ready(Ok(None)),
             }
@@ -1616,11 +1653,11 @@ mod tests {
         // The second chunk ends the head and carries the body: the body must
         // stay a slice of it.
         let chunks = split_at(CL_RESPONSE, &[10]);
-        let block = block_on(read_head(&mut Mock::new([]), chunks[0].clone()));
+        let block = block_on(read_head(&mut Mock::new([]), chunks[0].clone().into()));
         assert_eq!(block.err(), Some(H1Error::IncompleteHead));
         let mut mock = Mock::new([chunks[1].clone()]);
-        let (_, rest) = block_on(read_head(&mut mock, chunks[0].clone())).unwrap();
-        assert_eq!(rest, "hello world");
+        let (_, rest) = block_on(read_head(&mut mock, chunks[0].clone().into())).unwrap();
+        assert_eq!(&rest[..], b"hello world");
         assert_eq!(rest.as_ptr(), chunks[1][chunks[1].len() - 11..].as_ptr());
     }
 
@@ -2227,14 +2264,14 @@ connection: close\r\n\r\n"
             Poll::Ready(Ok(()))
         }
 
-        fn poll_recv(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
+        fn poll_recv(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<Option<Chunk>>> {
             if self.sent.lock().unwrap().len() < self.respond_after {
                 return Poll::Pending;
             }
             match self.reads.pop_front() {
                 Some(bytes) => {
                     self.credit += self.credit_per_read;
-                    Poll::Ready(Ok(Some(bytes)))
+                    Poll::Ready(Ok(Some(bytes.into())))
                 }
                 None => Poll::Ready(Ok(None)),
             }
@@ -2405,5 +2442,120 @@ connection: close\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"
             drive(request.exchange(peer, head)).map(drop).unwrap_err(),
             HttpError::BodyProducer(io::ErrorKind::BrokenPipe)
         );
+    }
+
+    /// Over plain TCP a response's body slices are views of the packet
+    /// buffers they arrived in, shared through each buffer's own reference
+    /// count: decoding them allocates nothing, however chunked framing cuts
+    /// a packet up, and collecting them allocates only the buffer they are
+    /// copied into. Initializes EAL, so it runs alone:
+    /// `cargo test --lib packet_buffers_reach_the_body -- --ignored`.
+    #[test]
+    #[ignore = "initializes EAL; run alone"]
+    fn packet_buffers_reach_the_body_without_allocating() {
+        use crate::allocations::count_allocations;
+        use crate::dpdk::tcp::worker::InboundMessage;
+        use crate::dpdk::{Mbuf, Mempool, eal, ffi, mempool::DEFAULT_MBUF_DATA_ROOM_SIZE};
+
+        const SEGMENT: usize = 1448;
+        let cpu = unsafe { libc::sched_getcpu() };
+        eal::init(&[
+            "h1-alloc-test",
+            "--no-huge",
+            "--no-pci",
+            "--no-shconf",
+            "--no-telemetry",
+            "--lcores",
+            &format!("0@{cpu}"),
+        ])
+        .unwrap();
+        {
+            let pool =
+                Mempool::create("h1-alloc-test", 255, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+            let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
+            let free = available();
+            // The response to `message`, received as full-size packets.
+            let respond = |message: &[u8]| {
+                let (stream, _commands, inbound, _credit) = TcpStream::test_stream();
+                for data in message.chunks(SEGMENT) {
+                    let mut packet = Mbuf::alloc(&pool).unwrap();
+                    packet
+                        .append(data.len() as u16)
+                        .unwrap()
+                        .copy_from_slice(data);
+                    let message = InboundMessage::Data(Chunk::packet(packet, 0, data.len()));
+                    assert!(inbound.push(message).is_ok());
+                }
+                let (_, body) = drive(read_response(stream, &Method::GET)).unwrap();
+                (body, inbound)
+            };
+            let payload: Vec<u8> = (0..10_000).map(|i| (i % 251) as u8).collect();
+
+            // Chunks of 700 bytes: every packet holds parts of several, so
+            // each is split into several slices, with framing in between.
+            let mut chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+            for piece in payload.chunks(700) {
+                chunked.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                chunked.extend_from_slice(piece);
+                chunked.extend_from_slice(b"\r\n");
+            }
+            chunked.extend_from_slice(b"0\r\n\r\n");
+            let packets = chunked.len().div_ceil(SEGMENT);
+
+            let (mut body, inbound) = respond(&chunked);
+            let ((received, slices), allocations) = count_allocations(|| {
+                let (mut received, mut slices) = (0, 0);
+                while let Some(slice) = drive(body.slice()) {
+                    let slice = slice.unwrap();
+                    assert!(matches!(slice, Chunk::Packet(_)));
+                    assert_eq!(&slice[..], &payload[received..received + slice.len()]);
+                    received += slice.len();
+                    slices += 1;
+                }
+                (received, slices)
+            });
+            assert_eq!(received, payload.len());
+            assert!(slices > packets, "packets were split into slices");
+            assert_eq!(allocations, 0, "no Bytes owner for any packet or slice");
+            drop((body, inbound));
+            assert_eq!(available(), free, "every packet buffer returned");
+
+            // A slice keeps its packet buffer, and only that one, after the
+            // body and the connection are gone.
+            let (mut body, inbound) = respond(&chunked);
+            let first = drive(body.slice()).unwrap().unwrap();
+            let second = drive(body.slice()).unwrap().unwrap();
+            drop((body, inbound));
+            assert_eq!(available(), free - 1);
+            assert_eq!(&first[..], &payload[..first.len()]);
+            drop(first);
+            assert_eq!(available(), free - 1);
+            std::thread::spawn(move || drop(second)).join().unwrap();
+            assert_eq!(available(), free);
+
+            // As `Bytes`, each slice costs its owner.
+            let (mut body, inbound) = respond(&chunked);
+            let (owned, allocations) = count_allocations(|| drive(body.chunk()).unwrap().unwrap());
+            assert_eq!(allocations, 1);
+            assert_eq!(&owned[..], &payload[..owned.len()]);
+            drop((owned, body, inbound));
+            assert_eq!(available(), free);
+
+            // Collecting copies each packet's bytes out and lets it go: the
+            // one allocation is the buffer collected into.
+            let mut sized = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            )
+            .into_bytes();
+            sized.extend_from_slice(&payload);
+            let (body, inbound) = respond(&sized);
+            let (collected, allocations) = count_allocations(|| drive(body.collect()).unwrap());
+            assert_eq!(collected, payload);
+            assert_eq!(allocations, 1, "only the collected buffer");
+            drop(inbound);
+            assert_eq!(available(), free, "every packet buffer returned");
+        }
+        eal::cleanup();
     }
 }

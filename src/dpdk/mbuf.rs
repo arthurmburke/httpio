@@ -3,7 +3,10 @@
 //! from the generated bindings, and calls DPDK's `static inline` pktmbuf
 //! helpers (`rte_pktmbuf_alloc`/`free`/`append`/`prepend`/`reset`) directly.
 
+use std::ops::{Bound, RangeBounds};
+use std::ptr::NonNull;
 use std::slice;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use bytes::Bytes;
 
@@ -455,6 +458,202 @@ fn eal_memory_span() -> &'static std::ops::Range<usize> {
 impl AsRef<[u8]> for Mbuf {
     fn as_ref(&self) -> &[u8] {
         self.data()
+    }
+}
+
+/// A shared, read-only view of bytes in one mbuf segment.
+///
+/// It does what `Bytes::from_owner(mbuf)` does without the heap-allocated
+/// owner: the count that keeps the buffer alive is the mbuf's own
+/// `refcnt`, so cloning, slicing and splitting a view never allocate. Each
+/// view holds one reference, and the mbuf goes back to its pool when the
+/// last one drops, on whichever thread that is (see [`Mbuf::into_bytes`]
+/// for why another thread may free it).
+///
+/// The whole mbuf stays out of the pool for as long as any view of it
+/// lives, however few bytes the view covers.
+pub struct MbufSlice {
+    /// The segment this view holds a reference to.
+    raw: NonNull<ffi::rte_mbuf>,
+    /// The viewed bytes, inside that segment's data. Kept here so reading
+    /// them does not load the mbuf header, which the RX lcore last wrote.
+    ptr: NonNull<u8>,
+    len: u32,
+}
+
+// The viewed bytes are never written while a view exists (making one
+// consumes the only `Mbuf` handle), and the reference count is only
+// changed atomically once it is shared, so views may be sent to and used
+// from other threads.
+unsafe impl Send for MbufSlice {}
+unsafe impl Sync for MbufSlice {}
+
+impl MbufSlice {
+    /// Most references one mbuf may have. `refcnt` is 16 bits; stopping
+    /// well short of that leaves room for increments racing past the check.
+    const MAX_REFS: u16 = u16::MAX / 2;
+
+    /// Views `len` bytes at `start` in the data of `mbuf`, which must be a
+    /// single segment (see [`Mbuf::into_segments`] for a chained packet).
+    ///
+    /// # Panics
+    /// If `mbuf` is chained, or the range is outside its data.
+    pub fn new(mbuf: Mbuf, start: usize, len: usize) -> Self {
+        let data = mbuf.data();
+        assert!(
+            start <= data.len() && len <= data.len() - start,
+            "range outside the mbuf's data"
+        );
+        // SAFETY: `raw` is a valid mbuf. A view frees only its own
+        // segment's reference, so a chain behind it would be freed once
+        // per view.
+        assert!(
+            unsafe { (*mbuf.raw).next.is_null() },
+            "an MbufSlice views one segment"
+        );
+        // SAFETY: `start` is within the data, so the pointer is in bounds
+        // (or dangling for an mbuf with no data, with `len == 0`).
+        let ptr = unsafe { NonNull::new_unchecked(data.as_ptr().add(start).cast_mut()) };
+        // SAFETY: `Mbuf` never holds a null pointer.
+        let raw = unsafe { NonNull::new_unchecked(mbuf.into_raw()) };
+        Self {
+            raw,
+            ptr,
+            len: len as u32,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the range is inside the data of an mbuf this view keeps
+        // alive, and nothing writes it meanwhile.
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+    }
+
+    /// Drops the first `n` bytes from the view.
+    ///
+    /// # Panics
+    /// If `n > self.len()`.
+    pub fn advance(&mut self, n: usize) {
+        assert!(n <= self.len(), "advance past the end of an MbufSlice");
+        // SAFETY: stays within the viewed range.
+        self.ptr = unsafe { self.ptr.add(n) };
+        self.len -= n as u32;
+    }
+
+    /// Keeps the first `len` bytes; no effect if the view is shorter.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.len() {
+            self.len = len as u32;
+        }
+    }
+
+    /// Splits off and returns the first `at` bytes, leaving the rest.
+    /// Both halves share the mbuf.
+    ///
+    /// # Panics
+    /// If `at > self.len()`.
+    pub fn split_to(&mut self, at: usize) -> Self {
+        let mut prefix = self.clone();
+        self.advance(at);
+        prefix.len = at as u32;
+        prefix
+    }
+
+    /// A view of `range` within this one, sharing the mbuf.
+    ///
+    /// # Panics
+    /// If `range` is out of bounds.
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
+        let (start, end) = resolve(range, self.len());
+        let mut part = self.clone();
+        part.advance(start);
+        part.len = (end - start) as u32;
+        part
+    }
+
+    /// Converts to [`Bytes`], which heap-allocates its shared owner (once;
+    /// slices of the result share it). For handing data to code that
+    /// needs `Bytes`; everything else can stay a view.
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from_owner(self)
+    }
+}
+
+/// `range` as `start..end` within a buffer of `len` bytes.
+///
+/// # Panics
+/// If `range` is out of bounds or decreasing.
+pub(crate) fn resolve(range: impl RangeBounds<usize>, len: usize) -> (usize, usize) {
+    let start = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start + 1,
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&end) => end + 1,
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => len,
+    };
+    assert!(start <= end && end <= len, "range out of bounds");
+    (start, end)
+}
+
+impl Clone for MbufSlice {
+    fn clone(&self) -> Self {
+        // SAFETY: `refcnt` is a live `u16` for as long as this view holds
+        // its reference, and DPDK updates it with the same atomic
+        // operations whenever more than one reference exists. The add is
+        // always atomic here (DPDK's own `rte_mbuf_refcnt_update` writes
+        // without one while the count is 1) because two threads may clone
+        // through one `&MbufSlice`.
+        let refcnt = unsafe { AtomicU16::from_ptr(&raw mut (*self.raw.as_ptr()).refcnt) };
+        // Relaxed, as for `Arc`: a new reference is only ever made from an
+        // existing one, which keeps the mbuf alive across the add.
+        if refcnt.fetch_add(1, Ordering::Relaxed) > Self::MAX_REFS {
+            // A wrapped count would free the mbuf under live views.
+            std::process::abort();
+        }
+        Self {
+            raw: self.raw,
+            ptr: self.ptr,
+            len: self.len,
+        }
+    }
+}
+
+impl Drop for MbufSlice {
+    fn drop(&mut self) {
+        // SAFETY: releases the one reference this view holds; DPDK frees
+        // the mbuf when it was the last.
+        unsafe { ffi::rte_pktmbuf_free(self.raw.as_ptr()) }
+    }
+}
+
+impl std::ops::Deref for MbufSlice {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[u8]> for MbufSlice {
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::fmt::Debug for MbufSlice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MbufSlice").field("len", &self.len).finish()
     }
 }
 

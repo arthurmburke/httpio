@@ -440,12 +440,21 @@ impl Tcb {
     }
 
     pub fn recv(&mut self, max_len: usize) -> Bytes {
-        self.recv_chunk(max_len)
-            .map_or_else(Bytes::new, Chunk::into_bytes)
+        let data = self.recv_buffer.read(max_len);
+        if !data.is_empty() {
+            self.on_read();
+        }
+        data
     }
 
     pub(super) fn recv_chunk(&mut self, max_len: usize) -> Option<Chunk> {
         let data = self.recv_buffer.read_chunk(max_len)?;
+        self.on_read();
+        Some(data)
+    }
+
+    /// The application took bytes from the receive buffer.
+    fn on_read(&mut self) {
         if self.state.can_receive() {
             // Announce newly freed space without waiting for another peer
             // packet, but only when the peer needs it: its window is shut,
@@ -459,7 +468,6 @@ impl Tcb {
                 self.ack_pending = true;
             }
         }
-        Some(data)
     }
 
     pub fn readable_len(&self) -> usize {

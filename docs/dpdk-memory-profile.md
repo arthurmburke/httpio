@@ -128,7 +128,9 @@ and reads the same payload into a preallocated application buffer with
 `poll_read`, with `poll_recv` followed by a copy, or with `poll_recv_chunk`
 followed by a copy. `poll_recv` must box one `Bytes` owner per mbuf (asserted
 as one allocation per segment); `poll_read` and `poll_recv_chunk` are
-asserted allocation-free. Timing covers the application read and mbuf
+asserted allocation-free. A `poll_recv_chunk` chunk is a view of the mbuf
+that shares it through the mbuf's own reference count, so splitting, slicing
+and cloning it are allocation-free too. Timing covers the application read and mbuf
 release. Ring production, packet processing, worker scheduling and wakeups
 are outside the timed window. Allocation counting uses a separate sample so
 it does not perturb the timed runs.
@@ -139,5 +141,15 @@ packet, shared by every frame in it:
 
 ```sh
 cargo test --release --lib frames_in_a_packet_buffer -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The HTTP/1.1 codec over plain TCP has one as well: decoding a response body
+out of real mbufs allocates nothing, however chunked framing cuts a packet
+into slices; a slice costs a `Bytes` owner only when it is taken as `Bytes`,
+and collecting a body allocates only the buffer it is copied into:
+
+```sh
+cargo test --release --lib packet_buffers_reach_the_body -- \
   --ignored --nocapture --test-threads=1
 ```
