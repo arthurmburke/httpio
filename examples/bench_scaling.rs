@@ -124,7 +124,7 @@ mod imp {
             engine.poll_into(
                 &port,
                 &pool,
-                httpio::dpdk::time::Instant::now(),
+                httpio::core::time::Instant::now(),
                 &mut events,
             );
             connections.extend(std::iter::from_fn(|| engine.accept(80)));

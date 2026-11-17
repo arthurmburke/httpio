@@ -6,7 +6,7 @@ mod allocations;
 static ALLOCATOR: allocations::CountingAllocator = allocations::CountingAllocator;
 use allocations::count_allocations;
 use bytes::Bytes;
-use httpio::dpdk::time::{Duration, Instant};
+use httpio::core::time::{Duration, Instant};
 use httpio::dpdk::{
     EthPort, Mbuf, Mempool, eal,
     mempool::DEFAULT_MBUF_DATA_ROOM_SIZE,

@@ -75,7 +75,7 @@ mod dpdk {
         events: Vec<(FourTuple, Event)>,
         // Advance protocol time explicitly; benchmarking must not fire RTOs
         // merely because the host was descheduled between samples.
-        now: httpio::dpdk::time::Instant,
+        now: httpio::core::time::Instant,
     }
     impl Fixture {
         fn new(cache_size: u32) -> Self {
@@ -114,7 +114,7 @@ mod dpdk {
                 },
                 injection: Vec::with_capacity(64),
                 events: Vec::new(),
-                now: httpio::dpdk::time::Instant::now(),
+                now: httpio::core::time::Instant::now(),
             };
             let mut packet = f.ethernet(arp::ETHERTYPE_ARP, arp::ARP_HDR_LEN);
             arp::ArpPacket {

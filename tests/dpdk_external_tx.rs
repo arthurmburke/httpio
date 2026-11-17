@@ -75,13 +75,13 @@ fn external_payload_lives_through_ack_driver_clone_and_cross_thread_completion()
             bytes.clone(),
             false,
             false,
-            httpio::dpdk::time::Instant::now(),
+            httpio::core::time::Instant::now(),
         );
         drop(bytes);
         let clone =
             unsafe { Mbuf::from_raw(ffi::rte_pktmbuf_clone(packet.as_raw(), pool.as_raw())) };
         drop(packet);
-        queue.ack_up_to(Seq::new(356), httpio::dpdk::time::Instant::now());
+        queue.ack_up_to(Seq::new(356), httpio::core::time::Instant::now());
         assert_eq!(
             drops.load(Ordering::SeqCst),
             0,

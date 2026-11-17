@@ -519,7 +519,7 @@ mod dpdk_mode {
     /// One thread owns the port and the engine and spins on them: no worker
     /// lcore, no rings, no async runtime.
     pub fn run_raw(args: &[String]) {
-        use httpio::dpdk::time::{Duration as StackDuration, Instant};
+        use httpio::core::time::{Duration as StackDuration, Instant};
 
         use bytes::Bytes;
         use httpio::dpdk::Mbuf;

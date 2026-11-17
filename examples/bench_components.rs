@@ -11,7 +11,7 @@
 //! Output is one tab-separated row per measurement: `section  name
 //! ns/op  [throughput]`.
 
-use httpio::dpdk::time::Instant;
+use httpio::core::time::Instant;
 use std::hint::black_box;
 use std::io::{Read, Write};
 

@@ -5,7 +5,7 @@
 //! `PortSteering` (and so the real flow rules) would.
 #![cfg(dpdk)]
 
-use httpio::dpdk::time::Instant;
+use httpio::core::time::Instant;
 use std::net::Ipv4Addr;
 
 use bytes::Bytes;

@@ -30,7 +30,7 @@ fn main() {
 
 #[cfg(dpdk)]
 mod dpdk_app {
-    use httpio::dpdk::time::Instant;
+    use httpio::core::time::Instant;
     use std::env;
 
     use std::net::Ipv4Addr;
