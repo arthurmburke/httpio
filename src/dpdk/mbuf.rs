@@ -461,20 +461,31 @@ impl AsRef<[u8]> for Mbuf {
     }
 }
 
-/// A shared, read-only view of bytes in one mbuf segment.
+impl Drop for Mbuf {
+    fn drop(&mut self) {
+        // SAFETY: `raw` is a valid, singly-owned mbuf; this is the sole
+        // owner releasing it.
+        unsafe { ffi::rte_pktmbuf_free(self.raw) }
+    }
+}
+
+/// A shared, read-only view of bytes in one mbuf segment: what received
+/// data is handed around as, from the engine to whoever consumes it.
 ///
-/// It does what `Bytes::from_owner(mbuf)` does without the heap-allocated
+/// It does what [`bytes::Bytes::from_owner`] does without the heap-allocated
 /// owner: the count that keeps the buffer alive is the mbuf's own
 /// `refcnt`, so cloning, slicing and splitting a view never allocate. Each
-/// view holds one reference, and the mbuf goes back to its pool when the
-/// last one drops, on whichever thread that is (see [`Mbuf::into_bytes`]
-/// for why another thread may free it).
+/// non-empty view holds one reference, and the mbuf goes back to its pool
+/// when the last one drops, on whichever thread that is (see
+/// [`Mbuf::into_bytes`] for why another thread may free it).
 ///
-/// The whole mbuf stays out of the pool for as long as any view of it
-/// lives, however few bytes the view covers.
+/// The whole mbuf stays out of the pool for as long as any non-empty view
+/// of it lives, however few bytes the view covers. An empty view holds no
+/// mbuf: one that is emptied lets go of it at once.
 pub struct MbufSlice {
-    /// The segment this view holds a reference to.
-    raw: NonNull<ffi::rte_mbuf>,
+    /// The segment this view holds a reference to; `None` exactly when
+    /// the view is empty.
+    raw: Option<NonNull<ffi::rte_mbuf>>,
     /// The viewed bytes, inside that segment's data. Kept here so reading
     /// them does not load the mbuf header, which the RX lcore last wrote.
     ptr: NonNull<u8>,
@@ -493,8 +504,18 @@ impl MbufSlice {
     /// well short of that leaves room for increments racing past the check.
     const MAX_REFS: u16 = u16::MAX / 2;
 
+    /// An empty view, of no mbuf.
+    pub const fn empty() -> Self {
+        Self {
+            raw: None,
+            ptr: NonNull::dangling(),
+            len: 0,
+        }
+    }
+
     /// Views `len` bytes at `start` in the data of `mbuf`, which must be a
     /// single segment (see [`Mbuf::into_segments`] for a chained packet).
+    /// An empty range frees `mbuf`.
     ///
     /// # Panics
     /// If `mbuf` is chained, or the range is outside its data.
@@ -511,16 +532,27 @@ impl MbufSlice {
             unsafe { (*mbuf.raw).next.is_null() },
             "an MbufSlice views one segment"
         );
-        // SAFETY: `start` is within the data, so the pointer is in bounds
-        // (or dangling for an mbuf with no data, with `len == 0`).
+        if len == 0 {
+            return Self::empty();
+        }
+        // SAFETY: `start` is within the data, so the pointer is in bounds.
         let ptr = unsafe { NonNull::new_unchecked(data.as_ptr().add(start).cast_mut()) };
-        // SAFETY: `Mbuf` never holds a null pointer.
-        let raw = unsafe { NonNull::new_unchecked(mbuf.into_raw()) };
         Self {
-            raw,
+            raw: NonNull::new(mbuf.into_raw()),
             ptr,
             len: len as u32,
         }
+    }
+
+    /// A view of a copy of `data`, in an mbuf of its own from `pool`: for
+    /// handing the stack bytes that did not arrive in a packet (tests,
+    /// benchmarks). `None` if the pool is empty or `data` does not fit in
+    /// one of its mbufs.
+    pub fn copy_from_slice(pool: &Mempool, data: &[u8]) -> Option<Self> {
+        let mut mbuf = Mbuf::alloc(pool)?;
+        mbuf.append(u16::try_from(data.len()).ok()?)?
+            .copy_from_slice(data);
+        Some(Self::new(mbuf, 0, data.len()))
     }
 
     pub fn len(&self) -> usize {
@@ -533,7 +565,8 @@ impl MbufSlice {
 
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: the range is inside the data of an mbuf this view keeps
-        // alive, and nothing writes it meanwhile.
+        // alive, and nothing writes it meanwhile. (Empty: a dangling
+        // pointer and no bytes.)
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 
@@ -543,6 +576,10 @@ impl MbufSlice {
     /// If `n > self.len()`.
     pub fn advance(&mut self, n: usize) {
         assert!(n <= self.len(), "advance past the end of an MbufSlice");
+        if n == self.len() {
+            self.clear();
+            return;
+        }
         // SAFETY: stays within the viewed range.
         self.ptr = unsafe { self.ptr.add(n) };
         self.len -= n as u32;
@@ -550,20 +587,37 @@ impl MbufSlice {
 
     /// Keeps the first `len` bytes; no effect if the view is shorter.
     pub fn truncate(&mut self, len: usize) {
-        if len < self.len() {
+        if len == 0 {
+            self.clear();
+        } else if len < self.len() {
             self.len = len as u32;
         }
     }
 
-    /// Splits off and returns the first `at` bytes, leaving the rest.
-    /// Both halves share the mbuf.
+    /// Empties the view, letting go of its mbuf.
+    pub fn clear(&mut self) {
+        *self = Self::empty();
+    }
+
+    /// Splits off and returns the first `at` bytes, leaving the rest. The
+    /// two share the mbuf; taking everything or nothing moves the view
+    /// without touching the reference count.
     ///
     /// # Panics
     /// If `at > self.len()`.
     pub fn split_to(&mut self, at: usize) -> Self {
+        assert!(at <= self.len(), "split past the end of an MbufSlice");
+        if at == self.len() {
+            return std::mem::take(self);
+        }
+        if at == 0 {
+            return Self::empty();
+        }
         let mut prefix = self.clone();
-        self.advance(at);
         prefix.len = at as u32;
+        // SAFETY: stays within the viewed range.
+        self.ptr = unsafe { self.ptr.add(at) };
+        self.len -= at as u32;
         prefix
     }
 
@@ -573,8 +627,12 @@ impl MbufSlice {
     /// If `range` is out of bounds.
     pub fn slice(&self, range: impl RangeBounds<usize>) -> Self {
         let (start, end) = resolve(range, self.len());
+        if start == end {
+            return Self::empty();
+        }
         let mut part = self.clone();
-        part.advance(start);
+        // SAFETY: stays within the viewed range.
+        part.ptr = unsafe { part.ptr.add(start) };
         part.len = (end - start) as u32;
         part
     }
@@ -583,6 +641,9 @@ impl MbufSlice {
     /// slices of the result share it). For handing data to code that
     /// needs `Bytes`; everything else can stay a view.
     pub fn into_bytes(self) -> Bytes {
+        if self.is_empty() {
+            return Bytes::new();
+        }
         Bytes::from_owner(self)
     }
 }
@@ -591,7 +652,7 @@ impl MbufSlice {
 ///
 /// # Panics
 /// If `range` is out of bounds or decreasing.
-pub(crate) fn resolve(range: impl RangeBounds<usize>, len: usize) -> (usize, usize) {
+fn resolve(range: impl RangeBounds<usize>, len: usize) -> (usize, usize) {
     let start = match range.start_bound() {
         Bound::Included(&start) => start,
         Bound::Excluded(&start) => start + 1,
@@ -606,15 +667,24 @@ pub(crate) fn resolve(range: impl RangeBounds<usize>, len: usize) -> (usize, usi
     (start, end)
 }
 
+impl Default for MbufSlice {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 impl Clone for MbufSlice {
     fn clone(&self) -> Self {
+        let Some(raw) = self.raw else {
+            return Self::empty();
+        };
         // SAFETY: `refcnt` is a live `u16` for as long as this view holds
         // its reference, and DPDK updates it with the same atomic
         // operations whenever more than one reference exists. The add is
         // always atomic here (DPDK's own `rte_mbuf_refcnt_update` writes
         // without one while the count is 1) because two threads may clone
         // through one `&MbufSlice`.
-        let refcnt = unsafe { AtomicU16::from_ptr(&raw mut (*self.raw.as_ptr()).refcnt) };
+        let refcnt = unsafe { AtomicU16::from_ptr(&raw mut (*raw.as_ptr()).refcnt) };
         // Relaxed, as for `Arc`: a new reference is only ever made from an
         // existing one, which keeps the mbuf alive across the add.
         if refcnt.fetch_add(1, Ordering::Relaxed) > Self::MAX_REFS {
@@ -631,9 +701,11 @@ impl Clone for MbufSlice {
 
 impl Drop for MbufSlice {
     fn drop(&mut self) {
-        // SAFETY: releases the one reference this view holds; DPDK frees
-        // the mbuf when it was the last.
-        unsafe { ffi::rte_pktmbuf_free(self.raw.as_ptr()) }
+        if let Some(raw) = self.raw {
+            // SAFETY: releases the one reference this view holds; DPDK
+            // frees the mbuf when it was the last.
+            unsafe { ffi::rte_pktmbuf_free(raw.as_ptr()) }
+        }
     }
 }
 
@@ -657,10 +729,80 @@ impl std::fmt::Debug for MbufSlice {
     }
 }
 
-impl Drop for Mbuf {
-    fn drop(&mut self) {
-        // SAFETY: `raw` is a valid, singly-owned mbuf; this is the sole
-        // owner releasing it.
-        unsafe { ffi::rte_pktmbuf_free(self.raw) }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+    use crate::dpdk::testing;
+
+    /// Views share their mbuf through its reference count: every split,
+    /// slice and clone points into the same buffer, and the mbuf goes back
+    /// to the pool exactly when the last non-empty view of it is gone.
+    #[test]
+    fn views_share_their_mbuf_and_return_it_with_the_last_one() {
+        testing::init();
+        let pool =
+            Mempool::create("mbuf-slice-test", 63, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+        let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
+        let free = available();
+
+        // A plain Mbuf frees itself.
+        drop(Mbuf::alloc(&pool).unwrap());
+        assert_eq!(available(), free);
+
+        let data = b"head\r\nbody-bytes";
+        let mut view = MbufSlice::copy_from_slice(&pool, data).unwrap();
+        assert_eq!(available(), free - 1);
+        let base = view.as_ptr();
+        assert_eq!(&view[..], data);
+
+        let head = view.split_to(6);
+        assert_eq!(
+            (&head[..], &view[..]),
+            (&b"head\r\n"[..], &b"body-bytes"[..])
+        );
+        assert_eq!(view.as_ptr(), unsafe { base.add(6) });
+        let part = view.slice(5..);
+        assert_eq!(&part[..], b"bytes");
+        assert_eq!(part.as_ptr(), unsafe { base.add(11) });
+        let copy = part.clone();
+        assert_eq!(copy.as_ptr(), part.as_ptr());
+        assert_eq!(available(), free - 1, "one mbuf, however many views");
+
+        // Empty views hold nothing, however they were made.
+        assert!(view.slice(3..3).is_empty());
+        assert!(view.split_to(0).is_empty());
+        assert!(MbufSlice::empty().clone().is_empty());
+        assert!(MbufSlice::empty().into_bytes().is_empty());
+
+        let mut rest = view.split_to(view.len());
+        assert!(view.is_empty());
+        rest.advance(5);
+        rest.truncate(3);
+        assert_eq!(&rest[..], b"byt");
+
+        // Emptying a view lets go of its reference at once.
+        drop((head, part));
+        rest.advance(rest.len());
+        assert_eq!(available(), free - 1, "`copy` still holds it");
+        let mut copy = copy;
+        copy.truncate(0);
+        assert_eq!(available(), free);
+
+        // A view converted to Bytes keeps its mbuf until the last Bytes
+        // slice of it goes, on any thread.
+        let bytes = MbufSlice::copy_from_slice(&pool, data)
+            .unwrap()
+            .into_bytes();
+        let tail = bytes.slice(6..);
+        drop(bytes);
+        assert_eq!(available(), free - 1);
+        std::thread::spawn(move || drop(tail)).join().unwrap();
+        assert_eq!(available(), free);
+
+        // An empty range of an mbuf frees it at once.
+        let empty = MbufSlice::new(Mbuf::alloc(&pool).unwrap(), 0, 0);
+        assert!(empty.is_empty());
+        assert_eq!(available(), free);
     }
 }

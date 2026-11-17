@@ -22,9 +22,8 @@ use crate::core::hashset::HashSet;
 use crate::dpdk::net::arp::ArpTable;
 use crate::dpdk::net::eth::EthAddr;
 use crate::dpdk::net::{arp, eth, ipv4, tcp};
-use crate::dpdk::{EthPort, Mbuf, Mempool};
+use crate::dpdk::{EthPort, Mbuf, MbufSlice, Mempool};
 
-use super::chunk::Chunk;
 use super::seq::Seq;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple, OutSegment, Tcb};
@@ -394,9 +393,12 @@ impl TcpEngine {
         }
     }
 
-    pub fn recv(&mut self, tuple: FourTuple, max_len: usize) -> Bytes {
+    /// Takes up to `max_len` in-order received bytes from the connection:
+    /// its next chunk, or part of it, as a view of the mbuf it arrived in.
+    /// Empty when nothing is readable.
+    pub fn recv(&mut self, tuple: FourTuple, max_len: usize) -> MbufSlice {
         let Some(conn) = self.connections.get_mut(&tuple) else {
-            return Bytes::new();
+            return MbufSlice::empty();
         };
         let data = conn.tcb.recv(max_len);
         // Reading only needs a poll when it produced a window update.
@@ -412,22 +414,17 @@ impl TcpEngine {
         &mut self,
         tuple: FourTuple,
         max_len: usize,
-        mut deliver: impl FnMut(Bytes) -> bool,
-    ) {
-        self.recv_each_chunk(tuple, max_len, |chunk| deliver(chunk.into_bytes()));
-    }
-
-    pub(super) fn recv_each_chunk(
-        &mut self,
-        tuple: FourTuple,
-        max_len: usize,
-        mut deliver: impl FnMut(Chunk) -> bool,
+        mut deliver: impl FnMut(MbufSlice) -> bool,
     ) {
         let Some(conn) = self.connections.get_mut(&tuple) else {
             return;
         };
         let mut any = false;
-        while let Some(data) = conn.tcb.recv_chunk(max_len) {
+        loop {
+            let data = conn.tcb.recv(max_len);
+            if data.is_empty() {
+                break;
+            }
             any = true;
             if !deliver(data) {
                 break;
@@ -904,9 +901,9 @@ impl TcpEngine {
 
     /// `ip_ok`/`l4_ok` report that the NIC already verified the IPv4 /
     /// TCP checksum on RX, so software verification can be skipped.
-    /// Parse the owned mbuf by borrowing it. Only accepted TCP data is
-    /// converted into shared Bytes ownership; control and dropped packets
-    /// return directly to the pool without allocating an owner record.
+    /// Parse the owned mbuf by borrowing it. Accepted TCP data is queued as
+    /// views of its segments ([`MbufSlice`]), which allocate nothing;
+    /// control and dropped packets return directly to the pool.
     fn handle_frame(&mut self, mbuf: Mbuf, ip_ok: bool, l4_ok: bool, now: Instant) {
         let frame = mbuf.data();
         let Some(eth_hdr) = eth::EthHeader::parse(frame) else {
@@ -978,7 +975,7 @@ impl TcpEngine {
         if let Some(conn) = self.connections.get_mut(&tuple) {
             let start = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + hdr_len;
             let end = eth::ETH_HDR_LEN + total_len;
-            conn.tcb.on_segment_rx(
+            conn.tcb.on_segment_with(
                 &tcp_hdr,
                 payload_len,
                 || {
@@ -994,7 +991,7 @@ impl TcpEngine {
                         if n == 0 {
                             return None;
                         }
-                        let chunk = Chunk::packet(segment, skip, n);
+                        let chunk = MbufSlice::new(segment, skip, n);
                         skip = 0;
                         remaining -= n;
                         Some(chunk)
@@ -1365,7 +1362,7 @@ mod tests {
                     urgent_pointer: 0,
                     options: tcp::TcpOptions::default(),
                 };
-                tcb.on_segment(&ack, Bytes::new(), now);
+                tcb.on_segment(&ack, MbufSlice::empty(), now);
             }
             tcb.send(Bytes::from(vec![0; 100_000]));
             let tuple = tcb.tuple;
@@ -1406,7 +1403,7 @@ mod tests {
             urgent_pointer: 0,
             options: tcp::TcpOptions::default(),
         };
-        tcb.on_segment(&peer, Bytes::new(), now);
+        tcb.on_segment(&peer, MbufSlice::empty(), now);
         tcb.poll_output(now);
         peer.seq += 1;
         peer.flags = tcp::flags::ACK;
@@ -1426,18 +1423,8 @@ mod tests {
     #[test]
     fn native_chains_tso_and_gro_preserve_payload_and_reclaim_pool() {
         use crate::dpdk::net::checksum;
-        use crate::dpdk::{eal, ffi};
-        let cpu = unsafe { libc::sched_getcpu() };
-        eal::init(&[
-            "offload-test",
-            "--no-huge",
-            "--no-pci",
-            "--no-shconf",
-            "--no-telemetry",
-            "--lcores",
-            &format!("0@{cpu}"),
-        ])
-        .unwrap();
+        use crate::dpdk::{ffi, testing};
+        testing::init();
         {
             let pool = Mempool::create("offload-test", 1023, 0, 2176, -1).unwrap();
             let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
@@ -1604,15 +1591,14 @@ mod tests {
             assert_eq!(packet.pkt_len(), 54 + 3003);
             engine.handle_frame(packet, true, true, now);
             use crate::dpdk::tcp::stream::TcpStream;
-            use crate::dpdk::tcp::worker::InboundMessage;
+            use crate::dpdk::tcp::worker::Inbound;
             use std::pin::Pin;
             use std::task::{Context, Poll, Waker};
             use tokio::io::{AsyncRead, ReadBuf};
 
             let (mut stream, _commands, inbound, _) = TcpStream::test_stream();
-            engine.recv_each_chunk(tuple, usize::MAX, |chunk| {
-                assert!(matches!(chunk, Chunk::Packet { .. }));
-                assert!(inbound.push(InboundMessage::Data(chunk)).is_ok());
+            engine.recv_each(tuple, usize::MAX, |chunk| {
+                assert!(inbound.push(Inbound::Data(chunk)).is_ok());
                 true
             });
             let mut cx = Context::from_waker(Waker::noop());
@@ -1644,7 +1630,6 @@ mod tests {
                     (suffix, head, middle, copy)
                 });
             assert_eq!(allocations, 0);
-            assert!(matches!(suffix, Chunk::Packet(_)));
             assert_eq!(
                 (head.len(), suffix.len(), middle.len(), copy.len()),
                 (100, 402, 401, 100)
@@ -1699,7 +1684,6 @@ mod tests {
             assert_eq!(engine.readable_len(tuple), 0);
             assert_eq!(available(), baseline);
         }
-        eal::cleanup();
     }
 
     #[test]
@@ -1713,7 +1697,7 @@ mod tests {
             let fin = tcb.poll_output(now).remove(0);
             peer.ack = fin.seq.0.wrapping_add(1);
             peer.flags |= tcp::flags::FIN;
-            tcb.on_segment(&peer, Bytes::new(), now);
+            tcb.on_segment(&peer, MbufSlice::empty(), now);
             tcb.poll_output(now); // final ACK
             assert_eq!(tcb.state, TcpState::TimeWait);
             deadline = tcb.next_deadline().unwrap();
@@ -1745,13 +1729,13 @@ mod tests {
         let fin = tcb.poll_output(now).remove(0);
         peer.ack = fin.seq.0.wrapping_add(1);
         peer.flags |= tcp::flags::FIN;
-        tcb.on_segment(&peer, Bytes::new(), now);
+        tcb.on_segment(&peer, MbufSlice::empty(), now);
         tcb.poll_output(now);
         let old_deadline = tcb.next_deadline().unwrap();
         let tuple = schedule_tcb(&mut engine, tcb);
         let later = now + Duration::from_secs(1);
         let conn = engine.connections.get_mut(&tuple).unwrap();
-        conn.tcb.on_segment(&peer, Bytes::new(), later);
+        conn.tcb.on_segment(&peer, MbufSlice::empty(), later);
         conn.tcb.poll_output(later);
         let new_deadline = conn.tcb.next_deadline().unwrap();
         assert!(new_deadline > old_deadline);
@@ -1776,7 +1760,7 @@ mod tests {
             let (mut tcb, mut peer) = established_tcb(1234, now);
             if persist {
                 peer.window = 0;
-                tcb.on_segment(&peer, Bytes::new(), now);
+                tcb.on_segment(&peer, MbufSlice::empty(), now);
             }
             tcb.send(Bytes::from_static(b"payload"));
             tcb.poll_output(now);
@@ -1808,7 +1792,7 @@ mod tests {
             .get_mut(&tuple)
             .unwrap()
             .tcb
-            .on_segment(&peer, Bytes::new(), now);
+            .on_segment(&peer, MbufSlice::empty(), now);
         TcpEngine::mark_active(
             &mut engine.active,
             engine.connections.get_mut(&tuple).unwrap(),

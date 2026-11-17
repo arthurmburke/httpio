@@ -16,4 +16,7 @@
 
 pub mod client;
 pub mod h1;
+pub mod recv_buf;
 pub mod websocket;
+
+pub use recv_buf::RecvBuf;

@@ -12,6 +12,7 @@ use bytes::Bytes;
 use super::engine::TcpEngine;
 use super::state::TcpState;
 use super::tcb::FourTuple;
+use crate::dpdk::MbufSlice;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpSocket(pub FourTuple);
@@ -41,9 +42,9 @@ impl TcpSocket {
         engine.send(self.0, data);
     }
 
-    /// Non-blocking read of up to `max_len` bytes; returns an empty
-    /// `Bytes` if nothing is available.
-    pub fn recv(&self, engine: &mut TcpEngine, max_len: usize) -> Bytes {
+    /// Non-blocking read of up to `max_len` bytes, as a view of the mbuf
+    /// they arrived in; empty if nothing is available.
+    pub fn recv(&self, engine: &mut TcpEngine, max_len: usize) -> MbufSlice {
         engine.recv(self.0, max_len)
     }
 

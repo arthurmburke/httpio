@@ -36,10 +36,9 @@ use crate::core::mpsc::{MpscRx, MpscTx};
 use crate::core::signal::{Signal, SignalHandle};
 use crate::core::spsc;
 use crate::core::spsc::{SpscRx, SpscTx};
-use crate::dpdk::{self, EthPort, Mempool, WorkerJoin};
+use crate::dpdk::{self, EthPort, MbufSlice, Mempool, WorkerJoin};
 
 use super::app_wake::{self, AppNotifier, AppReady, AppWake};
-use super::chunk::Chunk;
 use super::engine::TcpEngine;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple};
@@ -253,26 +252,13 @@ fn command_channel_with_wake(
 }
 pub type CmdRx = SpscRx<Command, CMD_CAP>;
 pub type InboundTx = SpscTx<Inbound, IN_CAP>;
-pub(crate) type InboundSender = SpscTx<InboundMessage, IN_CAP>;
-
-pub(crate) enum InboundMessage {
-    Data(Chunk),
-    Control(Inbound),
-}
 
 pub struct InboundRx {
-    ring: SpscRx<InboundMessage, IN_CAP>,
+    ring: SpscRx<Inbound, IN_CAP>,
     signal: Arc<SendCredit>,
 }
 impl InboundRx {
     pub fn pop(&self) -> Option<Inbound> {
-        Some(match self.pop_chunk()? {
-            InboundMessage::Data(chunk) => Inbound::Data(chunk.into_bytes()),
-            InboundMessage::Control(control) => control,
-        })
-    }
-
-    pub(super) fn pop_chunk(&self) -> Option<InboundMessage> {
         let value = self.ring.pop();
         if value.is_some() {
             self.signal.notify();
@@ -292,7 +278,7 @@ impl InboundRx {
         self.ring.capacity()
     }
 }
-pub(crate) fn inbound_channel(signal: Arc<SendCredit>) -> (InboundSender, InboundRx) {
+pub(crate) fn inbound_channel(signal: Arc<SendCredit>) -> (InboundTx, InboundRx) {
     let (tx, ring) = spsc::channel();
     (tx, InboundRx { ring, signal })
 }
@@ -323,8 +309,9 @@ pub enum Inbound {
     Established,
     /// Handshake failed (RST or timeout before ESTABLISHED).
     ConnectFailed,
-    /// Received application bytes, in order.
-    Data(Bytes),
+    /// Received application bytes, in order: a view of the mbuf segment
+    /// they arrived in, never empty.
+    Data(MbufSlice),
     /// Peer finished sending (FIN); no more `Data` will follow.
     Eof,
     /// Connection was reset.
@@ -334,16 +321,6 @@ pub enum Inbound {
     /// retry with a different local port. The existing connection is
     /// unaffected.
     AddrInUse,
-}
-
-#[cfg(test)]
-impl From<Inbound> for InboundMessage {
-    fn from(message: Inbound) -> Self {
-        match message {
-            Inbound::Data(bytes) => Self::Data(Chunk::Bytes(bytes)),
-            control => Self::Control(control),
-        }
-    }
 }
 
 /// The control message that registers a new connection with the worker,
@@ -356,7 +333,7 @@ struct NewConn {
     initial_window_segments: u16,
     cmd_rx: CmdRx,
     outstanding: Arc<SendCredit>,
-    inbound_tx: InboundSender,
+    inbound_tx: InboundTx,
     app_wake: Arc<AppWake>,
 }
 
@@ -408,10 +385,10 @@ struct WorkerConn {
     tuple: FourTuple,
     cmd_rx: CmdRx,
     outstanding: Arc<SendCredit>,
-    inbound_tx: InboundSender,
+    inbound_tx: InboundTx,
     /// A received chunk the inbound ring was too full to accept; retried
     /// before pulling more from the engine so no bytes are dropped.
-    pending_in: Option<Chunk>,
+    pending_in: Option<MbufSlice>,
     delivery: Delivery,
     teardown: Teardown,
     /// How the application is told this connection changed; absent only
@@ -429,7 +406,7 @@ impl WorkerConn {
         tuple: FourTuple,
         cmd_rx: CmdRx,
         outstanding: Arc<SendCredit>,
-        inbound_tx: InboundSender,
+        inbound_tx: InboundTx,
     ) -> Self {
         Self {
             engine_bytes: 0,
@@ -448,21 +425,13 @@ impl WorkerConn {
     /// Pushes to the application's inbound ring, noting on success that
     /// the application has something to be woken for.
     fn push_inbound(&mut self, msg: Inbound) -> Result<(), Inbound> {
-        self.push_message(InboundMessage::Control(msg))
-            .map_err(|message| match message {
-                InboundMessage::Control(control) => control,
-                InboundMessage::Data(_) => unreachable!(),
-            })
-    }
-
-    fn push_message(&mut self, message: InboundMessage) -> Result<(), InboundMessage> {
-        let pushed = self.inbound_tx.push(message);
+        let pushed = self.inbound_tx.push(msg);
         self.notify_app |= pushed.is_ok();
         pushed
     }
 
-    fn deliver_chunk(&mut self, chunk: Chunk) -> bool {
-        if let Err(InboundMessage::Data(chunk)) = self.push_message(InboundMessage::Data(chunk)) {
+    fn deliver_chunk(&mut self, chunk: MbufSlice) -> bool {
+        if let Err(Inbound::Data(chunk)) = self.push_inbound(Inbound::Data(chunk)) {
             self.pending_in = Some(chunk);
             return false;
         }
@@ -984,9 +953,7 @@ fn run(
             };
             let Some(tuple) = tuple else {
                 // The ring is brand new (empty), so this push cannot fail.
-                let _ = nc
-                    .inbound_tx
-                    .push(InboundMessage::Control(Inbound::AddrInUse));
+                let _ = nc.inbound_tx.push(Inbound::AddrInUse);
                 notifier.notify(&nc.app_wake);
                 continue;
             };
@@ -1065,7 +1032,7 @@ fn run(
             }
             // Each chunk is at most one mbuf segment (u16::MAX bytes).
             if conn.pending_in.is_none() {
-                engine.recv_each_chunk(conn.tuple, usize::MAX, |chunk| conn.deliver_chunk(chunk));
+                engine.recv_each(conn.tuple, usize::MAX, |chunk| conn.deliver_chunk(chunk));
             }
             // Peer FIN, once buffered data is fully delivered, becomes an
             // EOF terminal. The terminal signal goes out only after all
@@ -1161,7 +1128,7 @@ mod tests {
         assert!(work.is_empty(), "idle connections must not be scheduled");
         assert!(
             in_tx
-                .push(Inbound::Data(Bytes::from_static(b"x")).into())
+                .push(Inbound::Data(crate::dpdk::testing::slice(b"x")))
                 .is_ok()
         );
         assert!(in_rx.pop().is_some());

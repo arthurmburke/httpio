@@ -1,6 +1,6 @@
 use super::*;
 use crate::allocations::count_allocations;
-use crate::dpdk::{Mbuf, Mempool, eal, ffi, mempool::DEFAULT_MBUF_DATA_ROOM_SIZE};
+use crate::dpdk::{Mempool, ffi, mempool::DEFAULT_MBUF_DATA_ROOM_SIZE, testing};
 use std::{hint::black_box, task::Waker, time::Instant};
 
 const SEGMENT: usize = 1448;
@@ -8,17 +8,7 @@ const SEGMENT: usize = 1448;
 #[test]
 #[ignore = "benchmark; run alone in release mode"]
 fn benchmark_stream_reads() {
-    let cpu = unsafe { libc::sched_getcpu() };
-    eal::init(&[
-        "stream-read-bench",
-        "--no-huge",
-        "--no-pci",
-        "--no-shconf",
-        "--no-telemetry",
-        "--lcores",
-        &format!("0@{cpu}"),
-    ])
-    .unwrap();
+    testing::init();
     {
         let pool = Mempool::create(
             "stream-read-bench",
@@ -43,13 +33,8 @@ fn benchmark_stream_reads() {
                 let mut allocations = 0;
                 for iteration in 0..129 + iterations {
                     for data in expected.chunks(SEGMENT) {
-                        let mut packet = Mbuf::alloc(&pool).unwrap();
-                        packet
-                            .append(data.len() as u16)
-                            .unwrap()
-                            .copy_from_slice(data);
-                        let message = InboundMessage::Data(Chunk::packet(packet, 0, data.len()));
-                        assert!(inbound.push(message).is_ok());
+                        let packet = MbufSlice::copy_from_slice(&pool, data).unwrap();
+                        assert!(inbound.push(Inbound::Data(packet)).is_ok());
                     }
                     let mut read = || {
                         if borrowed {
@@ -117,5 +102,4 @@ fn benchmark_stream_reads() {
             }
         }
     }
-    eal::cleanup();
 }

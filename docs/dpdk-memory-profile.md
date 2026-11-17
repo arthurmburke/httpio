@@ -115,8 +115,8 @@ completion are outside this comparison. The report also records whether a
 16-mbuf request, an external attachment, or one individual allocation
 succeeds with one pool object left.
 
-Run the stream read baseline separately so its EAL setup has the process
-to itself:
+Run the stream read baseline on its own, so nothing else competes for the
+core:
 
 ```sh
 taskset -c 0 cargo test --release --lib benchmark_stream_reads -- \
@@ -128,28 +128,23 @@ and reads the same payload into a preallocated application buffer with
 `poll_read`, with `poll_recv` followed by a copy, or with `poll_recv_chunk`
 followed by a copy. `poll_recv` must box one `Bytes` owner per mbuf (asserted
 as one allocation per segment); `poll_read` and `poll_recv_chunk` are
-asserted allocation-free. A `poll_recv_chunk` chunk is a view of the mbuf
-that shares it through the mbuf's own reference count, so splitting, slicing
-and cloning it are allocation-free too. Timing covers the application read and mbuf
-release. Ring production, packet processing, worker scheduling and wakeups
+asserted allocation-free. Received data is an `MbufSlice` everywhere up to
+that point -- the reassembly queue, the inbound ring, `poll_recv_chunk` -- a
+view that shares its mbuf through the mbuf's own reference count, so
+splitting, slicing and cloning it are allocation-free too. Timing covers the
+application read and mbuf release. Ring production, packet processing, worker scheduling and wakeups
 are outside the timed window. Allocation counting uses a separate sample so
 it does not perturb the timed runs.
 
 The WebSocket reader over plain TCP has a matching check on real mbufs: text
 frames allocate only their `String`, and binary frames one `Bytes` owner per
-packet, shared by every frame in it:
+packet, shared by every frame in it. So does the HTTP/1.1 codec: decoding a
+response body out of real mbufs allocates nothing, however chunked framing
+cuts a packet into slices; a slice costs a `Bytes` owner only when it is
+taken as `Bytes`, and collecting a body allocates only the buffer it is
+copied into. Both run with the ordinary unit tests (the unit tests share
+one EAL, brought up on first use by `dpdk::testing`):
 
 ```sh
-cargo test --release --lib frames_in_a_packet_buffer -- \
-  --ignored --nocapture --test-threads=1
-```
-
-The HTTP/1.1 codec over plain TCP has one as well: decoding a response body
-out of real mbufs allocates nothing, however chunked framing cuts a packet
-into slices; a slice costs a `Bytes` owner only when it is taken as `Bytes`,
-and collecting a body allocates only the buffer it is copied into:
-
-```sh
-cargo test --release --lib packet_buffers_reach_the_body -- \
-  --ignored --nocapture --test-threads=1
+cargo test --lib -- frames_in_a_packet_buffer packet_buffers_reach_the_body
 ```

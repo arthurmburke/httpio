@@ -6,7 +6,7 @@
 //!
 //! [`AsyncRead`] copies directly from the receive mbuf into the caller's
 //! buffer. [`recv_chunk`](TcpStream::recv_chunk) hands out a view of the mbuf
-//! itself ([`Chunk`]), so the caller can read, split and keep the data
+//! itself ([`MbufSlice`]), so the caller can read, split and keep the data
 //! without copying or allocating; [`recv`](TcpStream::recv) does the same as
 //! [`Bytes`], at the cost of one allocation per mbuf.
 //! [`send`](TcpStream::send) moves owned bytes across the ring, while
@@ -35,12 +35,9 @@ use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::core::spinlock::SpinLock;
-use crate::dpdk::DmaWriter;
 use crate::dpdk::tcp::app_wake::AppWake;
-use crate::dpdk::tcp::chunk::Chunk;
-use crate::dpdk::tcp::worker::{
-    CmdTx, Command, Inbound, InboundMessage, InboundRx, OpenError, WorkerHandle,
-};
+use crate::dpdk::tcp::worker::{CmdTx, Command, Inbound, InboundRx, OpenError, WorkerHandle};
+use crate::dpdk::{DmaWriter, MbufSlice};
 
 /// Per-connection TCP transport options. Attach to an HTTP request via
 /// `http::Extensions` (`request.extensions_mut().insert(TcpOptions {..})`)
@@ -298,7 +295,7 @@ pub struct TcpStream {
     wake: Option<Parker>,
     state: StreamState,
     /// The next in-order chunk, including any unread suffix of a partial read.
-    read_chunk: Option<Chunk>,
+    read_chunk: Option<MbufSlice>,
     /// Where `poll_write` copies borrowed data on a port with TSO, so the
     /// engine attaches it to packets without a second copy; `None`
     /// otherwise, and the data goes to the ordinary heap.
@@ -489,22 +486,22 @@ impl TcpStream {
     /// reset is surfaced, matching [`AsyncRead`].
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
         self.poll_recv_chunk(cx)
-            .map_ok(|chunk| chunk.map(Chunk::into_bytes))
+            .map_ok(|chunk| chunk.map(MbufSlice::into_bytes))
     }
 
     /// Zero-copy read: pops the next received chunk, a view of the packet
     /// buffer it arrived in, with no copy and no heap allocation. The
-    /// [`Chunk`] can be split, sliced and cloned, still without allocating;
+    /// [`MbufSlice`] can be split, sliced and cloned, still without allocating;
     /// the buffer returns to its pool when the last part is dropped.
     /// `Ok(None)` is a clean EOF; waits until a chunk, EOF, or reset is
     /// available.
-    pub async fn recv_chunk(&mut self) -> io::Result<Option<Chunk>> {
+    pub async fn recv_chunk(&mut self) -> io::Result<Option<MbufSlice>> {
         poll_fn(|cx| self.poll_recv_chunk(cx)).await
     }
 
     /// Poll form of [`recv_chunk`](Self::recv_chunk). Buffered data is
     /// delivered before a reset is surfaced, matching [`AsyncRead`].
-    pub fn poll_recv_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Chunk>>> {
+    pub fn poll_recv_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<MbufSlice>>> {
         if let Poll::Ready(done) = self.try_recv() {
             return Poll::Ready(done);
         }
@@ -514,7 +511,7 @@ impl TcpStream {
         self.try_recv()
     }
 
-    fn try_recv(&mut self) -> Poll<io::Result<Option<Chunk>>> {
+    fn try_recv(&mut self) -> Poll<io::Result<Option<MbufSlice>>> {
         self.drain_flush();
         self.drain_inbound();
         if let Some(chunk) = self.read_chunk.take() {
@@ -574,16 +571,14 @@ impl TcpStream {
         // either end is dropped; from the receiver that means the sender.
         let sender_gone = self.inbound_rx.is_closed();
         while self.read_chunk.is_none() {
-            let Some(msg) = self.inbound_rx.pop_chunk() else {
-                break;
-            };
-            match msg {
-                InboundMessage::Data(chunk) => {
+            match self.inbound_rx.pop() {
+                None => break,
+                Some(Inbound::Data(chunk)) => {
                     if !chunk.is_empty() {
                         self.read_chunk = Some(chunk);
                     }
                 }
-                InboundMessage::Control(control) => self.on_control(control),
+                Some(control) => self.on_control(control),
             }
         }
         // If the worker dropped its inbound sender (connection reaped),
@@ -886,7 +881,7 @@ impl TcpStream {
     pub(crate) fn test_stream() -> (
         TcpStream,
         crate::dpdk::tcp::worker::CmdRx,
-        crate::dpdk::tcp::worker::InboundSender,
+        crate::dpdk::tcp::worker::InboundTx,
         Arc<crate::dpdk::tcp::worker::SendCredit>,
     ) {
         let (cmd_tx, cmd_rx, credit) = crate::dpdk::tcp::worker::command_channel();
@@ -912,7 +907,8 @@ impl TcpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dpdk::tcp::worker::{CmdRx, InboundSender, SEND_CAPACITY};
+    use crate::dpdk::tcp::worker::{CmdRx, InboundTx, SEND_CAPACITY};
+    use crate::dpdk::testing::slice;
 
     /// The worker clones each sent chunk into its retransmit queue (and
     /// slices it into segments). That must never allocate on the lcore, so
@@ -1007,12 +1003,9 @@ mod tests {
         let (mut stream, _rx, tx, _credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
         for b in [b"first".as_slice(), b"second".as_slice()] {
-            assert!(
-                tx.push(Inbound::Data(Bytes::copy_from_slice(b)).into())
-                    .is_ok()
-            );
+            assert!(tx.push(Inbound::Data(slice(b))).is_ok());
         }
-        assert!(tx.push(Inbound::Reset.into()).is_ok());
+        assert!(tx.push(Inbound::Reset).is_ok());
         drop(tx);
         for _ in 0..100 {
             assert!(matches!(
@@ -1038,10 +1031,7 @@ mod tests {
     fn reset_unblocks_writer_even_with_unread_data() {
         let (mut stream, _rx, tx, credit) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(
-            tx.push(Inbound::Data(Bytes::from_static(b"unread")).into())
-                .is_ok()
-        );
+        assert!(tx.push(Inbound::Data(slice(b"unread"))).is_ok());
         stream.drain_inbound();
         credit.failed.store(true, Ordering::Release);
         assert!(matches!(Pin::new(&mut stream).poll_write(&mut cx, b"x"),
@@ -1059,14 +1049,8 @@ mod tests {
     fn partial_read_keeps_only_one_staged_chunk() {
         let (mut stream, _rx, tx, _) = TcpStream::test_stream();
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        assert!(
-            tx.push(Inbound::Data(Bytes::from_static(b"abcd")).into())
-                .is_ok()
-        );
-        assert!(
-            tx.push(Inbound::Data(Bytes::from_static(b"ef")).into())
-                .is_ok()
-        );
+        assert!(tx.push(Inbound::Data(slice(b"abcd"))).is_ok());
+        assert!(tx.push(Inbound::Data(slice(b"ef"))).is_ok());
         let mut storage = [0; 2];
         let mut buf = ReadBuf::new(&mut storage);
         assert!(matches!(
@@ -1086,7 +1070,7 @@ mod tests {
     fn parked_fixture() -> (
         TcpStream,
         CmdRx,
-        InboundSender,
+        InboundTx,
         crate::dpdk::tcp::app_wake::AppNotifier,
         Arc<AppWake>,
     ) {
@@ -1108,8 +1092,8 @@ mod tests {
             let mut next = 0u32;
             while next < CHUNKS {
                 notifier.retry();
-                let chunk = Bytes::copy_from_slice(&next.to_be_bytes());
-                if inbound_tx.push(Inbound::Data(chunk).into()).is_ok() {
+                let chunk = slice(&next.to_be_bytes());
+                if inbound_tx.push(Inbound::Data(chunk)).is_ok() {
                     notifier.notify(&wake);
                     next += 1;
                     // Pause now and then so the reader really does wait.
@@ -1132,7 +1116,7 @@ mod tests {
                 .unwrap();
             runtime.block_on(async {
                 for expected in 0..CHUNKS {
-                    let chunk = stream.recv().await.unwrap().unwrap();
+                    let chunk = stream.recv_chunk().await.unwrap().unwrap();
                     assert_eq!(&chunk[..], &expected.to_be_bytes());
                 }
             });

@@ -15,10 +15,12 @@ pub mod net;
 pub mod port;
 pub mod steering;
 pub mod tcp;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod tls;
 pub mod tokio;
 
 pub use lcore::{WorkerJoin, first_worker_lcore, launch};
-pub use mbuf::Mbuf;
+pub use mbuf::{Mbuf, MbufSlice};
 pub use mempool::Mempool;
 pub use port::EthPort;

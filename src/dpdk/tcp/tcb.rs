@@ -7,9 +7,9 @@ use std::net::Ipv4Addr;
 
 use bytes::Bytes;
 
+use crate::dpdk::MbufSlice;
 use crate::dpdk::net::tcp::{TcpHeader, TcpOptions, flags};
 
-use super::chunk::Chunk;
 use super::congestion::CongestionControl;
 use super::rto::{MAX_RETRANSMITS, MAX_RTO, RetransmitQueue, RtoEstimator};
 use super::rx_queue::ReassemblyBuffer;
@@ -439,18 +439,14 @@ impl Tcb {
         self.flush_requested = true;
     }
 
-    pub fn recv(&mut self, max_len: usize) -> Bytes {
+    /// Takes up to `max_len` in-order received bytes: the next chunk, or
+    /// part of it. Empty when nothing is readable.
+    pub fn recv(&mut self, max_len: usize) -> MbufSlice {
         let data = self.recv_buffer.read(max_len);
         if !data.is_empty() {
             self.on_read();
         }
         data
-    }
-
-    pub(super) fn recv_chunk(&mut self, max_len: usize) -> Option<Chunk> {
-        let data = self.recv_buffer.read_chunk(max_len)?;
-        self.on_read();
-        Some(data)
     }
 
     /// The application took bytes from the receive buffer.
@@ -496,32 +492,18 @@ impl Tcb {
     /// RFC 9293 §3.10.7: processes one incoming segment against the
     /// current state.
     ///
-    /// `payload` is an owned, refcounted slice of the RX mbuf (see
-    /// [`Mbuf::into_bytes`](crate::dpdk::Mbuf::into_bytes)); if accepted it
-    /// moves into the reassembly buffer without being copied.
-    pub fn on_segment(&mut self, hdr: &TcpHeader, payload: Bytes, now: Instant) {
-        self.on_segment_chunks_with(hdr, payload.len(), || std::iter::once(payload), now);
+    /// `payload` is a view of the RX mbuf the segment arrived in (empty
+    /// for a segment without data); if accepted it moves into the
+    /// reassembly buffer without being copied.
+    pub fn on_segment(&mut self, hdr: &TcpHeader, payload: MbufSlice, now: Instant) {
+        self.on_segment_with(hdr, payload.len(), || std::iter::once(payload), now);
     }
 
-    /// Processes an incoming segment whose payload spans multiple chunks.
-    /// `payload_len` must equal the total length of those chunks. The closure
-    /// runs only if TCP accepts some of the payload.
-    pub fn on_segment_chunks_with<I: IntoIterator<Item = Bytes>>(
-        &mut self,
-        hdr: &TcpHeader,
-        payload_len: usize,
-        payload: impl FnOnce() -> I,
-        now: Instant,
-    ) {
-        self.on_segment_rx(
-            hdr,
-            payload_len,
-            || payload().into_iter().map(Chunk::Bytes),
-            now,
-        );
-    }
-
-    pub(super) fn on_segment_rx<I: IntoIterator<Item = Chunk>>(
+    /// Processes an incoming segment whose payload may span several mbuf
+    /// segments, one view each, in order. `payload_len` must equal their
+    /// total length. The closure runs only if TCP accepts some of the
+    /// payload, so a rejected packet is never taken apart.
+    pub fn on_segment_with<I: IntoIterator<Item = MbufSlice>>(
         &mut self,
         hdr: &TcpHeader,
         payload_len: usize,
@@ -623,7 +605,7 @@ impl Tcb {
         }
     }
 
-    fn on_segment_general<I: IntoIterator<Item = Chunk>>(
+    fn on_segment_general<I: IntoIterator<Item = MbufSlice>>(
         &mut self,
         hdr: &TcpHeader,
         payload_len: u32,
@@ -721,7 +703,7 @@ impl Tcb {
                     data.truncate(remaining.min(data.len()));
                     remaining -= data.len();
                     let end = chunk_seq + data.len() as u32;
-                    self.rcv_nxt = self.recv_buffer.insert_chunk(chunk_seq, data, self.rcv_nxt);
+                    self.rcv_nxt = self.recv_buffer.insert(chunk_seq, data, self.rcv_nxt);
                     chunk_seq = end;
                 }
             }
@@ -1413,6 +1395,7 @@ impl Tcb {
 mod tests {
     use super::super::rto::MAX_RTO;
     use super::*;
+    use crate::dpdk::testing::slice;
 
     fn tuple() -> FourTuple {
         FourTuple {
@@ -1445,7 +1428,7 @@ mod tests {
             flags::SYN | flags::ACK,
             u16::MAX,
         );
-        tcb.on_segment(&syn_ack, Bytes::new(), now);
+        tcb.on_segment(&syn_ack, MbufSlice::empty(), now);
         let _ack = tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::Established);
         tcb
@@ -1458,7 +1441,7 @@ mod tests {
         let data = |tcb: &Tcb, flags: u8| {
             (
                 header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK | flags, u16::MAX),
-                Bytes::from(vec![7; 500]),
+                slice(&[7; 500]),
             )
         };
         // One packet per poll, as a fast poll loop sees a stream: an ACK
@@ -1527,7 +1510,7 @@ mod tests {
         );
         syn_ack.options.mss = Some(1460);
         syn_ack.options.sack_permitted = sack;
-        tcb.on_segment(&syn_ack, Bytes::new(), now);
+        tcb.on_segment(&syn_ack, MbufSlice::empty(), now);
         tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::Established);
         tcb.set_nodelay(true);
@@ -1546,7 +1529,7 @@ mod tests {
         let now = Instant::now();
         let mut tcb = establish_with_sack(now, false);
         let ahead = header(tcb.rcv_nxt + 1000, tcb.snd_nxt, flags::ACK, u16::MAX);
-        tcb.on_segment(&ahead, Bytes::from(vec![1; 500]), now);
+        tcb.on_segment(&ahead, slice(&[1; 500]), now);
         let out = tcb.poll_output(now);
         assert_eq!(out.len(), 1);
         assert!(tcb.to_header(&out[0]).options.sack.is_empty());
@@ -1561,7 +1544,7 @@ mod tests {
             |tcb: &Tcb, offset: u32| header(start + offset, tcb.snd_nxt, flags::ACK, u16::MAX);
 
         let hdr = segment(&tcb, 1000);
-        tcb.on_segment(&hdr, Bytes::from(vec![1; 500]), now);
+        tcb.on_segment(&hdr, slice(&[1; 500]), now);
         let out = tcb.poll_output(now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].ack, start);
@@ -1572,7 +1555,7 @@ mod tests {
 
         // A second island: it arrived last, so it is reported first.
         let hdr = segment(&tcb, 3000);
-        tcb.on_segment(&hdr, Bytes::from(vec![1; 500]), now);
+        tcb.on_segment(&hdr, slice(&[1; 500]), now);
         let out = tcb.poll_output(now);
         assert_eq!(
             tcb.to_header(&out[0]).options.sack.as_slice(),
@@ -1585,7 +1568,7 @@ mod tests {
         // The blocks go out even when data carries the acknowledgment:
         // a data segment has no room for them, so a bare ACK follows it.
         let hdr = segment(&tcb, 5000);
-        tcb.on_segment(&hdr, Bytes::from(vec![1; 500]), now);
+        tcb.on_segment(&hdr, slice(&[1; 500]), now);
         tcb.send(Bytes::from_static(b"reply"));
         let out = tcb.poll_output(now);
         assert_eq!(out.len(), 2);
@@ -1596,7 +1579,7 @@ mod tests {
         // Filling the first gap acknowledges through the first island
         // and stops reporting it.
         let hdr = segment(&tcb, 0);
-        tcb.on_segment(&hdr, Bytes::from(vec![1; 1000]), now);
+        tcb.on_segment(&hdr, slice(&[1; 1000]), now);
         let out = tcb.poll_output(now);
         assert_eq!(out[0].ack, start + 1500);
         assert_eq!(tcb.to_header(&out[0]).options.sack.as_slice().len(), 2);
@@ -1616,7 +1599,7 @@ mod tests {
         ack.options
             .sack
             .push((base + 3 * 1460).0, (base + 10 * 1460).0);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert!(tcb.congestion.in_fast_recovery());
         assert!(tcb.has_pending_output());
         let out = tcb.poll_output(now);
@@ -1634,7 +1617,7 @@ mod tests {
         assert_eq!(out[0].seq, base + 10 * 1460);
 
         let done = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
-        tcb.on_segment(&done, Bytes::new(), now);
+        tcb.on_segment(&done, MbufSlice::empty(), now);
         assert!(!tcb.congestion.in_fast_recovery());
         assert!(!tcb.retransmit.scoreboard());
         assert_eq!(tcb.buffered_send_bytes(), 0);
@@ -1656,14 +1639,14 @@ mod tests {
         ack.options
             .sack
             .push((base + 2 * 1460).0, (base + 8 * 1460).0);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         let out = tcb.poll_output(now);
         assert_eq!(out.len(), 1);
         assert_eq!((out[0].seq, out[0].payload.len()), (base + 1460, 1460));
         assert_eq!(tcb.buffered_send_bytes(), 7 * 1460);
 
         let done = header(tcb.rcv_nxt, base + 8 * 1460, flags::ACK, u16::MAX);
-        tcb.on_segment(&done, Bytes::new(), now);
+        tcb.on_segment(&done, MbufSlice::empty(), now);
         assert_eq!(tcb.buffered_send_bytes(), 0);
     }
 
@@ -1688,7 +1671,7 @@ mod tests {
             // Its ACK doubles the window, and the next two follow at
             // once: no second timeout, no duplicate ACKs needed.
             let ack = header(tcb.rcv_nxt, base + 1460, flags::ACK, u16::MAX);
-            tcb.on_segment(&ack, Bytes::new(), late);
+            tcb.on_segment(&ack, MbufSlice::empty(), late);
             tcb.tick(late);
             let out = tcb.poll_output(late);
             let resent: Vec<_> = out.iter().map(|seg| seg.seq).collect();
@@ -1696,7 +1679,7 @@ mod tests {
 
             // The peer had the rest all along: one cumulative ACK ends it.
             let done = header(tcb.rcv_nxt, base + 10 * 1460, flags::ACK, u16::MAX);
-            tcb.on_segment(&done, Bytes::new(), late);
+            tcb.on_segment(&done, MbufSlice::empty(), late);
             assert_eq!(tcb.buffered_send_bytes(), 0);
             assert!(tcb.poll_output(late).is_empty());
         }
@@ -1725,7 +1708,7 @@ mod tests {
         tcb.poll_output(now);
         let mut reply = header(Seq::new(1000), tcb.snd_nxt, flags::SYN | flags::ACK, 65535);
         reply.options.window_scale = Some(7);
-        tcb.on_segment(&reply, Bytes::new(), now);
+        tcb.on_segment(&reply, MbufSlice::empty(), now);
         let ack = tcb.poll_output(now);
         assert_eq!(u32::from(ack[0].window) << 7, (8 << 20) - 128);
 
@@ -1733,7 +1716,7 @@ mod tests {
         let start = tcb.rcv_nxt;
         for i in 0..2048u32 {
             let seg = header(start + i * 1024, tcb.snd_nxt, flags::ACK, 65535);
-            tcb.on_segment(&seg, Bytes::from(vec![0; 1024]), now);
+            tcb.on_segment(&seg, slice(&[0; 1024]), now);
         }
         assert_eq!(tcb.readable_len(), 2 << 20);
         assert_eq!(tcb.rcv_nxt, start + (2 << 20));
@@ -1745,7 +1728,7 @@ mod tests {
         tcb.set_receive_window(8 << 20);
         tcb.poll_output(now);
         let reply = header(Seq::new(1000), tcb.snd_nxt, flags::SYN | flags::ACK, 65535);
-        tcb.on_segment(&reply, Bytes::new(), now);
+        tcb.on_segment(&reply, MbufSlice::empty(), now);
         assert_eq!(tcb.receive_capacity(), RECV_BUFFER_CAPACITY);
     }
 
@@ -1776,7 +1759,7 @@ mod tests {
         tcb.record_window_limits(now);
         let later = now + Duration::from_micros(10);
         let ack = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), later);
+        tcb.on_segment(&ack, MbufSlice::empty(), later);
         tcb.record_window_limits(later);
         let stats = metrics::snapshot();
         assert_eq!(stats.cwnd_limited_ns, 10_000);
@@ -1803,7 +1786,7 @@ mod tests {
                     peer_window,
                 );
                 reply.options.mss = Some(1460);
-                tcb.on_segment(&reply, Bytes::new(), now);
+                tcb.on_segment(&reply, MbufSlice::empty(), now);
                 let window = u32::from(segments) * 1000;
                 assert_eq!(tcb.congestion.cwnd(), window);
                 tcb.send(Bytes::from(vec![0; 100_000]));
@@ -1826,13 +1809,13 @@ mod tests {
         assert_eq!(offer.options.window_scale, Some(4));
         let mut reply = header(Seq::new(1000), tcb.snd_nxt, flags::SYN | flags::ACK, 1000);
         reply.options.window_scale = Some(7);
-        tcb.on_segment(&reply, Bytes::new(), now);
+        tcb.on_segment(&reply, MbufSlice::empty(), now);
         assert_eq!(tcb.snd_wnd, 1000, "SYN windows are never scaled");
         assert_eq!(tcb.poll_output(now)[0].window, 65535);
         reply.flags = flags::ACK;
         reply.seq += 1;
         reply.window = 2000;
-        tcb.on_segment(&reply, Bytes::new(), now);
+        tcb.on_segment(&reply, MbufSlice::empty(), now);
         assert_eq!(tcb.snd_wnd, 2000 << 7);
         assert_eq!(tcb.receive_capacity(), 1024 * 1024);
         assert_eq!(establish(now).receive_capacity(), RECV_BUFFER_CAPACITY);
@@ -1850,7 +1833,7 @@ mod tests {
                 scale.map(|_| 4)
             );
             let ack = header(Seq::new(1001), tcb.snd_nxt, flags::ACK, 1000);
-            tcb.on_segment(&ack, Bytes::new(), now);
+            tcb.on_segment(&ack, MbufSlice::empty(), now);
             assert_eq!(tcb.snd_wnd, 1000 << scale.unwrap_or(0));
         }
     }
@@ -1867,10 +1850,10 @@ mod tests {
         assert!(sent[0].payload.len() > tcb.send_mss() as usize);
         let ack_seq = sent[0].seq + 777;
         let ack = header(tcb.rcv_nxt, ack_seq, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert_eq!(tcb.retransmit.segments.front().unwrap().seq, ack_seq);
         for _ in 0..3 {
-            tcb.on_segment(&ack, Bytes::new(), now);
+            tcb.on_segment(&ack, MbufSlice::empty(), now);
         }
         let retry = tcb.poll_output(now);
         assert_eq!(retry[0].seq, ack_seq);
@@ -1892,7 +1875,7 @@ mod tests {
         // Partial ACKs release logical byte credit and trim retransmit ranges.
         let first = &output[0];
         let partial = header(tcb.rcv_nxt, first.seq + 1, flags::ACK, u16::MAX);
-        tcb.on_segment(&partial, Bytes::new(), now);
+        tcb.on_segment(&partial, MbufSlice::empty(), now);
         assert_eq!(tcb.buffered_send_bytes(), 4095);
         let ack = header(
             tcb.rcv_nxt,
@@ -1900,7 +1883,7 @@ mod tests {
             flags::ACK,
             u16::MAX,
         );
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert_eq!(tcb.buffered_send_bytes(), 4096 - first.payload.len());
     }
 
@@ -1928,7 +1911,7 @@ mod tests {
                         u16::MAX,
                     );
                     reply.options.mss = Some(peer_mss);
-                    tcb.on_segment(&reply, Bytes::new(), now);
+                    tcb.on_segment(&reply, MbufSlice::empty(), now);
                     tcb.poll_output(now);
                     tcb.set_nodelay(true);
                     tcb.send(Bytes::from(vec![42; 9000]));
@@ -1942,7 +1925,7 @@ mod tests {
                             sent += seg.payload.len();
                         }
                         let ack = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
-                        tcb.on_segment(&ack, Bytes::new(), now);
+                        tcb.on_segment(&ack, MbufSlice::empty(), now);
                     }
                     assert_eq!(sent, 9000);
                 }
@@ -1956,7 +1939,7 @@ mod tests {
         let mut tcb = establish(now);
         for _ in 0..64 {
             let hdr = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
-            tcb.on_segment(&hdr, Bytes::from(vec![42; 1024]), now);
+            tcb.on_segment(&hdr, slice(&[42; 1024]), now);
             tcb.poll_output(now);
         }
         assert_eq!(
@@ -1983,7 +1966,7 @@ mod tests {
         let mut syn = header(Seq::new(1000), Seq::new(0), flags::SYN, u16::MAX);
         for extra_flags in [0, flags::ECE | flags::CWR, 0] {
             syn.flags = flags::SYN | extra_flags;
-            tcb.on_segment(&syn, Bytes::new(), now);
+            tcb.on_segment(&syn, MbufSlice::empty(), now);
             assert_eq!(tcb.state, TcpState::SynReceived);
             let resent = tcb.poll_output(now);
             assert_eq!(resent.len(), 1);
@@ -1994,7 +1977,7 @@ mod tests {
             assert!(tcb.events.is_empty());
         }
         let ack = header(Seq::new(1001), tcb.snd_nxt, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert_eq!(tcb.state, TcpState::Established);
         assert!(tcb.retransmit.is_empty());
         assert_eq!(tcb.events, [Event::Established]);
@@ -2030,7 +2013,7 @@ mod tests {
         let mut tcb = Tcb::new_active(tuple());
         let rst = header(Seq::new(0), Seq::new(0), flags::RST, 0);
 
-        tcb.on_segment(&rst, Bytes::new(), now);
+        tcb.on_segment(&rst, MbufSlice::empty(), now);
 
         assert_eq!(tcb.state, TcpState::SynSent);
         assert!(tcb.events.is_empty());
@@ -2047,7 +2030,7 @@ mod tests {
             0,
         );
 
-        tcb.on_segment(&rst, Bytes::new(), now);
+        tcb.on_segment(&rst, MbufSlice::empty(), now);
 
         assert_eq!(tcb.state, TcpState::Established);
         assert!(!tcb.events.contains(&Event::Reset));
@@ -2076,7 +2059,7 @@ mod tests {
         let now = Instant::now();
         let mut tcb = establish(now);
         let update = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, 4);
-        tcb.on_segment(&update, Bytes::new(), now);
+        tcb.on_segment(&update, MbufSlice::empty(), now);
         tcb.set_cork(true);
         tcb.send(Bytes::from_static(b"abcdefgh"));
         assert!(tcb.has_pending_output());
@@ -2118,7 +2101,7 @@ mod tests {
 
         // An ACK for the data alone leaves the FIN outstanding.
         let ack = header(tcb.rcv_nxt, data_end, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert_eq!(tcb.state, TcpState::FinWait1);
         assert_eq!(tcb.retransmit.segments.len(), 1);
 
@@ -2130,7 +2113,7 @@ mod tests {
         assert_eq!(resent.seq, data_end);
 
         let ack = header(tcb.rcv_nxt, data_end + 1, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), later);
+        tcb.on_segment(&ack, MbufSlice::empty(), later);
         assert_eq!(tcb.state, TcpState::FinWait2);
     }
 
@@ -2139,7 +2122,7 @@ mod tests {
         let now = Instant::now();
         let mut tcb = establish(now);
         let peer_fin = header(tcb.rcv_nxt, tcb.snd_una, flags::FIN | flags::ACK, u16::MAX);
-        tcb.on_segment(&peer_fin, Bytes::new(), now);
+        tcb.on_segment(&peer_fin, MbufSlice::empty(), now);
         tcb.poll_output(now);
         tcb.send(Bytes::from_static(b"payload"));
         tcb.close();
@@ -2152,13 +2135,13 @@ mod tests {
         // The data ACK must be consumed in LAST-ACK, or a lost FIN could
         // never reach the front of the retransmission queue.
         let ack = header(tcb.rcv_nxt, data_end, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert_eq!(tcb.state, TcpState::LastAck);
         assert_eq!(tcb.snd_una, data_end);
         assert_eq!(tcb.retransmit.segments.len(), 1);
 
         let ack = header(tcb.rcv_nxt, data_end + 1, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert!(tcb.is_closed());
     }
 
@@ -2185,7 +2168,7 @@ mod tests {
         let cwnd = tcb.congestion.cwnd();
         for window in [40000, 45000, 50000, 55000] {
             let ack = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, window);
-            tcb.on_segment(&ack, Bytes::new(), now);
+            tcb.on_segment(&ack, MbufSlice::empty(), now);
             assert!(tcb.poll_output(now).is_empty());
             assert_eq!(tcb.congestion.cwnd(), cwnd);
             assert!(!tcb.congestion.in_fast_recovery());
@@ -2193,7 +2176,7 @@ mod tests {
         // Genuine duplicates still trigger recovery after three ACKs.
         let ack = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, 55000);
         for _ in 0..3 {
-            tcb.on_segment(&ack, Bytes::new(), now);
+            tcb.on_segment(&ack, MbufSlice::empty(), now);
         }
         assert_eq!(tcb.poll_output(now).len(), 1);
     }
@@ -2208,7 +2191,7 @@ mod tests {
         let ack = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
 
         for _ in 0..3 {
-            tcb.on_segment(&ack, Bytes::new(), now);
+            tcb.on_segment(&ack, MbufSlice::empty(), now);
         }
         let retransmitted = tcb.poll_output(now);
 
@@ -2224,7 +2207,7 @@ mod tests {
         let mut now = Instant::now();
         let mut tcb = establish(now);
         let zero = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, 0);
-        tcb.on_segment(&zero, Bytes::new(), now);
+        tcb.on_segment(&zero, MbufSlice::empty(), now);
         tcb.poll_output(now);
         tcb.send(Bytes::from_static(b"0123456789"));
         assert!(tcb.poll_output(now).is_empty());
@@ -2247,14 +2230,14 @@ mod tests {
             tcb.tick(now);
             tcb.poll_output(now);
             let ans = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, 0);
-            tcb.on_segment(&ans, Bytes::new(), now);
+            tcb.on_segment(&ans, MbufSlice::empty(), now);
         }
         assert_eq!(tcb.state, TcpState::Established);
         assert!(tcb.events.iter().all(|e| *e != Event::Reset));
 
         // Window opens: the probe is acked and the rest flows.
         let open = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, 1000);
-        tcb.on_segment(&open, Bytes::new(), now);
+        tcb.on_segment(&open, MbufSlice::empty(), now);
         let rest = tcb.poll_output(now);
         assert_eq!(rest.len(), 1);
         assert!(rest[0].payload == b"123456789"[..]);
@@ -2267,18 +2250,18 @@ mod tests {
         let mut tcb = establish(now);
         for _ in 0..64 {
             let hdr = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
-            tcb.on_segment(&hdr, Bytes::from(vec![1; 1024]), now);
+            tcb.on_segment(&hdr, slice(&[1; 1024]), now);
             tcb.poll_output(now);
         }
         let rcv_nxt = tcb.rcv_nxt;
         let hdr = header(rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
-        tcb.on_segment(&hdr, Bytes::from(vec![2; 100]), now);
+        tcb.on_segment(&hdr, slice(&[2; 100]), now);
         assert_eq!(tcb.readable_len(), 64 * 1024);
         assert_eq!(tcb.rcv_nxt, rcv_nxt);
         assert!(tcb.ack_pending);
         // Out-of-order data beyond the right edge is dropped too.
         let hdr = header(rcv_nxt + 10, tcb.snd_una, flags::ACK, u16::MAX);
-        tcb.on_segment(&hdr, Bytes::from(vec![2; 100]), now);
+        tcb.on_segment(&hdr, slice(&[2; 100]), now);
         assert!(!tcb.recv_buffer.has_out_of_order());
     }
 
@@ -2288,11 +2271,11 @@ mod tests {
         let mut tcb = establish(now);
         for _ in 0..63 {
             let hdr = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
-            tcb.on_segment(&hdr, Bytes::from(vec![1; 1024]), now);
+            tcb.on_segment(&hdr, slice(&[1; 1024]), now);
         }
         let rcv_nxt = tcb.rcv_nxt;
         let hdr = header(rcv_nxt, tcb.snd_una, flags::ACK | flags::FIN, u16::MAX);
-        tcb.on_segment(&hdr, Bytes::from(vec![2; 1500]), now);
+        tcb.on_segment(&hdr, slice(&[2; 1500]), now);
         assert_eq!(tcb.readable_len(), 64 * 1024);
         assert_eq!(tcb.rcv_nxt, rcv_nxt + 1024);
         assert_eq!(tcb.state, TcpState::Established);
@@ -2306,7 +2289,7 @@ mod tests {
         tcb.poll_output(now);
         let bad_ack = tcb.snd_nxt + 5;
         let hdr = header(Seq::new(1000), bad_ack, flags::SYN | flags::ACK, 100);
-        tcb.on_segment(&hdr, Bytes::new(), now);
+        tcb.on_segment(&hdr, MbufSlice::empty(), now);
         let out = tcb.poll_output(now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].flags, flags::RST);
@@ -2320,7 +2303,7 @@ mod tests {
         tcb.poll_output(now);
         let bad_ack = tcb.snd_nxt + 10;
         let hdr = header(Seq::new(1001), bad_ack, flags::ACK, 100);
-        tcb.on_segment(&hdr, Bytes::new(), now);
+        tcb.on_segment(&hdr, MbufSlice::empty(), now);
         let out = tcb.poll_output(now);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].flags, flags::RST);
@@ -2328,7 +2311,7 @@ mod tests {
         // Other resets still use snd_nxt.
         let mut est = establish(now);
         let syn = header(est.rcv_nxt, est.snd_una, flags::SYN | flags::ACK, 100);
-        est.on_segment(&syn, Bytes::new(), now);
+        est.on_segment(&syn, MbufSlice::empty(), now);
         let out = est.poll_output(now);
         assert_eq!(out[0].flags, flags::RST);
         assert_eq!(out[0].seq, est.snd_nxt);
@@ -2340,10 +2323,10 @@ mod tests {
         tcb.poll_output(now);
         assert_eq!(tcb.state, TcpState::FinWait1);
         let ack = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
-        tcb.on_segment(&ack, Bytes::new(), now);
+        tcb.on_segment(&ack, MbufSlice::empty(), now);
         assert_eq!(tcb.state, TcpState::FinWait2);
         let fin = header(tcb.rcv_nxt, tcb.snd_nxt, flags::FIN | flags::ACK, u16::MAX);
-        tcb.on_segment(&fin, Bytes::new(), now);
+        tcb.on_segment(&fin, MbufSlice::empty(), now);
         assert_eq!(tcb.state, TcpState::TimeWait);
         tcb
     }
@@ -2370,7 +2353,7 @@ mod tests {
             flags::FIN | flags::ACK,
             u16::MAX,
         );
-        tcb.on_segment(&fin, Bytes::new(), t2);
+        tcb.on_segment(&fin, MbufSlice::empty(), t2);
         let out = tcb.poll_output(t2);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].flags, flags::ACK);
@@ -2391,7 +2374,7 @@ mod tests {
         }
         let dup = header(tcb.rcv_nxt, tcb.snd_una, flags::ACK, u16::MAX);
         for _ in 0..3 {
-            tcb.on_segment(&dup, Bytes::new(), now);
+            tcb.on_segment(&dup, MbufSlice::empty(), now);
         }
         assert!(tcb.congestion.in_fast_recovery());
         let first = tcb.poll_output(now);
@@ -2399,7 +2382,7 @@ mod tests {
 
         // Ack only "aaaa": a partial ack, "bbbb" is lost as well.
         let partial = header(tcb.rcv_nxt, tcb.snd_una + 4, flags::ACK, u16::MAX);
-        tcb.on_segment(&partial, Bytes::new(), now);
+        tcb.on_segment(&partial, MbufSlice::empty(), now);
         assert!(tcb.congestion.in_fast_recovery());
         assert!(tcb.retransmit_now);
         let second = tcb.poll_output(now);

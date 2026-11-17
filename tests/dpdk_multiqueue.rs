@@ -156,7 +156,7 @@ fn each_queue_carries_the_connections_whose_ports_lead_to_it() {
                     if data.is_empty() {
                         break;
                     }
-                    server.send(tuple, data);
+                    server.send(tuple, data.into_bytes());
                 }
             }
             for (engine, conn, echo) in [

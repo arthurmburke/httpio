@@ -1,25 +1,24 @@
 //! Receive-side reassembly: buffers out-of-order segments and delivers
 //! in-order bytes to the application as gaps get filled.
 //!
-//! Queued payloads keep their mbuf alive while it is buffered. Reads hand
-//! out views of it ([`Chunk`]), which share the mbuf without allocating;
-//! only the `Bytes`-returning read boxes an owner for it.
+//! Payloads are queued as views of the mbufs they arrived in
+//! ([`MbufSlice`]), which keep those mbufs alive while buffered. Trimming a
+//! duplicate prefix and reading part of a segment move a view's bounds or
+//! share its mbuf; nothing here copies or allocates per segment.
 
 use std::collections::{BTreeMap, VecDeque};
 
-use bytes::Bytes;
-
 use super::seq::Seq;
+use crate::dpdk::MbufSlice;
 use crate::dpdk::net::tcp::{MAX_SACK_BLOCKS, SackBlocks};
-use crate::dpdk::tcp::chunk::Chunk;
 
 #[derive(Default)]
 pub struct ReassemblyBuffer {
     /// TCP sequence order, including wraparound. Accepted segments are
     /// within one receive window (less than half the sequence space).
-    out_of_order: BTreeMap<Seq, Chunk>,
+    out_of_order: BTreeMap<Seq, MbufSlice>,
     /// In-order chunks ready for the application to `recv()`.
-    ready: VecDeque<Chunk>,
+    ready: VecDeque<MbufSlice>,
     /// Total bytes across `ready` (kept incrementally to avoid summing).
     ready_len: usize,
 }
@@ -27,16 +26,17 @@ pub struct ReassemblyBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dpdk::testing::slice;
 
     #[test]
     fn reassembles_across_wrap_with_a_future_low_key() {
         let mut buffer = ReassemblyBuffer::default();
         let start = Seq::new(u32::MAX - 9);
-        buffer.insert(start + 5, Bytes::from_static(b"fghij"), start);
-        buffer.insert(Seq::new(5), Bytes::from_static(b"pqrst"), start);
-        let next = buffer.insert(start, Bytes::from_static(b"abcde"), start);
+        buffer.insert(start + 5, slice(b"fghij"), start);
+        buffer.insert(Seq::new(5), slice(b"pqrst"), start);
+        let next = buffer.insert(start, slice(b"abcde"), start);
         assert_eq!(next, Seq::new(0));
-        let next = buffer.insert(next, Bytes::from_static(b"klmno"), next);
+        let next = buffer.insert(next, slice(b"klmno"), next);
         assert_eq!(next, Seq::new(10));
         assert!(!buffer.has_out_of_order());
         let mut data = Vec::new();
@@ -55,9 +55,9 @@ mod tests {
         // the second is two abutting segments and one overlapping them.
         for island in 0..6u32 {
             let start = next + 100 + island * 200;
-            buffer.insert(start, Bytes::from(vec![0; 50]), next);
-            buffer.insert(start + 50, Bytes::from(vec![0; 50]), next);
-            buffer.insert(start + 25, Bytes::from(vec![0; 50]), next);
+            buffer.insert(start, slice(&[0; 50]), next);
+            buffer.insert(start + 50, slice(&[0; 50]), next);
+            buffer.insert(start + 25, slice(&[0; 50]), next);
         }
         let block = |island: u32| {
             let start = next + 100 + island * 200;
@@ -81,7 +81,7 @@ mod tests {
         );
         // Filling the first gap delivers the first island; it is no
         // longer reported.
-        let advanced = buffer.insert(next, Bytes::from(vec![0; 100]), next);
+        let advanced = buffer.insert(next, slice(&[0; 100]), next);
         assert_eq!(advanced, next + 200);
         assert_eq!(
             buffer.sack_blocks(None).as_slice(),
@@ -93,9 +93,9 @@ mod tests {
     fn trims_overlapping_segments_across_wrap() {
         let mut buffer = ReassemblyBuffer::default();
         let start = Seq::new(u32::MAX - 3);
-        buffer.insert(start + 2, Bytes::from_static(b"cdefgh"), start);
-        buffer.insert(Seq::new(3), Bytes::from_static(b"hijk"), start);
-        let next = buffer.insert(start, Bytes::from_static(b"abcde"), start);
+        buffer.insert(start + 2, slice(b"cdefgh"), start);
+        buffer.insert(Seq::new(3), slice(b"hijk"), start);
+        let next = buffer.insert(start, slice(b"abcde"), start);
         assert_eq!(next, Seq::new(7));
         assert!(!buffer.has_out_of_order());
         let mut data = Vec::new();
@@ -111,42 +111,20 @@ impl ReassemblyBuffer {
         self.ready_len
     }
 
-    /// Removes up to `max_len` in-order bytes from the front chunk, as
-    /// `Bytes`. A packet buffer gets its `Bytes` owner here; a read that
-    /// takes only part of one shares that owner with what is left, so the
-    /// buffer is boxed at most once.
-    pub fn read(&mut self, max_len: usize) -> Bytes {
-        if max_len == 0 {
-            return Bytes::new();
-        }
-        let Some(chunk) = self.ready.pop_front() else {
-            return Bytes::new();
+    /// Removes up to `max_len` in-order bytes from the front chunk; empty
+    /// when nothing is readable (or `max_len` is zero). A read that takes
+    /// only part of a chunk shares its mbuf with what is left, through the
+    /// mbuf's own reference count.
+    pub fn read(&mut self, max_len: usize) -> MbufSlice {
+        let Some(front) = self.ready.front_mut() else {
+            return MbufSlice::empty();
         };
-        let mut bytes = chunk.into_bytes();
-        let n = max_len.min(bytes.len());
-        self.ready_len -= n;
-        if n == bytes.len() {
-            return bytes;
-        }
-        let prefix = bytes.split_to(n);
-        self.ready.push_front(Chunk::Bytes(bytes));
-        prefix
-    }
-
-    /// Removes up to `max_len` in-order bytes from the front chunk. A read
-    /// that takes only part of a packet buffer shares it with what is
-    /// left, through the buffer's own reference count: nothing allocates.
-    pub(super) fn read_chunk(&mut self, max_len: usize) -> Option<Chunk> {
-        if max_len == 0 {
-            return None;
-        }
-        let front = self.ready.front_mut()?;
         let n = max_len.min(front.len());
         self.ready_len -= n;
         if n == front.len() {
-            return self.ready.pop_front();
+            return self.ready.pop_front().unwrap_or_default();
         }
-        Some(front.split_to(n))
+        front.split_to(n)
     }
 
     /// Inserts a received segment `[seq, seq+data.len())` given the
@@ -157,11 +135,7 @@ impl ReassemblyBuffer {
     /// Segments (or portions of them) at or before `rcv_nxt` are
     /// duplicates and dropped; segments strictly after `rcv_nxt` are
     /// buffered until the gap closes.
-    pub fn insert(&mut self, seq: Seq, data: Bytes, rcv_nxt: Seq) -> Seq {
-        self.insert_chunk(seq, Chunk::Bytes(data), rcv_nxt)
-    }
-
-    pub(super) fn insert_chunk(&mut self, seq: Seq, mut data: Chunk, rcv_nxt: Seq) -> Seq {
+    pub fn insert(&mut self, seq: Seq, mut data: MbufSlice, rcv_nxt: Seq) -> Seq {
         if data.is_empty() {
             return rcv_nxt;
         }
@@ -192,7 +166,7 @@ impl ReassemblyBuffer {
         rcv_nxt
     }
 
-    fn push_ready(&mut self, chunk: Chunk) {
+    fn push_ready(&mut self, chunk: MbufSlice) {
         self.ready_len += chunk.len();
         self.ready.push_back(chunk);
     }

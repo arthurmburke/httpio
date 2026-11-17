@@ -120,9 +120,9 @@ mod dpdk_app {
             connections.retain(|socket| {
                 let data = socket.recv(&mut engine, 4096);
                 if !data.is_empty() {
-                    // `data` is a refcounted `Bytes`; echoing it back moves it
-                    // to the send buffer without copying.
-                    socket.send(&mut engine, data);
+                    // `data` is a view of the received mbuf; as `Bytes` it
+                    // moves to the send buffer without being copied.
+                    socket.send(&mut engine, data.into_bytes());
                 }
                 match socket.state(&engine) {
                     Some(TcpState::CloseWait) if socket.readable_len(&engine) == 0 => {

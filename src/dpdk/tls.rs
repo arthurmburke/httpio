@@ -1044,7 +1044,8 @@ mod tests {
     use rustls::ServerConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundSender, SendCredit};
+    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundTx, SendCredit};
+    use crate::dpdk::testing;
 
     const CA: &[u8] = include_bytes!("tls_testdata/ca.pem");
     const CERT: &[u8] = include_bytes!("tls_testdata/server.pem");
@@ -1054,10 +1055,11 @@ mod tests {
     /// stream for a server: what the client sends is read here (returning
     /// its send credit, as an ACK would); what is written here reaches the
     /// client as `Inbound::Data` segments of the sizes in `segments`
-    /// (cycled), so records can be cut anywhere.
+    /// (cycled, and at most one packet buffer each, as on the wire), so
+    /// records can be cut anywhere.
     struct Peer {
         cmd_rx: CmdRx,
-        inbound_tx: InboundSender,
+        inbound_tx: InboundTx,
         credit: Arc<SendCredit>,
         unread: Bytes,
         client_closed: bool,
@@ -1076,13 +1078,14 @@ mod tests {
         fn push_out(&mut self) -> bool {
             while !self.out.is_empty() {
                 let size = self.segments[self.next_segment % self.segments.len()];
-                let n = size.min(self.out.len());
+                let n = size.min(self.out.len()).min(testing::MAX_SLICE);
                 let segment: Vec<u8> = self.out.iter().take(n).copied().collect();
-                if self
-                    .inbound_tx
-                    .push(Inbound::Data(Bytes::from(segment)).into())
-                    .is_err()
-                {
+                // No buffer free, like a full ring, is backpressure: the
+                // client frees buffers as it reads.
+                let Some(segment) = testing::try_slice(&segment) else {
+                    return false;
+                };
+                if self.inbound_tx.push(Inbound::Data(segment)).is_err() {
                     return false;
                 }
                 self.out.drain(..n);
@@ -1094,7 +1097,7 @@ mod tests {
         /// Ends TCP without `close_notify`.
         fn fin(&mut self) {
             assert!(self.push_out());
-            assert!(self.inbound_tx.push(Inbound::Eof.into()).is_ok());
+            assert!(self.inbound_tx.push(Inbound::Eof).is_ok());
         }
     }
 
@@ -1163,7 +1166,7 @@ mod tests {
         fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let this = self.get_mut();
             ready!(Pin::new(&mut *this).poll_flush(cx))?;
-            let _ = this.inbound_tx.push(Inbound::Eof.into());
+            let _ = this.inbound_tx.push(Inbound::Eof);
             Poll::Ready(Ok(()))
         }
     }
@@ -1348,7 +1351,8 @@ mod tests {
                 established(client_config(&[]), tls13(), &[1 << 20]).await;
             server.get_mut().0.batch = true;
             let mut expected = Vec::new();
-            for i in 0..200u32 {
+            // As many as fit one packet buffer, 26 bytes each on the wire.
+            for i in 0..64u32 {
                 let chunk = i.to_be_bytes();
                 server.write_all(&chunk).await.unwrap();
                 expected.extend_from_slice(&chunk);
@@ -1356,7 +1360,7 @@ mod tests {
             let before = server.get_ref().0.next_segment;
             server.flush().await.unwrap();
             assert_eq!(server.get_ref().0.next_segment, before + 1, "one segment");
-            // All 200 records decrypt in one pass and leave as one chunk.
+            // All the records decrypt in one pass and leave as one chunk.
             let chunk = client.recv().await.unwrap().unwrap();
             assert_eq!(&chunk[..], &expected[..]);
         });

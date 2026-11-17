@@ -1,5 +1,4 @@
 mod app_wake;
-pub mod chunk;
 pub mod congestion;
 pub mod engine;
 pub mod rto;

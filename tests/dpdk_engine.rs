@@ -238,12 +238,14 @@ fn engine_transmits_window_updates_and_final_reset() {
         let (empty, allocations) = count_allocations(|| engine.recv(tuple, 0));
         assert!(empty.is_empty());
         assert_eq!(allocations, 0);
+        // Reads are views of the mbuf: a split read shares it through
+        // its own reference count, with no owner allocated for either part.
         let (prefix, allocations) = count_allocations(|| engine.recv(tuple, 256));
         assert_eq!(&prefix[..], &[42; 256]);
-        assert_eq!(allocations, 1);
+        assert_eq!(allocations, 0, "a read must not allocate");
         let (suffix, allocations) = count_allocations(|| engine.recv(tuple, 1024));
         assert_eq!(&suffix[..], &[42; 768]);
-        assert_eq!(allocations, 0, "split reads must share the mbuf owner");
+        assert_eq!(allocations, 0, "split reads must share the mbuf");
         assert_eq!(
             unsafe { prefix.as_ptr().add(prefix.len()) },
             suffix.as_ptr()

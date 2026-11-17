@@ -51,7 +51,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::client::Client;
-use crate::dpdk::tcp::chunk::Chunk;
+use crate::dpdk::MbufSlice;
+use crate::dpdk::http::RecvBuf;
 use crate::dpdk::tcp::stream::TcpStream;
 use crate::http::errors::{
     HttpError::{self, InvalidHeaderValue},
@@ -815,9 +816,16 @@ impl UpgradedTransport {
 /// chunks arrive, so a large payload never pins more than one received
 /// packet buffer at a time.
 struct ChunkReader {
+    /// Unparsed bytes that are already `Bytes`, parsed before `chunk`:
+    /// what hyper read past the 101 response head, or the rest of a packet
+    /// buffer once a payload in it was handed out as `Bytes` (so that
+    /// every later frame in that packet shares the one owner). Frames in
+    /// it are slices of it.
+    shared: Bytes,
     /// The unparsed rest of the latest chunk, still in its packet buffer.
-    /// Empty whenever [`next_frame`](Self::next_frame) returns `None`.
-    chunk: Chunk,
+    /// Empty whenever `shared` is not, and whenever
+    /// [`next_frame`](Self::next_frame) returns `None`.
+    chunk: MbufSlice,
     /// Length of the [`Payload::InChunk`] frame last returned, which still
     /// sits at the front of `chunk`; dropped on the next `next_frame`.
     lent: usize,
@@ -848,6 +856,93 @@ impl RecvState {
         head: [0; MAX_INBOUND_HEADER],
         filled: 0,
     };
+
+    /// The next complete frame from the front of `buf`, or `None` once
+    /// `buf` is used up (it is then empty) and more input is needed.
+    /// Enforces the same rules as [`try_parse_frame`]. A payload that lies
+    /// within `buf` is left at its front, as [`Payload::InChunk`], for the
+    /// caller to read or split off.
+    fn next_frame<B: RecvBuf>(&mut self, buf: &mut B) -> Result<Option<RawFrame>, WebSocketError> {
+        let header = match self {
+            RecvState::Payload {
+                payload, remaining, ..
+            } => {
+                let n = (*remaining).min(buf.len());
+                payload.extend_from_slice(&buf[..n]);
+                buf.advance(n);
+                *remaining -= n;
+                if *remaining > 0 {
+                    return Ok(None);
+                }
+                let RecvState::Payload {
+                    fin,
+                    opcode,
+                    payload,
+                    ..
+                } = std::mem::replace(self, RecvState::START)
+                else {
+                    unreachable!("matched Payload above");
+                };
+                return Ok(Some(RawFrame {
+                    fin,
+                    opcode,
+                    payload: Payload::Owned(payload.freeze()),
+                }));
+            }
+            RecvState::Header { head, filled } if *filled == 0 => {
+                match parse_header(buf)? {
+                    Some(header) => {
+                        buf.advance(header.header_len);
+                        header
+                    }
+                    None => {
+                        // Too short for a header (so under
+                        // MAX_INBOUND_HEADER bytes): keep it for the next
+                        // chunk to complete.
+                        let n = buf.len();
+                        head[..n].copy_from_slice(buf);
+                        *filled = n;
+                        *buf = B::default();
+                        return Ok(None);
+                    }
+                }
+            }
+            RecvState::Header { head, filled } => loop {
+                if let Some(header) = parse_header(&head[..*filled])? {
+                    break header;
+                }
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                // Take just the header's bytes, so the payload that follows
+                // stays in the chunk to be sliced.
+                let n = (header_len_hint(&head[..*filled]) - *filled).min(buf.len());
+                head[*filled..*filled + n].copy_from_slice(&buf[..n]);
+                buf.advance(n);
+                *filled += n;
+            },
+        };
+        *self = RecvState::START;
+
+        if buf.len() >= header.payload_len {
+            return Ok(Some(RawFrame {
+                fin: header.fin,
+                opcode: header.opcode,
+                payload: Payload::InChunk(header.payload_len),
+            }));
+        }
+        let mut payload = BytesMut::with_capacity(header.payload_len);
+        payload.extend_from_slice(buf);
+        let remaining = header.payload_len - buf.len();
+        *buf = B::default();
+        *self = RecvState::Payload {
+            fin: header.fin,
+            opcode: header.opcode,
+            payload,
+            remaining,
+        };
+        Ok(None)
+    }
 }
 
 impl ChunkReader {
@@ -855,7 +950,8 @@ impl ChunkReader {
     /// 101 response head.
     fn new(leftover: Bytes) -> Self {
         ChunkReader {
-            chunk: leftover.into(),
+            shared: leftover,
+            chunk: MbufSlice::empty(),
             lent: 0,
             state: RecvState::START,
         }
@@ -863,9 +959,9 @@ impl ChunkReader {
 
     /// Supplies the next received chunk, once `next_frame` has asked for
     /// more input.
-    fn push(&mut self, chunk: Chunk) {
+    fn push(&mut self, chunk: MbufSlice) {
         debug_assert!(
-            self.chunk.is_empty() && self.lent == 0,
+            self.shared.is_empty() && self.chunk.is_empty() && self.lent == 0,
             "chunk pushed before the last was used"
         );
         self.chunk = chunk;
@@ -884,110 +980,47 @@ impl ChunkReader {
 
     /// `payload` (from the frame [`next_frame`] last returned) as shared
     /// [`Bytes`]. An in-chunk payload turns the packet buffer into `Bytes`
-    /// -- one allocation, shared by every later frame sliced from the same
-    /// chunk.
+    /// -- one allocation, shared by every later frame in the same chunk,
+    /// which is parsed out of `shared` from here on.
     fn payload_bytes(&mut self, payload: Payload) -> Bytes {
         match payload {
             Payload::Owned(bytes) => bytes,
             Payload::InChunk(n) => {
                 debug_assert_eq!(n, self.lent);
-                let mut shared = std::mem::take(&mut self.chunk).into_bytes();
-                let payload = shared.split_to(n);
-                self.chunk = shared.into();
+                let mut rest = std::mem::take(&mut self.chunk).into_bytes();
+                let payload = rest.split_to(n);
+                self.shared = rest;
                 self.lent = 0;
                 payload
             }
         }
     }
 
-    /// The next complete frame, or `None` once the current chunk is used up
-    /// and more input is needed. Enforces the same rules as
-    /// [`try_parse_frame`]. A payload that lies within the current chunk
-    /// is left there as [`Payload::InChunk`], to be read through
+    /// The next complete frame, or `None` once the input so far is used up
+    /// and more is needed. A payload that lies within the current chunk is
+    /// left there as [`Payload::InChunk`], to be read through
     /// [`payload`](Self::payload) or [`payload_bytes`](Self::payload_bytes)
     /// before the next call.
     fn next_frame(&mut self) -> Result<Option<RawFrame>, WebSocketError> {
         self.chunk.advance(std::mem::take(&mut self.lent));
-        let header = match &mut self.state {
-            RecvState::Payload {
-                payload, remaining, ..
-            } => {
-                let n = (*remaining).min(self.chunk.len());
-                payload.extend_from_slice(&self.chunk[..n]);
-                self.chunk.advance(n);
-                *remaining -= n;
-                if *remaining > 0 {
-                    return Ok(None);
-                }
-                let RecvState::Payload {
-                    fin,
-                    opcode,
-                    payload,
-                    ..
-                } = std::mem::replace(&mut self.state, RecvState::START)
-                else {
-                    unreachable!("matched Payload above");
-                };
-                return Ok(Some(RawFrame {
-                    fin,
-                    opcode,
-                    payload: Payload::Owned(payload.freeze()),
-                }));
+        if !self.shared.is_empty()
+            && let Some(mut frame) = self.state.next_frame(&mut self.shared)?
+        {
+            // Already `Bytes`: slicing the payload out costs nothing.
+            if let Payload::InChunk(n) = frame.payload {
+                frame.payload = Payload::Owned(self.shared.split_to(n));
             }
-            RecvState::Header { head, filled } if *filled == 0 => {
-                match parse_header(&self.chunk)? {
-                    Some(header) => {
-                        self.chunk.advance(header.header_len);
-                        header
-                    }
-                    None => {
-                        // Too short for a header (so under
-                        // MAX_INBOUND_HEADER bytes): keep it for the next
-                        // chunk to complete.
-                        let n = self.chunk.len();
-                        head[..n].copy_from_slice(&self.chunk);
-                        *filled = n;
-                        self.chunk = Chunk::new();
-                        return Ok(None);
-                    }
-                }
-            }
-            RecvState::Header { head, filled } => loop {
-                if let Some(header) = parse_header(&head[..*filled])? {
-                    break header;
-                }
-                if self.chunk.is_empty() {
-                    return Ok(None);
-                }
-                // Take just the header's bytes, so the payload that follows
-                // stays in the chunk to be sliced.
-                let n = (header_len_hint(&head[..*filled]) - *filled).min(self.chunk.len());
-                head[*filled..*filled + n].copy_from_slice(&self.chunk[..n]);
-                self.chunk.advance(n);
-                *filled += n;
-            },
-        };
-        self.state = RecvState::START;
-
-        if self.chunk.len() >= header.payload_len {
-            self.lent = header.payload_len;
-            return Ok(Some(RawFrame {
-                fin: header.fin,
-                opcode: header.opcode,
-                payload: Payload::InChunk(header.payload_len),
-            }));
+            return Ok(Some(frame));
         }
-        let mut payload = BytesMut::with_capacity(header.payload_len);
-        payload.extend_from_slice(&self.chunk);
-        let remaining = header.payload_len - self.chunk.len();
-        self.chunk = Chunk::new();
-        self.state = RecvState::Payload {
-            fin: header.fin,
-            opcode: header.opcode,
-            payload,
-            remaining,
-        };
-        Ok(None)
+        let frame = self.state.next_frame(&mut self.chunk)?;
+        if let Some(RawFrame {
+            payload: Payload::InChunk(n),
+            ..
+        }) = &frame
+        {
+            self.lent = *n;
+        }
+        Ok(frame)
     }
 }
 
@@ -1658,17 +1691,23 @@ mod tests {
 
     // ---- The zero-copy TCP transport. ----
 
-    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundSender};
+    use crate::dpdk::tcp::worker::{CmdRx, Command, Inbound, InboundTx};
+    use crate::dpdk::testing;
 
     /// The worker's ends of a test [`TcpStream`]'s rings.
     struct Wire {
         cmd_rx: CmdRx,
-        inbound_tx: InboundSender,
+        inbound_tx: InboundTx,
     }
 
     impl Wire {
-        fn push(&self, chunk: Bytes) {
-            assert!(self.inbound_tx.push(Inbound::Data(chunk).into()).is_ok());
+        /// Delivers `data` as one received chunk, in a packet buffer of
+        /// its own. Returns a view of that buffer, to compare addresses
+        /// against.
+        fn push(&self, data: &[u8]) -> MbufSlice {
+            let chunk = testing::slice(data);
+            assert!(self.inbound_tx.push(Inbound::Data(chunk.clone())).is_ok());
+            chunk
         }
 
         /// Everything the client has sent so far, concatenated.
@@ -1764,8 +1803,7 @@ mod tests {
         let (mut ws, wire) = tcp_client(Bytes::new());
         let mut bytes = server_frame(0x82, b"hello");
         bytes.extend(server_frame(0x82, &[9; 300]));
-        let chunk = Bytes::from(bytes);
-        wire.push(chunk.clone());
+        let chunk = wire.push(&bytes);
 
         let first = binary_payload(recv_now(&mut ws));
         assert_eq!(&first[..], b"hello");
@@ -1781,9 +1819,8 @@ mod tests {
         let (mut ws, wire) = tcp_client(Bytes::new());
         // A 4-byte header split 3 + 1, the payload whole in the second chunk.
         let frame = server_frame(0x82, &[5; 200]);
-        wire.push(Bytes::copy_from_slice(&frame[..3]));
-        let second = Bytes::copy_from_slice(&frame[3..]);
-        wire.push(second.clone());
+        wire.push(&frame[..3]);
+        let second = wire.push(&frame[3..]);
         let payload = binary_payload(recv_now(&mut ws));
         assert_eq!(&payload[..], &[5; 200]);
         assert_eq!(payload.as_ptr(), second[1..].as_ptr());
@@ -1795,7 +1832,7 @@ mod tests {
         let payload: Vec<u8> = (0..100).collect();
         let frame = server_frame(0x82, &payload);
         for piece in [&frame[..10], &frame[10..50], &frame[50..]] {
-            wire.push(Bytes::copy_from_slice(piece));
+            wire.push(piece);
         }
         assert_eq!(binary_payload(recv_now(&mut ws)), payload);
     }
@@ -1825,7 +1862,7 @@ mod tests {
             let (mut ws, wire) = tcp_client(Bytes::new());
             let mut got = Vec::new();
             for chunk in chunks {
-                wire.push(Bytes::copy_from_slice(chunk));
+                wire.push(chunk);
                 while let Poll::Ready(message) = poll_message(&mut ws) {
                     got.push(message.unwrap().unwrap());
                 }
@@ -1849,7 +1886,7 @@ mod tests {
         let (mut ws, wire) = tcp_client(Bytes::new());
         let mut got = None;
         for segment in frame.chunks(1448) {
-            wire.push(Bytes::copy_from_slice(segment));
+            wire.push(segment);
             if let Poll::Ready(message) = poll_message(&mut ws) {
                 got = Some(binary_payload(message.unwrap().unwrap()));
             }
@@ -1871,8 +1908,7 @@ mod tests {
         assert_eq!(first.as_ptr(), leftover[2..].as_ptr());
         assert!(poll_message(&mut ws).is_pending());
 
-        let rest = Bytes::copy_from_slice(&next[1..]);
-        wire.push(rest.clone());
+        let rest = wire.push(&next[1..]);
         let second = binary_payload(recv_now(&mut ws));
         assert_eq!(&second[..], &[7; 130]);
         assert_eq!(second.as_ptr(), rest[3..].as_ptr());
@@ -1892,7 +1928,7 @@ mod tests {
                 WebSocketError::MaskedServerFrame => &[0x81, 0, 0, 0, 0, 0],
                 _ => &[127, 0, 0, 0, 0, 0x01, 0, 0, 1],
             };
-            wire.push(Bytes::copy_from_slice(rest));
+            wire.push(rest);
             assert!(matches!(poll_message(&mut ws), Poll::Ready(Err(e)) if e == error));
         }
     }
@@ -1962,7 +1998,7 @@ mod tests {
     #[test]
     fn pings_are_answered_over_tcp_before_they_are_returned() {
         let (mut ws, wire) = tcp_client(Bytes::new());
-        wire.push(Bytes::from(server_frame(0x89, b"are you there")));
+        wire.push(&server_frame(0x89, b"are you there"));
         assert_eq!(
             recv_now(&mut ws),
             Message::Ping(Bytes::from_static(b"are you there"))
@@ -1976,10 +2012,7 @@ mod tests {
     #[test]
     fn a_peer_close_over_tcp_is_echoed_and_ends_the_stream() {
         let (mut ws, wire) = tcp_client(Bytes::new());
-        wire.push(Bytes::from(server_frame(
-            0x88,
-            &[0x03, 0xE8, b'b', b'y', b'e'],
-        )));
+        wire.push(&server_frame(0x88, &[0x03, 0xE8, b'b', b'y', b'e']));
         assert_eq!(
             recv_now(&mut ws),
             Message::Close(Some(CloseFrame {
@@ -2002,8 +2035,8 @@ mod tests {
     fn eof_over_tcp_without_a_close_is_unclean() {
         let (mut ws, wire) = tcp_client(Bytes::new());
         // Half a frame, then the peer's FIN.
-        wire.push(Bytes::from_static(&[0x82, 5, b'h']));
-        assert!(wire.inbound_tx.push(Inbound::Eof.into()).is_ok());
+        wire.push(&[0x82, 5, b'h']);
+        assert!(wire.inbound_tx.push(Inbound::Eof).is_ok());
         assert!(matches!(
             poll_message(&mut ws),
             Poll::Ready(Err(WebSocketError::UncleanClose))
@@ -2013,7 +2046,7 @@ mod tests {
     #[test]
     fn a_reset_over_tcp_surfaces_as_an_io_error() {
         let (mut ws, wire) = tcp_client(Bytes::new());
-        assert!(wire.inbound_tx.push(Inbound::Reset.into()).is_ok());
+        assert!(wire.inbound_tx.push(Inbound::Reset).is_ok());
         assert!(matches!(
             poll_message(&mut ws),
             Poll::Ready(Err(WebSocketError::Io(std::io::ErrorKind::ConnectionReset)))
@@ -2042,7 +2075,7 @@ mod tests {
             reply.extend(server_frame(0x81, b"welcome"));
             assert!(
                 inbound_tx
-                    .push(Inbound::Data(Bytes::from(reply)).into())
+                    .push(Inbound::Data(testing::slice(&reply)))
                     .is_ok()
             );
             Wire { cmd_rx, inbound_tx }
@@ -2070,7 +2103,7 @@ mod tests {
             panic!("a plaintext upgrade must run on the raw TcpStream");
         };
         assert!(
-            !tcp.reader.chunk.is_empty(),
+            !tcp.reader.shared.is_empty(),
             "hyper read the frame past the head"
         );
 
@@ -2089,26 +2122,13 @@ mod tests {
 
     /// Frames parsed out of a real packet buffer allocate only for what
     /// they hand out: a text frame for its `String`, and binary frames one
-    /// shared `Bytes` owner per packet. Initializes EAL, so it runs alone:
-    /// `cargo test --lib frames_in_a_packet_buffer -- --ignored`.
+    /// shared `Bytes` owner per packet.
     #[test]
-    #[ignore = "initializes EAL; run alone"]
     fn frames_in_a_packet_buffer_allocate_only_what_they_hand_out() {
         use crate::allocations::count_allocations;
-        use crate::dpdk::tcp::worker::InboundMessage;
-        use crate::dpdk::{Mbuf, Mempool, eal, ffi, mempool::DEFAULT_MBUF_DATA_ROOM_SIZE};
+        use crate::dpdk::{Mempool, ffi, mempool::DEFAULT_MBUF_DATA_ROOM_SIZE};
 
-        let cpu = unsafe { libc::sched_getcpu() };
-        eal::init(&[
-            "ws-alloc-test",
-            "--no-huge",
-            "--no-pci",
-            "--no-shconf",
-            "--no-telemetry",
-            "--lcores",
-            &format!("0@{cpu}"),
-        ])
-        .unwrap();
+        testing::init();
         {
             let pool =
                 Mempool::create("ws-alloc-test", 255, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
@@ -2116,14 +2136,8 @@ mod tests {
             let free = available();
             let (mut ws, wire) = tcp_client(Bytes::new());
             let push = |frames: &[Vec<u8>]| {
-                let data = frames.concat();
-                let mut packet = Mbuf::alloc(&pool).unwrap();
-                packet
-                    .append(data.len() as u16)
-                    .unwrap()
-                    .copy_from_slice(&data);
-                let message = InboundMessage::Data(Chunk::packet(packet, 0, data.len()));
-                assert!(wire.inbound_tx.push(message).is_ok());
+                let packet = MbufSlice::copy_from_slice(&pool, &frames.concat()).unwrap();
+                assert!(wire.inbound_tx.push(Inbound::Data(packet)).is_ok());
             };
 
             push(&[
@@ -2158,6 +2172,5 @@ mod tests {
             drop((texts, binaries, ws, wire));
             assert_eq!(available(), free, "every packet buffer returned");
         }
-        eal::cleanup();
     }
 }

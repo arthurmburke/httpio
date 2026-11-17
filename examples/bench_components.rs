@@ -231,7 +231,7 @@ mod dpdk_parts {
     use httpio::dpdk::tcp::seq::Seq;
     use httpio::dpdk::tcp::tcb::{FourTuple, Tcb};
     use httpio::dpdk::tcp::tx_queue::SendBuffer;
-    use httpio::dpdk::{EthPort, Mbuf, Mempool, eal};
+    use httpio::dpdk::{EthPort, Mbuf, MbufSlice, Mempool, eal};
 
     const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
     const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
@@ -241,9 +241,24 @@ mod dpdk_parts {
 
     pub fn run() {
         wire_formats();
-        buffers();
-        tcb();
-        engine();
+        // Received payload is a view of a packet buffer, so the receive
+        // benchmarks need EAL and a pool too.
+        let args: Vec<String> = std::env::args().collect();
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        eal::init(&args).expect("EAL initialization failed");
+        {
+            let rx_pool = Mempool::create("bench-rx", 1023, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
+                .expect("failed to create the receive mbuf pool");
+            // One full-size segment, as received. Each use clones the
+            // view (an atomic increment of the mbuf's refcnt, as a `Bytes`
+            // clone is of its own).
+            let segment = MbufSlice::copy_from_slice(&rx_pool, &[0xa5u8; MSS])
+                .expect("the receive pool is empty");
+            buffers(&segment);
+            tcb(&segment);
+            engine();
+        }
+        eal::cleanup();
     }
 
     fn peer_header(seq: u32, ack: u32, flags: u8) -> tcp::TcpHeader {
@@ -353,7 +368,7 @@ mod dpdk_parts {
         });
     }
 
-    fn buffers() {
+    fn buffers(segment: &MbufSlice) {
         let chunk = Bytes::from(vec![0xa5u8; MSS]);
         let mut send = SendBuffer::default();
         bench("tcp", "SendBuffer push+take 1460B", 10_000_000, MSS, || {
@@ -383,7 +398,7 @@ mod dpdk_parts {
             10_000_000,
             MSS,
             || {
-                next = recv.insert(next, chunk.clone(), next);
+                next = recv.insert(next, segment.clone(), next);
                 black_box(recv.read(usize::MAX));
             },
         );
@@ -403,12 +418,12 @@ mod dpdk_parts {
         let syn = tcb.poll_output(now).remove(0);
         let ours = syn.seq.0.wrapping_add(1);
         let synack = peer_synack(1000, ours);
-        tcb.on_segment(&synack, Bytes::new(), now);
+        tcb.on_segment(&synack, MbufSlice::empty(), now);
         tcb.poll_output(now);
         (tcb, 1001, ours)
     }
 
-    fn tcb() {
+    fn tcb(segment: &MbufSlice) {
         let now = Instant::now();
         let chunk = Bytes::from(vec![0xa5u8; MSS]);
         let mut out = Vec::new();
@@ -421,7 +436,7 @@ mod dpdk_parts {
             MSS,
             || {
                 let hdr = peer_header(peer_seq, ours, tcp::flags::ACK);
-                tcb.on_segment(&hdr, chunk.clone(), now);
+                tcb.on_segment(&hdr, segment.clone(), now);
                 peer_seq = peer_seq.wrapping_add(MSS as u32);
                 black_box(tcb.recv(usize::MAX));
                 tcb.poll_output_into(now, &mut out);
@@ -441,7 +456,7 @@ mod dpdk_parts {
                 black_box(&out);
                 ours = ours.wrapping_add(MSS as u32);
                 let ack = peer_header(peer_seq, ours, tcp::flags::ACK);
-                tcb.on_segment(&ack, Bytes::new(), now);
+                tcb.on_segment(&ack, MbufSlice::empty(), now);
             },
         );
     }
@@ -502,9 +517,6 @@ mod dpdk_parts {
     }
 
     fn engine() {
-        let args: Vec<String> = std::env::args().collect();
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        eal::init(&args).expect("EAL initialization failed");
         {
             let pool = Mempool::create("bench", 8191, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
                 .expect("failed to create mbuf pool");
@@ -714,6 +726,5 @@ mod dpdk_parts {
                 },
             );
         }
-        eal::cleanup();
     }
 }
