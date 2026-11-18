@@ -10,6 +10,7 @@
 //! every peer is assumed to be on the local Ethernet segment.
 
 mod gro;
+mod table;
 
 use crate::core::time::{Duration, Instant};
 use std::collections::VecDeque;
@@ -19,6 +20,7 @@ use bytes::Bytes;
 
 use crate::core::hashmap::HashMap;
 use crate::core::hashset::HashSet;
+use table::{ConnId, ConnTable};
 use crate::dpdk::net::arp::ArpTable;
 use crate::dpdk::net::eth::EthAddr;
 use crate::dpdk::net::{arp, eth, ipv4, tcp};
@@ -41,6 +43,7 @@ const ARP_TIMEOUT: Duration = Duration::from_secs(30);
 const TX_STALL_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct PendingTcp {
+    id: ConnId,
     tuple: FourTuple,
     mac: EthAddr,
     header: tcp::TcpHeader,
@@ -85,9 +88,8 @@ struct Conn {
     /// Segments of this connection queued locally (awaiting pool space or
     /// NIC acceptance). No new output is produced while this is non-zero.
     queued_tx: usize,
-    /// Already in the engine's `active` set, so marking it again (once per
-    /// received packet) needs no hashing. May be false for a member that a
-    /// due timer inserted; inserting such a tuple twice is harmless.
+    /// Whether the connection is on the engine's `active` list, which
+    /// therefore never holds it twice.
     active: bool,
 }
 
@@ -192,18 +194,21 @@ pub struct TcpEngine {
     rx_gro: bool,
     receive_window: u32,
     listeners: HashSet<u16>,
-    connections: HashMap<FourTuple, Conn>,
+    connections: ConnTable<Conn>,
     connections_opened: u64,
     accept_queues: HashMap<u16, VecDeque<FourTuple>>,
-    /// Immediately runnable connections only. Future timers live in an
-    /// indexed heap and enter this set when due, or on packet/app activity.
+    /// Future deadlines, one per connection, filed under its slot in
+    /// `connections`. A connection enters `active` when its timer is due,
+    /// or on packet/app activity.
     timers: Timers,
-    active: HashSet<FourTuple>,
-    /// Scratch set for both poll phases; empty between polls. Swapping
+    /// Immediately runnable connections only. An entry whose connection
+    /// has since been removed is skipped when the list is processed.
+    active: Vec<ConnId>,
+    /// Scratch list for both poll phases; empty between polls. Swapping
     /// with `active` and clearing afterward retains both allocations.
-    processing: HashSet<FourTuple>,
+    processing: Vec<ConnId>,
     tx_batch: Vec<Mbuf>,
-    tx_owners: Vec<Option<(FourTuple, Seq)>>,
+    tx_owners: Vec<Option<(ConnId, Seq)>>,
     /// When the port first refused the packet now at the head of
     /// `tx_batch`; `None` while the port is accepting packets.
     tx_stalled_since: Option<Instant>,
@@ -230,15 +235,15 @@ impl TcpEngine {
             rx_gro: true,
             receive_window: super::tcb::DEFAULT_RECEIVE_WINDOW,
             listeners: HashSet::default(),
-            connections: HashMap::default(),
+            connections: ConnTable::default(),
             connections_opened: 0,
             accept_queues: HashMap::default(),
             arp: ArpTable::new(),
             pending_arp_replies: Vec::new(),
             pending_raw_resets: Vec::new(),
             timers: Timers::default(),
-            active: HashSet::default(),
-            processing: HashSet::default(),
+            active: Vec::new(),
+            processing: Vec::new(),
             tx_batch: Vec::new(),
             tx_owners: Vec::new(),
             tx_stalled_since: None,
@@ -292,10 +297,10 @@ impl TcpEngine {
     /// pending output (app ops, inbound segments). Its timer entry stays:
     /// a due timer only inserts into the same set, and the poll that
     /// processes the connection re-arms or removes it.
-    fn mark_active(active: &mut HashSet<FourTuple>, conn: &mut Conn, tuple: FourTuple) {
+    fn mark_active(active: &mut Vec<ConnId>, conn: &mut Conn, id: ConnId) {
         if !conn.active {
             conn.active = true;
-            active.insert(tuple);
+            active.push(id);
         }
     }
 
@@ -325,16 +330,16 @@ impl TcpEngine {
             remote_ip,
             remote_port,
         };
-        match self.connections.entry(tuple) {
-            std::collections::hash_map::Entry::Occupied(_) => return None,
-            std::collections::hash_map::Entry::Vacant(v) => {
-                let mut tcb = Tcb::new_active(tuple);
-                tcb.set_receive_window(self.receive_window);
-                let conn = v.insert(Conn::new(tcb, AcceptState::NotApplicable));
-                // Has a SYN to send.
-                Self::mark_active(&mut self.active, conn, tuple);
-            }
+        if self.connections.contains(&tuple) {
+            return None;
         }
+        let mut tcb = Tcb::new_active(tuple);
+        tcb.set_receive_window(self.receive_window);
+        let (id, conn) = self
+            .connections
+            .insert(tuple, Conn::new(tcb, AcceptState::NotApplicable));
+        // Has a SYN to send.
+        Self::mark_active(&mut self.active, conn, id);
         self.connections_opened += 1;
         Some(tuple)
     }
@@ -367,29 +372,32 @@ impl TcpEngine {
 
     /// Discards an abandoned connection and all its retained buffers.
     pub(crate) fn abort(&mut self, tuple: FourTuple) {
-        self.connections.remove(&tuple);
-        self.timers.remove(tuple);
-        self.active.remove(&tuple);
-        self.discard_queued(tuple);
+        let Some(id) = self.connections.id_of(&tuple) else {
+            return;
+        };
+        self.discard_queued(id);
+        // Its entry in `active`, if any, now names nothing and is skipped.
+        self.connections.remove(id);
+        self.timers.remove(id.index);
     }
 
-    fn discard_queued(&mut self, tuple: FourTuple) {
-        self.pending_tx.retain(|p| p.tuple != tuple);
+    fn discard_queued(&mut self, id: ConnId) {
+        self.pending_tx.retain(|p| p.id != id);
         for i in (0..self.tx_owners.len()).rev() {
-            if self.tx_owners[i].is_some_and(|(owner, _)| owner == tuple) {
+            if self.tx_owners[i].is_some_and(|(owner, _)| owner == id) {
                 self.tx_owners.remove(i);
                 self.tx_batch.remove(i);
             }
         }
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some(conn) = self.connections.by_id_mut(id) {
             conn.queued_tx = 0;
         }
     }
 
     pub fn send(&mut self, tuple: FourTuple, data: Bytes) {
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some((id, conn)) = self.connections.get_mut(&tuple) {
             conn.tcb.send(data);
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
         }
     }
 
@@ -397,13 +405,13 @@ impl TcpEngine {
     /// its next chunk, or part of it, as a view of the mbuf it arrived in.
     /// Empty when nothing is readable.
     pub fn recv(&mut self, tuple: FourTuple, max_len: usize) -> MbufSlice {
-        let Some(conn) = self.connections.get_mut(&tuple) else {
+        let Some((id, conn)) = self.connections.get_mut(&tuple) else {
             return MbufSlice::empty();
         };
         let data = conn.tcb.recv(max_len);
         // Reading only needs a poll when it produced a window update.
         if !data.is_empty() && conn.tcb.has_pending_output() {
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
         }
         data
     }
@@ -416,7 +424,7 @@ impl TcpEngine {
         max_len: usize,
         mut deliver: impl FnMut(MbufSlice) -> bool,
     ) {
-        let Some(conn) = self.connections.get_mut(&tuple) else {
+        let Some((id, conn)) = self.connections.get_mut(&tuple) else {
             return;
         };
         let mut any = false;
@@ -432,7 +440,7 @@ impl TcpEngine {
         }
         // Reading only needs a poll when it produced a window update.
         if any && conn.tcb.has_pending_output() {
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
         }
     }
 
@@ -444,9 +452,9 @@ impl TcpEngine {
     }
 
     pub fn close(&mut self, tuple: FourTuple) {
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some((id, conn)) = self.connections.get_mut(&tuple) {
             conn.tcb.close();
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
         }
     }
 
@@ -457,7 +465,7 @@ impl TcpEngine {
     ///
     /// Panics if a tracked connection is outside SYN-SENT or `segments` is zero.
     pub fn set_initial_window(&mut self, tuple: FourTuple, segments: u16) {
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some((_, conn)) = self.connections.get_mut(&tuple) {
             conn.tcb.set_initial_window(segments);
         }
     }
@@ -465,28 +473,28 @@ impl TcpEngine {
     /// TCP_NODELAY: disable (or re-enable) Nagle's algorithm for one
     /// connection.
     pub fn set_nodelay(&mut self, tuple: FourTuple, nodelay: bool) {
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some((id, conn)) = self.connections.get_mut(&tuple) {
             conn.tcb.set_nodelay(nodelay);
             // May unblock a Nagle-held tail.
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
         }
     }
 
     /// TCP_CORK-style hold: while set, the trailing sub-MSS segment is
     /// held back until `flush()` (full-MSS segments still flow).
     pub fn set_cork(&mut self, tuple: FourTuple, corked: bool) {
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some((id, conn)) = self.connections.get_mut(&tuple) {
             conn.tcb.set_cork(corked);
             // Uncorking flushes a held tail.
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
         }
     }
 
     /// Manual trigger releasing a corked connection's held tail segment.
     pub fn flush(&mut self, tuple: FourTuple) {
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some((id, conn)) = self.connections.get_mut(&tuple) {
             conn.tcb.flush();
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
         }
     }
 
@@ -566,11 +574,13 @@ impl TcpEngine {
 
         // Phase 1: tick timers and drain events. Closed connections remain
         // until phase 2 has serialized any final reset.
-        for &tuple in &self.processing {
-            self.updated.push(tuple);
-            let Some(conn) = self.connections.get_mut(&tuple) else {
+        for &id in &self.processing {
+            // Aborted since it was marked active.
+            let Some(conn) = self.connections.by_id_mut(id) else {
                 continue;
             };
+            let tuple = conn.tcb.tuple;
+            self.updated.push(tuple);
             // `active` was swapped out: this connection is no longer in it.
             conn.active = false;
             conn.tcb.tick(now);
@@ -601,15 +611,22 @@ impl TcpEngine {
             .min(u16::MAX as u32) as u16;
         let output_budget = self.output_budget();
         let connections = &mut self.connections;
+        let timers = &mut self.timers;
         let config = &self.config;
         let arp = &mut self.arp;
-        for &tuple in &self.processing {
-            let Some(conn) = connections.get_mut(&tuple) else {
+        // A connection leaves with its timer, so a slot never inherits one.
+        let mut remove = |connections: &mut ConnTable<Conn>, id: ConnId| {
+            connections.remove(id);
+            timers.remove(id.index);
+        };
+        for &id in &self.processing {
+            let Some(conn) = connections.by_id_mut(id) else {
                 continue;
             };
+            let tuple = conn.tcb.tuple;
             if !conn.tcb.has_pending_output() {
                 if conn.tcb.is_closed() {
-                    connections.remove(&tuple);
+                    remove(connections, id);
                 }
                 continue;
             }
@@ -632,7 +649,7 @@ impl TcpEngine {
                     }
                 };
                 if now.saturating_duration_since(since) >= ARP_TIMEOUT {
-                    connections.remove(&tuple);
+                    remove(connections, id);
                     events.push((tuple, Event::Reset));
                 }
                 continue;
@@ -661,6 +678,7 @@ impl TcpEngine {
                     conn.queued_tx += 1;
                 }
                 self.pending_tx.push_back(PendingTcp {
+                    id,
                     tuple,
                     mac,
                     header: conn.tcb.to_header(&seg),
@@ -674,7 +692,7 @@ impl TcpEngine {
                 });
             }
             if !owned {
-                connections.remove(&tuple);
+                remove(connections, id);
             }
         }
 
@@ -758,26 +776,27 @@ impl TcpEngine {
     }
 
     fn activate_due(&mut self, now: Instant) {
-        while let Some(tuple) = self.timers.pop_due(now) {
-            self.active.insert(tuple);
+        while let Some(index) = self.timers.pop_due(now) {
+            if let Some((id, conn)) = self.connections.at_mut(index) {
+                Self::mark_active(&mut self.active, conn, id);
+            }
         }
     }
 
     fn reschedule_processed(&mut self, _now: Instant) {
-        for &tuple in &self.processing {
-            self.active.remove(&tuple);
-            let Some(conn) = self.connections.get_mut(&tuple) else {
-                self.timers.remove(tuple);
+        for &id in &self.processing {
+            // Removed connections took their timers with them.
+            let Some(conn) = self.connections.by_id_mut(id) else {
                 continue;
             };
             #[cfg(feature = "tcp-metrics")]
             conn.tcb.record_window_limits(_now);
-            self.timers.set(tuple, conn.tcb.next_deadline());
-            conn.active = conn.tcb.has_pending_output()
+            self.timers.set(id.index, conn.tcb.next_deadline());
+            if conn.tcb.has_pending_output()
                 || conn.queued_tx != 0
-                || matches!(conn.next_hop, NextHop::Resolving { .. });
-            if conn.active {
-                self.active.insert(tuple);
+                || matches!(conn.next_hop, NextHop::Resolving { .. })
+            {
+                Self::mark_active(&mut self.active, conn, id);
             }
         }
         self.processing.clear();
@@ -832,7 +851,7 @@ impl TcpEngine {
             self.tx_owners.push(
                 packet
                     .owned
-                    .then(|| (packet.tuple, Seq::new(packet.header.seq))),
+                    .then(|| (packet.id, Seq::new(packet.header.seq))),
             );
             self.tx_batch.push(mbuf);
             self.pending_tx.pop_front();
@@ -846,15 +865,15 @@ impl TcpEngine {
         // A burst is mostly runs of one connection's packets: look the
         // connection up once per run rather than once per packet.
         let mut owners = self.tx_owners.drain(..sent).flatten().peekable();
-        while let Some((tuple, seq)) = owners.next() {
+        while let Some((id, seq)) = owners.next() {
             // An owned packet's connection is still tracked: `abort`
             // discards a connection's queued packets along with it.
-            let Some(conn) = self.connections.get_mut(&tuple) else {
+            let Some(conn) = self.connections.by_id_mut(id) else {
                 continue;
             };
             conn.tcb.mark_transmitted(seq, now);
             conn.queued_tx = conn.queued_tx.saturating_sub(1);
-            while let Some((_, seq)) = owners.next_if(|(next, _)| *next == tuple) {
+            while let Some((_, seq)) = owners.next_if(|(next, _)| *next == id) {
                 conn.tcb.mark_transmitted(seq, now);
                 conn.queued_tx = conn.queued_tx.saturating_sub(1);
             }
@@ -887,13 +906,13 @@ impl TcpEngine {
     /// A queued packet left the engine, accepted by the port or given up
     /// on: either way its retransmission timer runs from now.
     fn transmitted(
-        connections: &mut HashMap<FourTuple, Conn>,
-        (tuple, seq): (FourTuple, Seq),
+        connections: &mut ConnTable<Conn>,
+        (id, seq): (ConnId, Seq),
         now: Instant,
     ) {
         // An owned packet's connection is still tracked: `abort`
         // discards a connection's queued packets along with it.
-        if let Some(conn) = connections.get_mut(&tuple) {
+        if let Some(conn) = connections.by_id_mut(id) {
             conn.tcb.mark_transmitted(seq, now);
             conn.queued_tx = conn.queued_tx.saturating_sub(1);
         }
@@ -972,7 +991,7 @@ impl TcpEngine {
             remote_port: tcp_hdr.src_port,
         };
 
-        if let Some(conn) = self.connections.get_mut(&tuple) {
+        if let Some((id, conn)) = self.connections.get_mut(&tuple) {
             let start = eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN + hdr_len;
             let end = eth::ETH_HDR_LEN + total_len;
             conn.tcb.on_segment_with(
@@ -1001,9 +1020,9 @@ impl TcpEngine {
             );
             // The segment may have produced an ACK/data to send, an event,
             // or a state change -- process it next poll.
-            Self::mark_active(&mut self.active, conn, tuple);
+            Self::mark_active(&mut self.active, conn, id);
             if conn.tcb.is_closed() {
-                self.discard_queued(tuple);
+                self.discard_queued(id);
             }
             return;
         }
@@ -1016,9 +1035,10 @@ impl TcpEngine {
             tcb.set_peer_scale(tcp_hdr.options.window_scale);
             tcb.set_peer_sack(tcp_hdr.options.sack_permitted);
             // Has a SYN-ACK to send.
-            let mut conn = Conn::new(tcb, AcceptState::AwaitingHandshake);
-            Self::mark_active(&mut self.active, &mut conn, tuple);
-            self.connections.insert(tuple, conn);
+            let (id, conn) = self
+                .connections
+                .insert(tuple, Conn::new(tcb, AcceptState::AwaitingHandshake));
+            Self::mark_active(&mut self.active, conn, id);
             return;
         }
 
@@ -1366,10 +1386,10 @@ mod tests {
             }
             tcb.send(Bytes::from(vec![0; 100_000]));
             let tuple = tcb.tuple;
-            engine
+            let (id, _) = engine
                 .connections
                 .insert(tuple, Conn::new(tcb, AcceptState::NotApplicable));
-            engine.processing.insert(tuple);
+            engine.processing.push(id);
         }
         let budget = engine.output_budget();
         let mut total = 0;
@@ -1412,12 +1432,33 @@ mod tests {
 
     fn schedule_tcb(engine: &mut TcpEngine, tcb: Tcb) -> FourTuple {
         let tuple = tcb.tuple;
-        engine
+        let (id, _) = engine
             .connections
             .insert(tuple, Conn::new(tcb, AcceptState::NotApplicable));
-        engine.processing.insert(tuple);
+        engine.processing.push(id);
         engine.reschedule_processed(Instant::now());
         tuple
+    }
+
+    fn conn(engine: &mut TcpEngine, tuple: FourTuple) -> &mut Conn {
+        engine.connections.get_mut(&tuple).unwrap().1
+    }
+
+    fn is_active(engine: &TcpEngine, tuple: FourTuple) -> bool {
+        let id = engine.connections.id_of(&tuple).unwrap();
+        engine.active.contains(&id)
+    }
+
+    /// What a poll does with a connection that had activity: takes it off
+    /// the active list, then decides where it waits next.
+    fn process(engine: &mut TcpEngine, tuple: FourTuple) {
+        let (id, conn) = engine.connections.get_mut(&tuple).unwrap();
+        TcpEngine::mark_active(&mut engine.active, conn, id);
+        std::mem::swap(&mut engine.active, &mut engine.processing);
+        for id in engine.processing.clone() {
+            engine.connections.by_id_mut(id).unwrap().active = false;
+        }
+        engine.reschedule_processed(Instant::now());
     }
 
     #[test]
@@ -1713,8 +1754,8 @@ mod tests {
         }
         engine.activate_due(deadline);
         assert_eq!(engine.active.len(), 300);
-        for tuple in &engine.active {
-            let conn = engine.connections.get_mut(tuple).unwrap();
+        for id in engine.active.clone() {
+            let conn = engine.connections.by_id_mut(id).unwrap();
             conn.tcb.tick(deadline);
             assert!(conn.tcb.is_closed());
         }
@@ -1734,22 +1775,16 @@ mod tests {
         let old_deadline = tcb.next_deadline().unwrap();
         let tuple = schedule_tcb(&mut engine, tcb);
         let later = now + Duration::from_secs(1);
-        let conn = engine.connections.get_mut(&tuple).unwrap();
+        let conn = conn(&mut engine, tuple);
         conn.tcb.on_segment(&peer, MbufSlice::empty(), later);
         conn.tcb.poll_output(later);
         let new_deadline = conn.tcb.next_deadline().unwrap();
         assert!(new_deadline > old_deadline);
-        TcpEngine::mark_active(
-            &mut engine.active,
-            engine.connections.get_mut(&tuple).unwrap(),
-            tuple,
-        );
-        engine.processing.insert(tuple);
-        engine.reschedule_processed(Instant::now());
+        process(&mut engine, tuple);
         engine.activate_due(old_deadline);
         assert!(engine.active.is_empty());
         engine.activate_due(new_deadline);
-        assert!(engine.active.contains(&tuple));
+        assert!(is_active(&engine, tuple));
     }
 
     #[test]
@@ -1770,8 +1805,8 @@ mod tests {
             engine.activate_due(deadline - Duration::from_nanos(1));
             assert!(engine.active.is_empty());
             engine.activate_due(deadline);
-            assert!(engine.active.contains(&tuple));
-            let conn = engine.connections.get_mut(&tuple).unwrap();
+            assert!(is_active(&engine, tuple));
+            let conn = conn(&mut engine, tuple);
             conn.tcb.tick(deadline);
             assert!(!conn.tcb.poll_output(deadline).is_empty());
         }
@@ -1787,23 +1822,15 @@ mod tests {
         let deadline = tcb.next_deadline().unwrap();
         let tuple = schedule_tcb(&mut engine, tcb);
         peer.ack = (packet.seq + packet.payload.len() as u32).0;
-        engine
-            .connections
-            .get_mut(&tuple)
-            .unwrap()
+        conn(&mut engine, tuple)
             .tcb
             .on_segment(&peer, MbufSlice::empty(), now);
-        TcpEngine::mark_active(
-            &mut engine.active,
-            engine.connections.get_mut(&tuple).unwrap(),
-            tuple,
-        );
-        engine.processing.insert(tuple);
-        engine.reschedule_processed(Instant::now());
+        process(&mut engine, tuple);
         engine.activate_due(deadline);
         assert!(engine.active.is_empty());
         // An aborted timer must not later activate a new connection with the same tuple.
-        engine.timers.set(tuple, Some(deadline));
+        let slot = engine.connections.id_of(&tuple).unwrap().index;
+        engine.timers.set(slot, Some(deadline));
         engine.abort(tuple);
         let (tcb, _) = established_tcb(1234, now);
         schedule_tcb(&mut engine, tcb);

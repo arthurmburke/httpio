@@ -996,13 +996,10 @@ fn run(
                     Command::Close => conn.close(&mut engine),
                 }
             }
-        }
-
-        for tuple in &work {
-            if let Some(conn) = conns.get(tuple) {
-                if !conn.cmd_rx.is_empty() {
-                    conn.outstanding.notify();
-                }
+            // More than one iteration's worth was queued: come back for
+            // the rest without waiting for the application to push again.
+            if !conn.cmd_rx.is_empty() {
+                conn.outstanding.notify();
             }
         }
 
@@ -1021,8 +1018,8 @@ fn run(
         }
 
         // 4. Deliver received bytes, then the terminal signal, to the app.
-        for tuple in &work {
-            let Some(conn) = conns.get_mut(tuple) else {
+        for tuple in work.drain() {
+            let Some(conn) = conns.get_mut(&tuple) else {
                 continue;
             };
             conn.release_credit(&engine);
@@ -1038,15 +1035,7 @@ fn run(
             // EOF terminal. The terminal signal goes out only after all
             // data has drained, retrying until the ring accepts it.
             conn.deliver_terminal(&engine);
-        }
 
-        // 5. Reap connections whose app-side handle is gone. Close the
-        //    engine side (idempotent) and drop the worker state; the
-        //    engine finishes any TIME_WAIT on its own.
-        for tuple in work.drain() {
-            let Some(conn) = conns.get_mut(&tuple) else {
-                continue;
-            };
             // Everything this iteration changed for the connection is
             // visible to the application by now; tell it once.
             if std::mem::take(&mut conn.notify_app)
@@ -1054,6 +1043,9 @@ fn run(
             {
                 notifier.notify(wake);
             }
+            // 5. Reap the connection if its app-side handle is gone. Close
+            //    the engine side (idempotent) and drop the worker state;
+            //    the engine finishes any TIME_WAIT on its own.
             if !conn.retain_after_drop(&mut engine, now) {
                 conns.remove(&tuple);
                 closing.remove(&tuple);

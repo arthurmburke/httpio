@@ -1,57 +1,76 @@
 //! Indexed min-heap: one deadline per connection, without stale entries.
 //! Updating or cancelling a timer is O(log n); an idle poll checks only the root.
+//!
+//! A connection is named by its slot in the engine's connection table, a
+//! small dense integer, so finding its heap entry is an array read.
 
-use super::tcb::FourTuple;
-use crate::core::hashmap::HashMap;
 use crate::core::time::Instant;
+
+/// `positions` entry of a key with no timer.
+const UNSET: u32 = u32::MAX;
 
 #[derive(Default)]
 pub struct Timers {
-    heap: Vec<(Instant, FourTuple)>,
-    positions: HashMap<FourTuple, usize>,
+    heap: Vec<(Instant, u32)>,
+    /// Where each key's entry is in `heap`, indexed by key.
+    positions: Vec<u32>,
 }
 
 impl Timers {
-    pub fn set(&mut self, tuple: FourTuple, deadline: Option<Instant>) {
+    fn position(&self, key: u32) -> Option<usize> {
+        match self.positions.get(key as usize) {
+            Some(&index) if index != UNSET => Some(index as usize),
+            _ => None,
+        }
+    }
+
+    pub fn set(&mut self, key: u32, deadline: Option<Instant>) {
         let Some(deadline) = deadline else {
-            self.remove(tuple);
+            self.remove(key);
             return;
         };
-        if let Some(&index) = self.positions.get(&tuple) {
+        if let Some(index) = self.position(key) {
+            if self.heap[index].0 == deadline {
+                return;
+            }
             self.heap[index].0 = deadline;
             self.repair(index);
         } else {
+            if self.positions.len() <= key as usize {
+                self.positions.resize(key as usize + 1, UNSET);
+            }
             let index = self.heap.len();
-            self.heap.push((deadline, tuple));
-            self.positions.insert(tuple, index);
+            self.heap.push((deadline, key));
+            self.positions[key as usize] = index as u32;
             self.up(index);
         }
     }
 
-    pub fn remove(&mut self, tuple: FourTuple) {
-        let Some(index) = self.positions.remove(&tuple) else {
+    pub fn remove(&mut self, key: u32) {
+        let Some(index) = self.position(key) else {
             return;
         };
+        self.positions[key as usize] = UNSET;
         self.heap.swap_remove(index);
         if index < self.heap.len() {
-            *self.positions.get_mut(&self.heap[index].1).unwrap() = index;
+            self.positions[self.heap[index].1 as usize] = index as u32;
             self.repair(index);
         }
     }
 
-    pub fn pop_due(&mut self, now: Instant) -> Option<FourTuple> {
-        let &(deadline, tuple) = self.heap.first()?;
+    pub fn pop_due(&mut self, now: Instant) -> Option<u32> {
+        let &(deadline, key) = self.heap.first()?;
         if deadline > now {
             return None;
         }
-        self.remove(tuple);
-        Some(tuple)
+        self.remove(key);
+        Some(key)
     }
 
     fn swap(&mut self, a: usize, b: usize) {
         self.heap.swap(a, b);
-        *self.positions.get_mut(&self.heap[a].1).unwrap() = a;
-        *self.positions.get_mut(&self.heap[b].1).unwrap() = b;
+        self.positions[self.heap[a].1 as usize] = a as u32;
+        self.positions[self.heap[b].1 as usize] = b as u32;
     }
 
     fn repair(&mut self, index: usize) {
@@ -98,46 +117,33 @@ impl Timers {
 mod tests {
     use super::*;
     use crate::core::time::Duration;
-    use std::net::Ipv4Addr;
-
-    fn tuple(port: u16) -> FourTuple {
-        FourTuple {
-            local_ip: Ipv4Addr::LOCALHOST,
-            local_port: port,
-            remote_ip: Ipv4Addr::LOCALHOST,
-            remote_port: 80,
-        }
-    }
 
     #[test]
     fn reschedule_cancel_and_reuse_keep_one_entry_per_connection() {
         let now = Instant::now();
         let mut timers = Timers::default();
         for i in 0..300 {
-            timers.set(
-                tuple(i),
-                Some(now + Duration::from_secs(300 - u64::from(i))),
-            );
+            timers.set(i, Some(now + Duration::from_secs(300 - u64::from(i))));
         }
         for i in 0..1000 {
-            timers.set(tuple(0), Some(now + Duration::from_secs(i)));
+            timers.set(0, Some(now + Duration::from_secs(i)));
         }
         assert_eq!(timers.heap.len(), 300);
-        timers.set(tuple(1), Some(now));
-        assert_eq!(timers.pop_due(now), Some(tuple(1)));
-        timers.remove(tuple(299));
+        timers.set(1, Some(now));
+        assert_eq!(timers.pop_due(now), Some(1));
+        timers.remove(299);
         assert_eq!(timers.pop_due(now + Duration::from_secs(1)), None);
-        timers.set(tuple(299), Some(now));
-        assert_eq!(timers.pop_due(now), Some(tuple(299)));
+        timers.set(299, Some(now));
+        assert_eq!(timers.pop_due(now), Some(299));
         let mut previous = now;
-        while let Some(&(deadline, tuple)) = timers.heap.first() {
+        while let Some(&(deadline, next)) = timers.heap.first() {
             assert!(deadline >= previous);
             previous = deadline;
-            assert_eq!(timers.pop_due(deadline), Some(tuple));
+            assert_eq!(timers.pop_due(deadline), Some(next));
             for (index, &(_, key)) in timers.heap.iter().enumerate() {
-                assert_eq!(timers.positions[&key], index);
+                assert_eq!(timers.positions[key as usize], index as u32);
             }
         }
-        assert!(timers.positions.is_empty());
+        assert!(timers.positions.iter().all(|&p| p == UNSET));
     }
 }
