@@ -376,15 +376,24 @@ impl RetransmitQueue {
     /// Drops fully-acked segments given the peer's cumulative ACK
     /// (`snd_una`). Returns an RTT sample from the oldest segment removed
     /// this call, if it qualifies under Karn's algorithm.
+    ///
+    /// Only the oldest can give one. It is the segment whose arrival
+    /// produced this ACK; the ones behind it may have reached the peer
+    /// long before, and waited there (SACKed) for a hole in front of them
+    /// to be filled. Timing those would measure how long the hole took to
+    /// repair, a retransmission timeout or more, and each such sample
+    /// would lengthen the next timeout.
     pub fn ack_up_to(&mut self, snd_una: Seq, now: Instant) -> Option<Duration> {
         let mut sample = None;
+        let mut oldest = true;
         while let Some(front) = self.segments.front() {
             if front.end_seq().leq(snd_una) {
                 let seg = self.segments.pop_front().unwrap();
                 self.payload_bytes -= seg.data.len();
-                if !seg.retransmitted && sample.is_none() {
+                if oldest && !seg.retransmitted && !seg.sacked {
                     sample = now.checked_duration_since(seg.first_sent_at);
                 }
+                oldest = false;
             } else {
                 // Large TSO ranges can be cumulatively ACKed a segment at a time.
                 let front = self.segments.front_mut().unwrap();
@@ -429,5 +438,45 @@ impl RetransmitQueue {
             .front()
             .filter(|s| !s.pending_transmit)
             .map(|s| s.last_sent_at + rto)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn queue_of_three(sent: Instant) -> RetransmitQueue {
+        let mut queue = RetransmitQueue::default();
+        for i in 0..3u32 {
+            queue.push(Seq::new(i * 100), Bytes::from(vec![0; 100]), false, false, sent);
+        }
+        queue
+    }
+
+    #[test]
+    fn an_ack_of_several_segments_times_the_oldest() {
+        let sent = Instant::now();
+        let mut queue = queue_of_three(sent);
+        let rtt = Duration::from_millis(5);
+        assert_eq!(queue.ack_up_to(Seq::new(300), sent + rtt), Some(rtt));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn segments_held_by_the_peer_behind_a_repaired_hole_give_no_rtt_sample() {
+        let sent = Instant::now();
+        let mut queue = queue_of_three(sent);
+        // The first segment is lost; the peer reports holding the others.
+        queue.apply_sack(&[(100, 300)], Seq::new(0), Seq::new(300));
+        // It is resent after a timeout, and the ACK then covers everything.
+        let resent = sent + Duration::from_secs(1);
+        queue.mark_all_lost();
+        assert!(queue.take_lost(1460, resent).is_some());
+        let acked = resent + Duration::from_millis(5);
+        // Not the second after which the later segments were finally
+        // acknowledged: they arrived within milliseconds of being sent.
+        assert_eq!(queue.ack_up_to(Seq::new(300), acked), None);
+        assert!(queue.is_empty());
     }
 }
