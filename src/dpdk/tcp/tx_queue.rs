@@ -144,6 +144,17 @@ impl From<Bytes> for Payload {
 }
 
 impl Payload {
+    /// A payload of no bytes, to borrow where a segment carries none.
+    pub fn empty() -> &'static Self {
+        static EMPTY: Payload = Payload {
+            chunks: [Bytes::new(), Bytes::new()],
+            count: 0,
+            overflow: None,
+            len: 0,
+        };
+        &EMPTY
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

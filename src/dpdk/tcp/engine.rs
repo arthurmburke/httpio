@@ -28,7 +28,7 @@ use crate::dpdk::{EthPort, Mbuf, MbufSlice, Mempool};
 
 use super::seq::Seq;
 use super::state::TcpState;
-use super::tcb::{Event, FourTuple, OutSegment, Tcb};
+use super::tcb::{Event, FourTuple, OutSegment, QueuedPayload, Tcb};
 use super::timers::Timers;
 use super::tx_queue::Payload;
 
@@ -215,7 +215,7 @@ pub struct TcpEngine {
     tx_dropped: u64,
     pending_tx: VecDeque<PendingTcp>,
     updated: Vec<FourTuple>,
-    segments: Vec<OutSegment>,
+    segments: Vec<OutSegment<QueuedPayload>>,
 
     /// Next-hop MAC resolution: expiring mappings plus the requests that
     /// fill them (see [`ArpTable`]).
@@ -610,6 +610,7 @@ impl TcpEngine {
             .saturating_sub((ipv4::IPV4_HDR_LEN + tcp::TCP_HDR_LEN) as u32)
             .min(u16::MAX as u32) as u16;
         let output_budget = self.output_budget();
+        let tx_max_segments = port.offloads().tx_max_segments;
         let connections = &mut self.connections;
         let timers = &mut self.timers;
         let config = &self.config;
@@ -673,21 +674,49 @@ impl TcpEngine {
             // A connection that closed is dropped below, so whatever it
             // just produced (a final reset) goes out unowned.
             let owned = !conn.tcb.is_closed();
+            let send_mss = conn.tcb.send_mss();
             for seg in self.segments.drain(..) {
                 if owned {
                     conn.queued_tx += 1;
+                }
+                let header = conn.tcb.to_header(&seg);
+                // Borrowed from the retransmission queue, which holds the
+                // bytes until they are acknowledged anyway.
+                let payload = conn.tcb.queued_payload(&seg.payload);
+                let tso_mss = if payload.len() > usize::from(send_mss) {
+                    send_mss
+                } else {
+                    0
+                };
+                // Normally each segment becomes a packet here and now, and
+                // joins the batch for the port. It waits in `pending_tx`
+                // only when the pool has no mbuf for it, or behind earlier
+                // packets that are already waiting for one.
+                if self.pending_tx.is_empty()
+                    && let Some(mbuf) = build_tcp_packet(
+                        pool,
+                        config.local_mac,
+                        mac,
+                        tuple,
+                        &header,
+                        payload,
+                        tx_offload,
+                        tso_mss,
+                        tx_max_segments,
+                    )
+                {
+                    self.tx_owners.push(owned.then_some((id, seg.seq)));
+                    self.tx_batch.push(mbuf);
+                    continue;
                 }
                 self.pending_tx.push_back(PendingTcp {
                     id,
                     tuple,
                     mac,
-                    header: conn.tcb.to_header(&seg),
-                    tso_mss: if seg.payload.len() > conn.tcb.send_mss() as usize {
-                        conn.tcb.send_mss()
-                    } else {
-                        0
-                    },
-                    payload: seg.payload,
+                    header,
+                    tso_mss,
+                    // Waiting outlasts the borrow: share the bytes.
+                    payload: payload.clone(),
                     owned,
                 });
             }
@@ -824,28 +853,19 @@ impl TcpEngine {
         crate::dpdk::metrics::record(|m| {
             m.pending_tx_peak = m.pending_tx_peak.max(self.pending_tx_len() as u64)
         });
+        // Packets the pool had no mbuf for when they were produced.
         while let Some(packet) = self.pending_tx.front() {
-            #[cfg(feature = "tcp-metrics")]
-            let metrics_start = Instant::now();
-            let built = build_ip_tcp_frame_external(
+            let Some(mbuf) = build_tcp_packet(
                 pool,
                 self.config.local_mac,
                 packet.mac,
-                packet.tuple.local_ip,
-                packet.tuple.remote_ip,
+                packet.tuple,
                 &packet.header,
                 &packet.payload,
                 port.tx_cksum_offload(),
                 packet.tso_mss,
                 port.offloads().tx_max_segments,
-            );
-            #[cfg(feature = "tcp-metrics")]
-            crate::dpdk::metrics::record(|m| {
-                m.packet_build_calls += 1;
-                m.packet_build_failures += u64::from(built.is_none());
-                m.packet_build_ns += metrics_start.elapsed().as_nanos() as u64;
-            });
-            let Some(mbuf) = built else {
+            ) else {
                 break;
             };
             self.tx_owners.push(
@@ -1112,6 +1132,43 @@ fn external_segment_count(payload: &Payload, max_segments: usize) -> Option<usiz
     Some(count)
 }
 
+/// Builds the packet for one of a connection's segments. `None` if the
+/// pool cannot supply its mbufs right now.
+#[allow(clippy::too_many_arguments)]
+fn build_tcp_packet(
+    pool: &Mempool,
+    local_mac: EthAddr,
+    remote_mac: EthAddr,
+    tuple: FourTuple,
+    header: &tcp::TcpHeader,
+    payload: &Payload,
+    tx_cksum_offload: bool,
+    tso_mss: u16,
+    max_segments: usize,
+) -> Option<Mbuf> {
+    #[cfg(feature = "tcp-metrics")]
+    let metrics_start = Instant::now();
+    let built = build_ip_tcp_frame_external(
+        pool,
+        local_mac,
+        remote_mac,
+        tuple.local_ip,
+        tuple.remote_ip,
+        header,
+        payload,
+        tx_cksum_offload,
+        tso_mss,
+        max_segments,
+    );
+    #[cfg(feature = "tcp-metrics")]
+    crate::dpdk::metrics::record(|m| {
+        m.packet_build_calls += 1;
+        m.packet_build_failures += u64::from(built.is_none());
+        m.packet_build_ns += metrics_start.elapsed().as_nanos() as u64;
+    });
+    built
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_ip_tcp_frame(
     pool: &Mempool,
@@ -1264,8 +1321,8 @@ fn build_ip_tcp_frame_external(
         return Some(head);
     }
 
+    // Fresh from the pool: `rte_pktmbuf_alloc` has already reset it.
     let mut mbuf = Mbuf::alloc(pool)?;
-    mbuf.reset();
     let buf = mbuf.append(total_len as u16)?;
 
     let eth_hdr = eth::EthHeader {

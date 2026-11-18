@@ -16,6 +16,10 @@ use super::mempool::Mempool;
 /// Owning handle to a single `rte_mbuf`. Freed via `rte_pktmbuf_free` on
 /// drop unless ownership is explicitly handed off (e.g. to `tx_burst`,
 /// which frees transmitted mbufs itself once the NIC is done with them).
+///
+/// `repr(transparent)`: a slice of these is a slice of raw mbuf pointers,
+/// which is how a batch is handed to the driver without copying it.
+#[repr(transparent)]
 pub struct Mbuf {
     raw: *mut ffi::rte_mbuf,
 }

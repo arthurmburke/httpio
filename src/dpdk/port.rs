@@ -428,16 +428,17 @@ impl EthPort {
     /// Keeps the caller's allocation; removes only packets owned by the NIC.
     pub fn tx_burst_in_place(&self, mbufs: &mut Vec<Mbuf>) {
         let mut accepted = 0;
-        let mut raw = [ptr::null_mut(); MAX_TX_BURST];
         while accepted < mbufs.len() {
             let n = (mbufs.len() - accepted).min(self.tx_burst_limit);
-            for (dst, packet) in raw.iter_mut().zip(&mbufs[accepted..accepted + n]) {
-                *dst = packet.as_raw();
-            }
+            // SAFETY: an `Mbuf` is exactly its `*mut rte_mbuf`
+            // (`repr(transparent)`), so the vector's storage is the pointer
+            // array the driver expects. The driver reads the `n` pointers
+            // and takes ownership of the packets it accepts.
+            let raw = unsafe { mbufs.as_mut_ptr().add(accepted).cast::<*mut ffi::rte_mbuf>() };
             #[cfg(feature = "tcp-metrics")]
             let metrics_start = std::time::Instant::now();
             let sent = unsafe {
-                ffi::rte_eth_tx_burst(self.port_id, self.queue_id, raw.as_mut_ptr(), n as u16)
+                ffi::rte_eth_tx_burst(self.port_id, self.queue_id, raw, n as u16)
             } as usize;
             #[cfg(feature = "tcp-metrics")]
             super::metrics::record(|m| {

@@ -52,13 +52,69 @@ pub struct FourTuple {
 }
 
 /// A segment the engine should serialize onto the wire.
-pub struct OutSegment {
+///
+/// `P` is how the segment refers to its payload. Every byte a connection
+/// sends is held in its retransmission queue until acknowledged, so a
+/// segment can either share those bytes ([`Payload`], the default) or just
+/// say where in the queue they are ([`QueuedPayload`]).
+pub struct OutSegment<P = Payload> {
     pub seq: Seq,
     pub ack: Seq,
     pub flags: u8,
     pub window: u16,
-    pub payload: Payload,
+    pub payload: P,
     pub mss: Option<u16>,
+}
+
+/// How an [`OutSegment`] refers to the payload it carries.
+pub trait SegmentPayload {
+    /// A segment without payload.
+    fn none() -> Self;
+    /// The payload `data`, which is (or is about to become) entry `index`
+    /// of the connection's retransmission queue.
+    fn of(data: &Payload, index: usize) -> Self;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Shares the payload bytes: the segment can outlive the queue entry.
+impl SegmentPayload for Payload {
+    fn none() -> Self {
+        Self::default()
+    }
+    fn of(data: &Payload, _index: usize) -> Self {
+        data.clone()
+    }
+    fn len(&self) -> usize {
+        Payload::len(self)
+    }
+}
+
+/// Names the retransmission queue entry holding a segment's payload,
+/// without sharing it: producing the segment touches no reference count.
+/// Good until the connection's next output poll or received segment;
+/// [`Tcb::queued_payload`] turns it back into the bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct QueuedPayload {
+    index: u32,
+    len: u32,
+}
+
+impl SegmentPayload for QueuedPayload {
+    fn none() -> Self {
+        Self { index: 0, len: 0 }
+    }
+    fn of(data: &Payload, index: usize) -> Self {
+        Self {
+            index: index as u32,
+            len: data.len() as u32,
+        }
+    }
+    fn len(&self) -> usize {
+        self.len as usize
+    }
 }
 
 /// Notable state transitions the engine/socket layer needs to react to
@@ -1026,17 +1082,37 @@ impl Tcb {
     /// Like [`Tcb::poll_output_into`], for a caller that queues the
     /// segments ahead of the port: at most `limit` segments, and each
     /// one's retransmission timer waits for [`Tcb::mark_transmitted`].
+    ///
+    /// The segments refer to their payloads in the retransmission queue
+    /// rather than sharing them; read each with [`Tcb::queued_payload`]
+    /// before doing anything else with the connection.
     pub(crate) fn poll_output_queued(
         &mut self,
         now: Instant,
-        out: &mut Vec<OutSegment>,
+        out: &mut Vec<OutSegment<QueuedPayload>>,
         limit: usize,
     ) {
         self.retransmit.hold_until_transmitted(true);
         self.poll_output_limited(now, out, limit);
     }
 
-    fn poll_output_limited(&mut self, now: Instant, out: &mut Vec<OutSegment>, limit: usize) {
+    /// The payload of a segment [`Tcb::poll_output_queued`] just produced.
+    pub(crate) fn queued_payload(&self, payload: &QueuedPayload) -> &Payload {
+        if payload.len == 0 {
+            return Payload::empty();
+        }
+        let data = &self.retransmit.segments[payload.index as usize].data;
+        // Sending the wrong bytes would be silent corruption.
+        assert_eq!(data.len(), payload.len as usize, "stale queued payload");
+        data
+    }
+
+    fn poll_output_limited<P: SegmentPayload>(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<OutSegment<P>>,
+        limit: usize,
+    ) {
         out.clear();
         if limit == 0 {
             return;
@@ -1047,7 +1123,7 @@ impl Tcb {
                 ResetOut::AtSndNxt => self.snd_nxt,
                 ResetOut::At(seq) => seq,
             };
-            out.push(self.make_segment(seq, flags::RST, Bytes::new(), None));
+            out.push(self.make_segment(seq, flags::RST, P::none(), None));
             return;
         }
 
@@ -1062,7 +1138,7 @@ impl Tcb {
             };
             self.retransmit
                 .push(self.iss, Bytes::new(), true, false, now);
-            out.push(self.make_segment(self.iss, seg_flags, Bytes::new(), Some(self.local_mss)));
+            out.push(self.make_segment(self.iss, seg_flags, P::none(), Some(self.local_mss)));
             return;
         }
 
@@ -1079,7 +1155,7 @@ impl Tcb {
             self.retransmit.split_front(usize::from(self.send_mss()));
             if let Some(seg) = self.retransmit.segments.front() {
                 let seq = seg.seq;
-                let data = seg.data.clone();
+                let data = P::of(&seg.data, 0);
                 let mut seg_flags = 0u8;
                 if seg.syn {
                     seg_flags |= flags::SYN;
@@ -1103,9 +1179,11 @@ impl Tcb {
             let cwnd = self.congestion.cwnd();
             let mut pipe = self.retransmit.pipe();
             while out.len() < limit && pipe < cwnd {
-                let Some((seq, data, fin)) = self.retransmit.take_lost(mss, now) else {
+                let Some(index) = self.retransmit.take_lost(mss, now) else {
                     break;
                 };
+                let seg = &self.retransmit.segments[index];
+                let (seq, data, fin) = (seg.seq, P::of(&seg.data, index), seg.fin);
                 #[cfg(feature = "tcp-metrics")]
                 crate::dpdk::metrics::record(|m| m.retransmits += 1);
                 pipe = pipe.saturating_add(data.len() as u32 + u32::from(fin));
@@ -1136,10 +1214,10 @@ impl Tcb {
             self.snd_nxt = self.snd_nxt + 1;
             self.retransmit.push(seq, Bytes::new(), false, true, now);
             self.state = self.state.on_fin_sent();
-            out.push(self.make_segment(seq, flags::FIN | flags::ACK, Bytes::new(), None));
+            out.push(self.make_segment(seq, flags::FIN | flags::ACK, P::none(), None));
         } else if (self.ack_pending && out.is_empty()) || (self.sack_pending && out.len() < limit) {
             self.ack_sent();
-            out.push(self.make_segment(self.snd_nxt, flags::ACK, Bytes::new(), None));
+            out.push(self.make_segment(self.snd_nxt, flags::ACK, P::none(), None));
         }
         // Any segment without payload carries the current SACK blocks.
         if out.last().is_some_and(|seg| seg.payload.is_empty()) {
@@ -1174,7 +1252,12 @@ impl Tcb {
         self.ack_delayed = None;
     }
 
-    fn send_new_data(&mut self, now: Instant, out: &mut Vec<OutSegment>, limit: usize) {
+    fn send_new_data<P: SegmentPayload>(
+        &mut self,
+        now: Instant,
+        out: &mut Vec<OutSegment<P>>,
+        limit: usize,
+    ) {
         if out.len() == limit {
             return;
         }
@@ -1186,7 +1269,10 @@ impl Tcb {
                 let data = self.send_buffer.take(1);
                 let seq = self.snd_nxt;
                 self.snd_nxt = self.snd_nxt + data.len() as u32;
-                self.retransmit.push(seq, data.clone(), false, false, now);
+                // The queue keeps the bytes; the segment refers to them.
+                let queued = P::of(&data, self.retransmit.segments.len());
+                self.retransmit.push(seq, data, false, false, now);
+                let data = queued;
                 self.persist = Persist::ProbeOutstanding;
                 out.push(self.make_segment(seq, flags::ACK | flags::PSH, data, None));
                 self.ack_sent();
@@ -1231,7 +1317,9 @@ impl Tcb {
             let data = self.send_buffer.take(chunk_len);
             let seq = self.snd_nxt;
             self.snd_nxt = self.snd_nxt + data.len() as u32;
-            self.retransmit.push(seq, data.clone(), false, false, now);
+            let queued = P::of(&data, self.retransmit.segments.len());
+            self.retransmit.push(seq, data, false, false, now);
+            let data = queued;
             // PSH only on the segment that empties the buffer. Receive
             // aggregation (this stack's GRO, Linux GRO, hardware LRO) stops
             // at a PSH, so setting it on every segment of a bulk write
@@ -1256,13 +1344,7 @@ impl Tcb {
         self.update_persist(now);
     }
 
-    fn make_segment(
-        &self,
-        seq: Seq,
-        flags: u8,
-        payload: impl Into<Payload>,
-        mss: Option<u16>,
-    ) -> OutSegment {
+    fn make_segment<P>(&self, seq: Seq, flags: u8, payload: P, mss: Option<u16>) -> OutSegment<P> {
         let free = self
             .receive_capacity()
             .saturating_sub(self.recv_buffer.readable_len() as u32);
@@ -1279,12 +1361,12 @@ impl Tcb {
             ack: self.rcv_nxt,
             flags,
             window,
-            payload: payload.into(),
+            payload,
             mss,
         }
     }
 
-    pub fn to_header(&self, seg: &OutSegment) -> TcpHeader {
+    pub fn to_header<P: SegmentPayload>(&self, seg: &OutSegment<P>) -> TcpHeader {
         TcpHeader {
             src_port: self.tuple.local_port,
             dst_port: self.tuple.remote_port,
@@ -1943,7 +2025,7 @@ mod tests {
             tcb.poll_output(now);
         }
         assert_eq!(
-            tcb.make_segment(tcb.snd_nxt, flags::ACK, Bytes::new(), None)
+            tcb.make_segment(tcb.snd_nxt, flags::ACK, Payload::default(), None)
                 .window,
             0
         );
@@ -2150,7 +2232,7 @@ mod tests {
         let now = Instant::now();
         let mut tcb = establish(now);
         tcb.send(Bytes::from(vec![0; 4096]));
-        let mut output = Vec::new();
+        let mut output: Vec<OutSegment> = Vec::new();
         tcb.poll_output_limited(now, &mut output, 0);
         assert!(output.is_empty());
         assert_eq!(tcb.send_buffer.len(), 4096);

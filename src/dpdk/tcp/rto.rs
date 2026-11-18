@@ -302,8 +302,8 @@ impl RetransmitQueue {
     }
 
     /// Takes the oldest lost segment for resending, at most `mss` bytes
-    /// of it: its sequence number, data, and whether it is the FIN.
-    pub fn take_lost(&mut self, mss: usize, now: Instant) -> Option<(Seq, Payload, bool)> {
+    /// of it, and returns its place in `segments`.
+    pub fn take_lost(&mut self, mss: usize, now: Instant) -> Option<usize> {
         let index = self.segments.iter().position(Self::awaits_resend)?;
         if self.segments[index].data.len() > mss {
             let boundary = self.segments[index].seq + mss as u32;
@@ -318,7 +318,7 @@ impl RetransmitQueue {
         if hold {
             seg.pending_transmit = true;
         }
-        Some((seg.seq, seg.data.clone(), seg.fin))
+        Some(index)
     }
 
     /// Chooses whether segments queued from now on wait for
