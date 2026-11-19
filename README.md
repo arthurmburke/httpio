@@ -28,8 +28,9 @@ IPv4 + TCP, no kernel network stack involved.
   partial segment (full-MSS segments still flow) until an explicit
   `flush()` -- a manual send trigger, like Linux `TCP_CORK`. `close()`
   and uncorking flush implicitly.
-- **HTTP client** (`src/http/`): HTTP/1.1 and HTTP/2 via hyper's
-  low-level `client::conn` API, HTTPS via rustls with the Mozilla
+- **HTTP client** (`src/http/`): HTTP/1.1 and HTTP/2 via the crate's own
+  owned-buffer codecs (`dpdk::http::h1`, `dpdk::http::h2`; hyper carries
+  only protocol upgrades), HTTPS via rustls with the Mozilla
   (webpki) roots plus custom CAs (`HttpClientBuilder::add_root_ca_pem`),
   protocol selected by ALPN. The API speaks the `http` crate's types:
   `http::Request<Bytes>` in, `http::Response<Bytes>` out (bodies are

@@ -10,7 +10,20 @@ use crate::core::spinlock::SpinLock;
 pub struct DmaBuffer {
     ptr: NonNull<u8>,
     len: usize,
+    source: Source,
 }
+
+/// Where a [`DmaBuffer`]'s memory came from, and so how it is freed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// EAL memory (`rte_zmalloc`): DMA-capable.
+    Eal,
+    /// The ordinary heap; see [`DmaWriter::on_heap`].
+    Heap,
+}
+
+/// Alignment of heap blocks, as for EAL ones: a cache line.
+const HEAP_ALIGN: usize = 64;
 // The allocation is uniquely owned; shared access only exposes immutable bytes.
 unsafe impl Send for DmaBuffer {}
 unsafe impl Sync for DmaBuffer {}
@@ -24,7 +37,26 @@ impl DmaBuffer {
         }
         let ptr =
             NonNull::new(unsafe { ffi::rte_zmalloc(std::ptr::null(), len, 64) }.cast::<u8>())?;
-        Some(Self { ptr, len })
+        Some(Self {
+            ptr,
+            len,
+            source: Source::Eal,
+        })
+    }
+    /// Allocates zero-initialized memory on the ordinary heap. Not
+    /// DMA-capable; for [`DmaWriter::on_heap`].
+    fn new_on_heap(len: usize) -> Option<Self> {
+        let layout = std::alloc::Layout::from_size_align(len, HEAP_ALIGN).ok()?;
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: the layout has a non-zero size.
+        let ptr = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })?;
+        Some(Self {
+            ptr,
+            len,
+            source: Source::Heap,
+        })
     }
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
@@ -41,7 +73,15 @@ impl AsRef<[u8]> for DmaBuffer {
 }
 impl Drop for DmaBuffer {
     fn drop(&mut self) {
-        unsafe { ffi::rte_free(self.ptr.as_ptr().cast()) }
+        match self.source {
+            Source::Eal => unsafe { ffi::rte_free(self.ptr.as_ptr().cast()) },
+            Source::Heap => {
+                let layout = std::alloc::Layout::from_size_align(self.len, HEAP_ALIGN)
+                    .expect("the layout it was allocated with");
+                // SAFETY: allocated by `new_on_heap` with this layout.
+                unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) }
+            }
+        }
     }
 }
 
@@ -69,6 +109,8 @@ pub struct DmaWriter {
     /// Blocks whose slices have all been dropped, pushed from whichever
     /// thread dropped the last one.
     spares: Arc<SpinLock<Vec<DmaBuffer>>>,
+    /// Where new blocks come from.
+    source: Source,
 }
 
 struct Block {
@@ -123,6 +165,21 @@ impl DmaWriter {
         Self {
             current: None,
             spares: Arc::new(crate::core::spinlock::SpinLock::new(Vec::new())),
+            source: Source::Eal,
+        }
+    }
+
+    /// A writer whose blocks are ordinary heap memory: the same block
+    /// reuse, for output the port copies into packets anyway (no TSO, so
+    /// nothing is attached). What it buys over a fresh buffer per write is
+    /// that a block is zeroed once, when allocated, and then only ever
+    /// overwritten -- a producer that needs initialised memory to write
+    /// into (TLS encryption) does not pay for zeroing it on every write.
+    /// Needs no EAL.
+    pub fn on_heap() -> Self {
+        Self {
+            source: Source::Heap,
+            ..Self::new()
         }
     }
 
@@ -304,7 +361,10 @@ impl DmaWriter {
                 // Nothing reusable is big enough: smaller spares would
                 // only cut the data into more pieces, so let them go.
                 self.spares.with(|spares| spares.clear());
-                DmaBuffer::new(size)?
+                match self.source {
+                    Source::Eal => DmaBuffer::new(size)?,
+                    Source::Heap => DmaBuffer::new_on_heap(size)?,
+                }
             }
         };
         let base = buffer.ptr;
@@ -317,5 +377,49 @@ impl DmaWriter {
             base,
             used: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Heap blocks need no EAL, are zeroed when allocated, and are reused
+    /// -- stale contents and all -- once every slice of them is dropped.
+    #[test]
+    fn heap_writer_reuses_blocks_without_zeroing_again() {
+        let mut writer = DmaWriter::on_heap();
+        let first = writer
+            .fill_prefix(MAX_BLOCK, |out| {
+                assert!(out.iter().all(|&b| b == 0));
+                out.fill(0xaa);
+                100
+            })
+            .unwrap();
+        assert_eq!(first.len(), 100);
+        assert!(first.iter().all(|&b| b == 0xaa));
+        let block = first.as_ptr();
+        // The block is full as far as the writer goes, and still in use:
+        // the next write gets another.
+        let second = writer
+            .fill_prefix(MAX_BLOCK, |out| {
+                assert!(out.iter().all(|&b| b == 0));
+                out[0] = 1;
+                1
+            })
+            .unwrap();
+        assert_ne!(second.as_ptr(), block);
+        drop(first);
+        drop(second);
+        // Both came back; whichever is handed out next still holds what
+        // was written to it.
+        let third = writer
+            .fill_prefix(MAX_BLOCK, |out| {
+                assert!(out[0] == 0xaa || out[0] == 1);
+                out.len()
+            })
+            .unwrap();
+        assert_eq!(third.len(), MAX_BLOCK);
+        assert!(writer.fill_prefix(MAX_BLOCK + 1, |_| 0).is_none());
     }
 }

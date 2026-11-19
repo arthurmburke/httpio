@@ -1,15 +1,15 @@
 //! The HTTP client: HTTPS via rustls (webpki roots + custom CAs, ALPN),
 //! HTTP/1.1 via the zero-copy codec in [`h1`] (plain and over TLS),
-//! HTTP/2 and protocol upgrades via hyper's low-level `client::conn` API,
-//! all over `TcpStream`.
+//! HTTP/2 via the multiplexing codec in [`h2`], and protocol upgrades via
+//! hyper's low-level `client::conn` API, all over `TcpStream`.
 //!
 //! The request/response API uses the `http` crate's types directly:
 //! `http::Request<Bytes>` in, `http::Response<Bytes>` out (the response
 //! body is collected to completion; this client does not stream bodies).
 //!
 //! Connection reuse: HTTP/2 connections are pooled per origin
-//! (host, port) and multiplexed -- hyper's h2 `SendRequest` is `Clone`,
-//! so any number of requests share one TCP+TLS connection until the
+//! (host, port) and multiplexed -- [`h2::SendRequest`] is `Clone`, so
+//! any number of requests share one TCP+TLS connection until the
 //! server closes it (there is no idle timeout on our side). HTTP/1.1 has
 //! no such multiplexing handle and stays connection-per-request.
 
@@ -19,14 +19,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use bytes::Bytes;
-use futures::StreamExt;
-use futures::future::ready;
 use http::request::Parts;
 use http::{HeaderValue, Method, Request, Response, Uri, Version, header};
-use http_body_util::{BodyExt, BodyStream, Full};
-use hyper::body::Incoming;
-use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use http_body_util::Full;
+use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
@@ -35,7 +31,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::core::hashmap::HashMap;
-use crate::dpdk::http::h1;
+use crate::dpdk::http::{h1, h2};
 use crate::dpdk::tcp::stream::{FlushHandle, TcpOptions, TcpStream};
 use crate::dpdk::tcp::worker::WorkerHandle;
 use crate::dpdk::tls::{TlsConnector, TlsStream};
@@ -47,7 +43,7 @@ use crate::http::errors::HttpError;
 /// reach the pool (they force h1), so transport options aren't part of
 /// the key.
 // Nested maps permit borrowed host lookups without constructing an origin key.
-type H2Pool = Arc<AsyncMutex<HashMap<String, HashMap<u16, http2::SendRequest<Full<Bytes>>>>>>;
+type H2Pool = Arc<AsyncMutex<HashMap<String, HashMap<u16, h2::SendRequest<TlsStream>>>>>;
 
 /// First port of the ephemeral range handed out by the client.
 const EPHEMERAL_FIRST: u16 = 49152;
@@ -57,18 +53,14 @@ const EPHEMERAL_LAST: u16 = 65535;
 /// 4-tuple already in use, before giving up with `Connect(AddrInUse)`.
 const DIAL_PORT_ATTEMPTS: usize = 64;
 
-/// A response body still on the wire: hyper's (h2) or the zero-copy
-/// HTTP/1.1 codec's (see [`h1`]), over plain TCP or over TLS. An h1 body
-/// owns its connection, so the connection lives exactly as long as the
-/// body is read.
+/// A response body still on the wire: the HTTP/2 codec's (see [`h2`]) or
+/// the HTTP/1.1 codec's (see [`h1`]), over plain TCP or over TLS. An h1
+/// body owns its connection, so the connection lives exactly as long as
+/// the body is read; an h2 body is one stream of a pooled connection.
 enum ResponseBody {
-    Hyper(Incoming),
+    H2(h2::Body<TlsStream>),
     H1(h1::Body<TcpStream>),
     H1Tls(h1::Body<TlsStream>),
-}
-
-fn hyper_body(response: Response<Incoming>) -> Response<ResponseBody> {
-    response.map(ResponseBody::Hyper)
 }
 
 /// Atomically takes the next port from `cursor`, wrapping from
@@ -275,54 +267,25 @@ impl Client {
                 self.send_buffered(Request::from_parts(parts, bytes))
                     .await?
             }
-            // A ByteStream body is sent chunk-by-chunk with chunked framing;
-            // streaming is HTTP/1.1-only (a stream can't ride the pooled
-            // Full<Bytes> h2 connections).
+            // A ByteStream body is sent chunk-by-chunk with chunked framing
+            // over HTTP/1.1, on a connection of its own.
             EncodedBody::Stream(stream) => self.send_stream(parts, stream).await?,
         };
 
+        // Each codec hands a `ByteStream` target the body unbuffered and
+        // collects and decodes anything else for its `Content-Type`.
         let (parts, body) = response.into_parts();
-        let incoming = match body {
-            ResponseBody::Hyper(incoming) => incoming,
+        match body {
+            ResponseBody::H2(body) => {
+                h2::into_typed_response(Response::from_parts(parts, body)).await
+            }
             ResponseBody::H1(body) => {
-                return h1::into_typed_response(Response::from_parts(parts, body)).await;
+                h1::into_typed_response(Response::from_parts(parts, body)).await
             }
             ResponseBody::H1Tls(body) => {
-                return h1::into_typed_response(Response::from_parts(parts, body)).await;
+                h1::into_typed_response(Response::from_parts(parts, body)).await
             }
-        };
-        // A ByteStream response target takes the body unbuffered: hand over
-        // the chunk stream without collecting. Data frames pass through as
-        // `Ok` chunks (trailer frames are skipped); a mid-body transport
-        // failure surfaces as one final `Err` item, after which the stream
-        // is fused shut -- so truncation is distinguishable from EOF.
-        if codec::is_stream::<R>() {
-            let chunks = BodyStream::new(incoming)
-                .filter_map(|frame| {
-                    ready(match frame {
-                        Ok(frame) => frame.into_data().ok().map(Ok),
-                        Err(_) => Some(Err(HttpError::Protocol)),
-                    })
-                })
-                .scan(false, |errored, item| {
-                    if *errored {
-                        return ready(None);
-                    }
-                    *errored = item.is_err();
-                    ready(Some(item))
-                });
-            let body =
-                codec::stream_response::<R, _>(chunks).expect("is_stream::<R>() checked above");
-            return Ok(Response::from_parts(parts, body));
         }
-
-        let body = incoming
-            .collect()
-            .await
-            .map_err(|_| HttpError::Protocol)?
-            .to_bytes();
-        let body = codec::decode(parts.headers.get(header::CONTENT_TYPE), body)?;
-        Ok(Response::from_parts(parts, body))
     }
 
     /// Sends a request whose body is already fully-buffered bytes and
@@ -370,7 +333,7 @@ impl Client {
 
             // Fast path: multiplex onto an existing h2 connection.
             if let Some(send_request) = self.pooled_h2(&host, port).await {
-                return send_h2_on(send_request, parts, body).await.map(hyper_body);
+                return send_h2_on(send_request, parts, body).await;
             }
 
             let tcp = self
@@ -386,7 +349,7 @@ impl Client {
                 .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
             let negotiated_h2 = tls.alpn_protocol() == Some(b"h2".as_slice());
             if negotiated_h2 {
-                let send_request = handshake_h2(tls).await?;
+                let send_request = handshake_h2(tls);
                 // Pool a clone; on a race where two tasks dialed the same
                 // origin concurrently, last-in wins and the loser's
                 // connection just serves its own request and then idles
@@ -397,7 +360,7 @@ impl Client {
                     .entry(host.into_owned())
                     .or_default()
                     .insert(port, send_request.clone());
-                send_h2_on(send_request, parts, body).await.map(hyper_body)
+                send_h2_on(send_request, parts, body).await
             } else {
                 send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port).await
             }
@@ -417,9 +380,8 @@ impl Client {
     /// stream yields (with chunked transfer-encoding, since the total
     /// length is unknown).
     ///
-    /// Streaming is HTTP/1.1-only: the h2 pool multiplexes `Full<Bytes>`
-    /// connections, which a stream can't join, so `https` dials through the
-    /// h1-only ALPN connector and is never pooled. Corking composes (both are
+    /// Streaming requests use HTTP/1.1: `https` dials through the h1-only
+    /// ALPN connector and is never pooled. Corking composes (both are
     /// h1 paths): the held tail is released by the caller's `FlushHandle`,
     /// exactly as for buffered requests.
     async fn send_stream(
@@ -545,13 +507,13 @@ impl Client {
     }
 
     /// Checks out a clone of the pooled h2 `SendRequest` for this origin
-    /// if the underlying connection is still alive and ready to accept a
-    /// new stream; evicts dead entries.
-    async fn pooled_h2(&self, host: &str, port: u16) -> Option<http2::SendRequest<Full<Bytes>>> {
+    /// if the underlying connection still takes new streams; evicts dead
+    /// entries.
+    async fn pooled_h2(&self, host: &str, port: u16) -> Option<h2::SendRequest<TlsStream>> {
         let mut pool = self.h2_pool.lock().await;
         let ports = pool.get_mut(host)?;
         let send_request = ports.get_mut(&port)?;
-        if send_request.is_closed() || send_request.ready().await.is_err() {
+        if send_request.is_closed() {
             ports.remove(&port);
             if ports.is_empty() {
                 pool.remove(host);
@@ -670,39 +632,28 @@ where
         .map_err(|_| HttpError::Protocol)
 }
 
-/// Performs the h2 connection preface/SETTINGS exchange and spawns the
-/// connection driver task. The returned `SendRequest` is the poolable,
-/// clonable multiplexing handle; the connection stays alive as long as
-/// the driver task runs (until GOAWAY or transport close).
-async fn handshake_h2<T>(io: T) -> Result<http2::SendRequest<Full<Bytes>>, HttpError>
-where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (send_request, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(io))
-        .await
-        .map_err(|_| HttpError::Protocol)?;
+/// Starts an HTTP/2 connection over `tls` and spawns its driver task. The
+/// returned `SendRequest` is the poolable, clonable multiplexing handle;
+/// the connection lives until the server ends it or every handle and
+/// response is gone. The connection preface leaves with the first request.
+fn handshake_h2(tls: TlsStream) -> h2::SendRequest<TlsStream> {
+    let (send_request, connection) = h2::handshake(tls);
     tokio::spawn(async move {
-        let _ = conn.await;
+        let _ = connection.await;
     });
-    Ok(send_request)
+    send_request
 }
 
-/// Sends one request as a new stream on an (owned clone of an) h2
-/// connection handle.
+/// Sends one request as a new stream on an h2 connection. HTTP/2 derives
+/// `:scheme`, `:authority` and `:path` from the absolute URI the caller
+/// supplied.
 async fn send_h2_on(
-    mut send_request: http2::SendRequest<Full<Bytes>>,
-    mut parts: Parts,
+    send_request: h2::SendRequest<TlsStream>,
+    parts: Parts,
     body: Bytes,
-) -> Result<Response<Incoming>, HttpError> {
-    // HTTP/2 derives :scheme/:authority/:path from the absolute URI the
-    // caller already supplied; just pin the version.
-    parts.version = Version::HTTP_2;
-    let request = Request::from_parts(parts, Full::new(body));
-
-    send_request
-        .send_request(request)
-        .await
-        .map_err(|_| HttpError::Protocol)
+) -> Result<Response<ResponseBody>, HttpError> {
+    let response = send_request.send(parts, EncodedBody::Full(body))?.await?;
+    Ok(response.map(ResponseBody::H2))
 }
 
 #[cfg(test)]

@@ -91,6 +91,36 @@ pub trait Transport {
 
     /// Receives the next chunk. `Ok(None)` is a clean end of input.
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Self::Recv>>>;
+
+    /// Sends the buffers in `queue`, front first, removing each once all
+    /// of it has been taken; `Ready(Ok)` when the queue is empty. On
+    /// `Pending` the queue holds what is still to send, the front buffer
+    /// cut down to its unsent suffix.
+    ///
+    /// For a codec that has several buffers ready at once (a frame header
+    /// and the payload behind it). A transport that does work per call
+    /// rather than per byte, as TLS does, overrides this to take them
+    /// together.
+    fn poll_send_queue(
+        &mut self,
+        cx: &mut Context<'_>,
+        queue: &mut VecDeque<Bytes>,
+    ) -> Poll<io::Result<()>> {
+        while let Some(front) = queue.pop_front() {
+            let mut slot = Some(front);
+            match self.poll_send(cx, &mut slot) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {
+                    if let Some(rest) = slot {
+                        queue.push_front(rest);
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
 }
 
 impl Transport for TcpStream {
@@ -125,6 +155,14 @@ impl Transport for TlsStream {
 
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Bytes>>> {
         TlsStream::poll_recv(self, cx)
+    }
+
+    fn poll_send_queue(
+        &mut self,
+        cx: &mut Context<'_>,
+        queue: &mut VecDeque<Bytes>,
+    ) -> Poll<io::Result<()>> {
+        TlsStream::poll_send_queue(self, cx, queue)
     }
 }
 
@@ -449,7 +487,7 @@ where
 
 /// Methods whose semantics anticipate a body, so an empty one is still
 /// announced with `Content-Length: 0`.
-fn anticipates_body(method: &Method) -> bool {
+pub(super) fn anticipates_body(method: &Method) -> bool {
     !matches!(
         *method,
         Method::GET
@@ -741,7 +779,7 @@ fn transfer_coding(headers: &HeaderMap) -> TransferCoding {
 /// are accepted only when every value is the same valid decimal number
 /// (RFC 9110 §8.6); anything else is an error rather than a guess, since a
 /// wrong length desynchronises the framing.
-fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
+pub(super) fn content_length(headers: &HeaderMap) -> Result<Option<u64>, ()> {
     let mut length = None;
     for value in headers.get_all(header::CONTENT_LENGTH) {
         for token in value.as_bytes().split(|&b| b == b',') {

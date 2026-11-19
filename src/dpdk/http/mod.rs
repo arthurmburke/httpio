@@ -1,5 +1,6 @@
-//! An HTTP/1.1 + HTTP/2 client (hyper + rustls) that uses the DPDK TCP
-//! stack as its transport instead of the kernel's sockets.
+//! An HTTP/1.1 + HTTP/2 client (the codecs in [`h1`] and [`h2`], rustls
+//! for TLS, hyper for protocol upgrades) that uses the DPDK TCP stack as
+//! its transport instead of the kernel's sockets.
 //!
 //! Integration model: the TCP engine runs on a dedicated worker lcore
 //! (see `crate::tcp::worker`). The async transport adapter (`TcpStream`)
@@ -16,6 +17,7 @@
 
 pub mod client;
 pub mod h1;
+pub mod h2;
 pub mod recv_buf;
 pub mod websocket;
 

@@ -320,43 +320,47 @@ impl Incoming {
     }
 }
 
-/// Where outgoing TLS bytes are written: DMA memory the stack attaches to
-/// packets as is, or the heap on ports (and in tests) without it.
-enum OutAlloc {
-    Dma(DmaWriter),
-    /// Reused: once the `Bytes` split off it are dropped (sent and
-    /// acknowledged), `reserve` reclaims the allocation.
-    Heap(BytesMut),
+/// Where outgoing TLS bytes are written: blocks of DMA memory the stack
+/// attaches to packets as is, or of heap memory on ports (and in tests)
+/// without that. Either way the blocks are reused once the data in them
+/// has been acknowledged, and are zeroed only when first allocated:
+/// rustls needs initialised memory to encrypt into, and zeroing the
+/// output afresh for every write costs more than the encryption of a
+/// small record.
+struct OutAlloc {
+    writer: DmaWriter,
 }
 
 impl OutAlloc {
+    fn new(dma: bool) -> Self {
+        Self {
+            writer: if dma {
+                DmaWriter::new()
+            } else {
+                DmaWriter::on_heap()
+            },
+        }
+    }
+
     /// Lends `len` writable bytes to `fill`, which writes a prefix and
     /// returns its length; that prefix comes back as `Bytes`.
     fn fill(&mut self, len: usize, fill: impl FnOnce(&mut [u8]) -> usize) -> Bytes {
         let mut fill = Some(fill);
-        if let OutAlloc::Dma(writer) = self
-            && let Some(bytes) = writer.fill_prefix(len, |out| fill.take().map_or(0, |f| f(out)))
+        if let Some(bytes) = self
+            .writer
+            .fill_prefix(len, |out| fill.take().map_or(0, |f| f(out)))
         {
             return bytes;
         }
-        // Not DMA, or no DMA memory (or `len` beyond a DMA block): heap.
-        // `fill_prefix` did not call `fill` in that case.
+        // No block to be had (out of DMA memory, or `len` beyond a block):
+        // a buffer of its own. `fill_prefix` did not call `fill`.
         let Some(fill) = fill else {
             return Bytes::new();
         };
-        let mut scratch;
-        let heap = match self {
-            OutAlloc::Heap(heap) => heap,
-            OutAlloc::Dma(_) => {
-                scratch = BytesMut::new();
-                &mut scratch
-            }
-        };
-        heap.clear();
-        heap.resize(len, 0);
-        let n = fill(&mut heap[..]).min(len);
-        heap.truncate(n);
-        heap.split().freeze()
+        let mut scratch = vec![0; len];
+        let n = fill(&mut scratch).min(len);
+        scratch.truncate(n);
+        Bytes::from(scratch)
     }
 }
 
@@ -384,11 +388,7 @@ pub struct TlsStream {
 
 impl TlsStream {
     fn new(tcp: TcpStream, conn: UnbufferedClientConnection) -> Self {
-        let out = if tcp.dma_writes() {
-            OutAlloc::Dma(DmaWriter::new())
-        } else {
-            OutAlloc::Heap(BytesMut::new())
-        };
+        let out = OutAlloc::new(tcp.dma_writes());
         Self {
             tcp,
             conn,
@@ -447,6 +447,50 @@ impl TlsStream {
             }
             let n = ready!(self.poll_encrypt(cx, &[IoSlice::new(bytes)]))?;
             bytes.advance(n);
+        }
+    }
+
+    /// [`poll_send`](Self::poll_send) for several buffers at once: encrypts
+    /// the buffers in `queue`, front first, in as few passes over the
+    /// connection as their sizes allow, and removes each from the queue
+    /// once all of it is encrypted. Small buffers next to each other share
+    /// a record (see [`COALESCE_BELOW`]), and all the records of one pass
+    /// share an output buffer, where one `poll_send` per buffer would give
+    /// each its own. `Ready(Ok)` once the queue is empty and the records
+    /// are with TCP; on `Pending` the queue holds what is not yet
+    /// encrypted.
+    pub fn poll_send_queue(
+        &mut self,
+        cx: &mut Context<'_>,
+        queue: &mut VecDeque<Bytes>,
+    ) -> Poll<io::Result<()>> {
+        /// Buffers offered to one encryption pass.
+        const BATCH: usize = 16;
+        loop {
+            while queue.front().is_some_and(Bytes::is_empty) {
+                queue.pop_front();
+            }
+            if queue.is_empty() {
+                return self.poll_flush_tx(cx);
+            }
+            let mut slices = [IoSlice::new(&[]); BATCH];
+            let mut count = 0;
+            for (slot, bytes) in slices.iter_mut().zip(queue.iter()) {
+                *slot = IoSlice::new(bytes);
+                count += 1;
+            }
+            let mut taken = ready!(self.poll_encrypt(cx, &slices[..count]))?;
+            while taken > 0 {
+                let front = queue
+                    .front_mut()
+                    .expect("encrypted bytes came from the queue");
+                if taken < front.len() {
+                    front.advance(taken);
+                    break;
+                }
+                taken -= front.len();
+                queue.pop_front();
+            }
         }
     }
 
@@ -1404,6 +1448,51 @@ mod tests {
         });
     }
 
+    /// A queue of buffers is encrypted in one pass: small neighbours
+    /// share a record and everything shares one output buffer.
+    #[test]
+    fn queued_buffers_are_encrypted_together() {
+        run(async {
+            let (mut client, mut server) = established(client_config(&[]), tls13(), &[1448]).await;
+            let before = server.get_ref().0.sends.len();
+            let parts = [
+                pattern(40, 1),
+                pattern(9, 2),
+                pattern(20_000, 3),
+                Vec::new(),
+                pattern(9, 4),
+                pattern(5_000, 5),
+            ];
+            let mut queue: VecDeque<Bytes> = parts.iter().cloned().map(Bytes::from).collect();
+            poll_fn(|cx| client.poll_send_queue(cx, &mut queue))
+                .await
+                .unwrap();
+            assert!(queue.is_empty());
+            let expected = parts.concat();
+            let mut got = vec![0; expected.len()];
+            server.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, expected);
+            let sends = &server.get_ref().0.sends[before..];
+            assert_eq!(sends.len(), 1, "one output buffer: {sends:?}");
+            // Records: 40+9 together, 20,000 in two, 9, 5,000.
+            assert!(sends[0] <= expected.len() + 5 * RECORD_OVERHEAD);
+
+            // More buffers than one pass takes.
+            let mut queue: VecDeque<Bytes> =
+                (0..100u8).map(|i| Bytes::from(pattern(2_000, i))).collect();
+            let expected: Vec<u8> = queue.iter().flat_map(|b| b.to_vec()).collect();
+            let writer = poll_fn(|cx| client.poll_send_queue(cx, &mut queue));
+            let reader = async {
+                let mut got = vec![0; expected.len()];
+                server.read_exact(&mut got).await.unwrap();
+                got
+            };
+            let (sent, got) = tokio::join!(writer, reader);
+            sent.unwrap();
+            assert_eq!(got, expected);
+        });
+    }
+
     #[test]
     fn backpressure_keeps_encrypted_bytes_without_reencrypting() {
         run(async {
@@ -1747,6 +1836,54 @@ mod tests {
                 // cleanly once the response is out.
                 server.await.unwrap();
             }
+        });
+    }
+
+    /// The HTTP/2 codec over this stream's owned-`Bytes` face, against a
+    /// real HTTP/2 server: concurrent streams on one connection, with
+    /// records cut at awkward segment boundaries.
+    #[test]
+    fn h2_codec_end_to_end() {
+        use crate::dpdk::http::h2;
+        use crate::http::codec::EncodedBody;
+
+        run(async {
+            let server = server_config(&[&rustls::version::TLS13], &[b"h2", b"http/1.1"]);
+            let (client, server) = established(
+                client_config(&[b"h2", b"http/1.1"]),
+                server,
+                &[1448, 3, 9000],
+            )
+            .await;
+            assert_eq!(client.alpn_protocol(), Some(b"h2".as_slice()));
+            let server = tokio::spawn(serve(server, true));
+            let (sender, conn) = h2::handshake(client);
+            let conn = tokio::spawn(conn);
+            let mut requests = Vec::new();
+            for (i, len) in [0usize, 40_000, 3, 200_000].into_iter().enumerate() {
+                let sender = sender.clone();
+                requests.push(tokio::spawn(async move {
+                    for round in 0..3 {
+                        let path = format!("/r{i}-{round}");
+                        let parts = hyper::Request::post(format!("https://test.local{path}"))
+                            .body(())
+                            .unwrap()
+                            .into_parts()
+                            .0;
+                        let body = EncodedBody::Full(Bytes::from(pattern(len, 7)));
+                        let response = sender.send(parts, body).unwrap().await.unwrap();
+                        assert_eq!(response.status(), 200);
+                        let body = response.into_body().collect().await.unwrap();
+                        assert_eq!(&body[..], &expected_reply(&path, len)[..]);
+                    }
+                }));
+            }
+            for request in requests {
+                request.await.unwrap();
+            }
+            drop(sender);
+            conn.await.unwrap().unwrap();
+            server.await.unwrap();
         });
     }
 
