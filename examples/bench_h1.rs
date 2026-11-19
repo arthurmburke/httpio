@@ -257,10 +257,17 @@ fn dpdk_run(args: &[String]) {
     .unwrap();
     engine.set_tx_budget(tx_budget.try_into().unwrap());
     eprintln!("tx_budget={tx_budget} tx_burst={tx_burst}");
+    // BENCH_SHARED_POOL=1 sends from the receive pool, as before the
+    // transmit pool existed, for comparison.
+    let tx_pool = if setting("BENCH_SHARED_POOL", 0) == 1 {
+        pool
+    } else {
+        Mempool::create_for_transmit("bench_h1_tx", 1024, -1).unwrap()
+    };
     let (worker, join) = WorkerHandle::spawn(
         engine,
         port,
-        pool,
+        tx_pool,
         dpdk::first_worker_lcore().expect("two lcores required"),
     )
     .unwrap();

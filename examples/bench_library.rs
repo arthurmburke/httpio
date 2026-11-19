@@ -157,12 +157,19 @@ fn dpdk(_: &[String]) {
 /// the receiver single-segment packets whose checksums it reports as
 /// verified. Checksums are never computed; the receiver trusts the flags,
 /// as it does with a real device. This is harness cost, not library cost.
+///
+/// With `release`, it also does what a device does with every packet it
+/// sends: puts the bytes on the wire (here, into a fresh mbuf from `pool`
+/// for the receiver) and frees the sender's mbuf at once. Without it a
+/// single-segment packet's own mbuf travels on to the receiver, and stays
+/// out of the sender's pool until the receiving application is done with it.
 #[cfg(dpdk)]
 fn emulated_nic(
     packet: httpio::dpdk::Mbuf,
     pool: &httpio::dpdk::Mempool,
     scratch: &mut Vec<u8>,
     out: &mut std::collections::VecDeque<httpio::dpdk::Mbuf>,
+    release: bool,
 ) {
     use httpio::dpdk::{Mbuf, ffi};
     const GOOD: u64 =
@@ -177,6 +184,16 @@ fn emulated_nic(
         )
     };
     if segments == 1 && flags & ffi::RTE_MBUF_F_TX_TCP_SEG == 0 {
+        if release {
+            let frame = packet.data();
+            let mut wire = Mbuf::alloc(pool).expect("harness pool exhausted");
+            wire.append(frame.len() as u16)
+                .unwrap()
+                .copy_from_slice(frame);
+            unsafe { (*wire.as_raw()).ol_flags = GOOD };
+            out.push_back(wire);
+            return;
+        }
         let tx =
             ffi::RTE_MBUF_F_TX_IPV4 | ffi::RTE_MBUF_F_TX_IP_CKSUM | ffi::RTE_MBUF_F_TX_TCP_CKSUM;
         unsafe { (*raw).ol_flags = (flags & !tx) | GOOD };
@@ -246,6 +263,27 @@ fn dpdk(args: &[String]) {
             other => panic!("BENCH_LIBRARY_OFFLOAD: unknown mode {other:?}"),
         };
         let tso = offload == "tso";
+        // BENCH_LIBRARY_TX_POOL=shared|separate makes the emulated NIC
+        // release each sent mbuf as a device does (see `emulated_nic`),
+        // with the engines building packets from the pool they receive
+        // into, or from a transmit pool each.
+        let tx_pool_mode = std::env::var("BENCH_LIBRARY_TX_POOL").unwrap_or_default();
+        let release = match tx_pool_mode.as_str() {
+            "" => false,
+            "shared" | "separate" => true,
+            other => panic!("BENCH_LIBRARY_TX_POOL: unknown mode {other:?}"),
+        };
+        assert!(!release || emulate, "BENCH_LIBRARY_TX_POOL needs BENCH_LIBRARY_OFFLOAD");
+        let tx_pools = (tx_pool_mode == "separate").then(|| {
+            [
+                Mempool::create_for_transmit("library-bench-tx-a", 1024, -1).unwrap(),
+                Mempool::create_for_transmit("library-bench-tx-b", 1024, -1).unwrap(),
+            ]
+        });
+        let (a_pool, b_pool) = match &tx_pools {
+            Some([a, b]) => (a, b),
+            None => (&pool, &pool),
+        };
         for port in [&mut a_port, &mut b_port] {
             let mut offloads = port.offloads();
             assert_eq!(offloads.tso_max_payload, 0, "expected a software device");
@@ -307,7 +345,7 @@ fn dpdk(args: &[String]) {
                 let before = wire.len();
                 if emulate {
                     for packet in from.rx_packets(64) {
-                        emulated_nic(packet, &pool, &mut scratch, wire);
+                        emulated_nic(packet, &pool, &mut scratch, wire, release);
                     }
                 } else {
                     wire.extend(from.rx_packets(64));
@@ -377,9 +415,9 @@ fn dpdk(args: &[String]) {
             let mut accepted = None;
             let start = Instant::now();
             while accepted.is_none() || a.state(a_tuple) != Some(TcpState::Established) {
-                a.poll_into(&a_port, &pool, Instant::now(), &mut a_events);
+                a.poll_into(&a_port, a_pool, Instant::now(), &mut a_events);
                 forward(&a_port, &b_port, &mut a_to_b, &mut a_due, true);
-                b.poll_into(&b_port, &pool, Instant::now(), &mut b_events);
+                b.poll_into(&b_port, b_pool, Instant::now(), &mut b_events);
                 forward(&b_port, &a_port, &mut b_to_a, &mut b_due, false);
                 if accepted.is_none() {
                     accepted = b.accept(80);
@@ -412,13 +450,13 @@ fn dpdk(args: &[String]) {
                 let start = Instant::now();
                 loop {
                     timed(breakdown, &mut parts.tx_ns, || {
-                        a.poll_into(&a_port, &pool, Instant::now(), &mut a_events)
+                        a.poll_into(&a_port, a_pool, Instant::now(), &mut a_events)
                     });
                     timed(breakdown, &mut parts.forward_ns, || {
                         forward(&a_port, &b_port, &mut a_to_b, &mut a_due, true)
                     });
                     timed(breakdown, &mut parts.rx_ns, || {
-                        b.poll_into(&b_port, &pool, Instant::now(), &mut b_events)
+                        b.poll_into(&b_port, b_pool, Instant::now(), &mut b_events)
                     });
                     timed(breakdown, &mut parts.forward_ns, || {
                         forward(&b_port, &a_port, &mut b_to_a, &mut b_due, false)

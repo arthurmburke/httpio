@@ -121,7 +121,10 @@ mod dpdk_app {
             ..app.engine
         });
 
-        let (worker, worker_join) = match WorkerHandle::spawn(engine, port, pool, worker_lcore) {
+        // Outgoing packets come from a pool of their own, which stays warm.
+        let tx_pool = Mempool::create_for_transmit("ws_tx_pool", NB_TX_DESC, socket_id as i32)
+            .expect("failed to create transmit mbuf pool");
+        let (worker, worker_join) = match WorkerHandle::spawn(engine, port, tx_pool, worker_lcore) {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("error: {e}");

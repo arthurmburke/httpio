@@ -11,6 +11,9 @@ use super::ffi;
 /// frame plus headroom for prepending headers.
 pub const DEFAULT_MBUF_DATA_ROOM_SIZE: u16 = 2048 + 128;
 
+/// Largest per-lcore cache a pool can have (`RTE_MEMPOOL_CACHE_MAX_SIZE`).
+pub const MAX_CACHE_SIZE: u32 = 512;
+
 pub struct Mempool {
     raw: *mut ffi::rte_mempool,
     data_room_size: u16,
@@ -62,6 +65,44 @@ impl Mempool {
             raw,
             data_room_size,
         })
+    }
+
+    /// Creates the pool one worker builds its outgoing packets from, for a
+    /// queue with `tx_descriptors` transmit descriptors.
+    ///
+    /// Give a worker a pool of its own for this rather than the one its
+    /// queue receives into. A pool's per-lcore cache hands back the mbuf
+    /// freed last, which is still in the CPU's cache; but mbufs freed by
+    /// other threads, or more of them than the per-lcore cache holds, come
+    /// back through the pool's ring, oldest first. Received data is held
+    /// for as long as the application keeps it and freed on its threads,
+    /// so a pool that receives is always cycling through all of its mbufs,
+    /// and a packet built from it is written into memory the CPU has not
+    /// touched for a long time. Outgoing packets, by contrast, are freed
+    /// by the driver on the worker's own lcore as soon as they are sent:
+    /// kept apart, the same few stay in circulation, and stay warm.
+    ///
+    /// The pool holds four mbufs per descriptor (at least 4095): what the
+    /// device has not yet released, the engine's own batch, and the extra
+    /// mbuf each attached (not copied) payload needs. If it does run dry
+    /// the engine holds packets back until mbufs return.
+    pub fn create_for_transmit(
+        name: &str,
+        tx_descriptors: u16,
+        socket_id: i32,
+    ) -> Result<Self, MempoolCreateError> {
+        // A power of two minus one is the size DPDK's ring stores exactly.
+        let mbufs = (4 * u32::from(tx_descriptors))
+            .max(4096)
+            .next_power_of_two()
+            - 1;
+        Self::create(
+            name,
+            mbufs,
+            MAX_CACHE_SIZE,
+            DEFAULT_MBUF_DATA_ROOM_SIZE,
+            socket_id,
+        )
     }
 
     pub fn as_raw(&self) -> *mut ffi::rte_mempool {

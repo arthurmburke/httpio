@@ -89,7 +89,7 @@ type Configure = Box<dyn FnMut(&mut TcpEngine)>;
 
 impl StackBuilder {
     /// The worker lcores: one worker, with its own receive queue, engine
-    /// and mbuf pool, on each. Choose lcores on the device's NUMA socket
+    /// and mbuf pools, on each. Choose lcores on the device's NUMA socket
     /// ([`EthPort::socket`]); the pools are allocated there. Without this
     /// call the stack runs one worker on the first worker lcore.
     pub fn lcores(mut self, lcores: &[u32]) -> Self {
@@ -115,8 +115,10 @@ impl StackBuilder {
         self
     }
 
-    /// Mbufs in each worker's pool. A worker's pool holds what it has
-    /// received and not yet handed over or freed, and what it is sending.
+    /// Mbufs in each worker's receive pool: what its queue has received
+    /// and the application has not yet freed. What a worker sends comes
+    /// from a second pool, sized from the transmit descriptors (see
+    /// [`Mempool::create_for_transmit`]).
     pub fn pool_mbufs(mut self, mbufs: u32) -> Self {
         self.pool_mbufs = mbufs;
         self
@@ -159,6 +161,16 @@ impl StackBuilder {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(StackError::Pool)?;
+        let tx_pools = (0..self.lcores.len())
+            .map(|queue| {
+                Mempool::create_for_transmit(
+                    &format!("tcp-p{}-q{queue}-tx", self.port_id),
+                    self.tx_descriptors,
+                    socket,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StackError::Pool)?;
         let queues = EthPort::init_queues(
             self.port_id,
             &pools.iter().collect::<Vec<_>>(),
@@ -176,7 +188,9 @@ impl StackBuilder {
         };
         let workers = queues
             .into_iter()
-            .zip(pools)
+            // The queues keep receiving into `pools`; the workers build
+            // what they send from `tx_pools`.
+            .zip(tx_pools)
             .zip(&self.lcores)
             .map(|((queue, pool), &lcore)| {
                 let mut engine = TcpEngine::new(config);

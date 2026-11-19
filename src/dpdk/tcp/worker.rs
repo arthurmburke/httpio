@@ -657,6 +657,10 @@ impl WorkerHandle {
     /// Launches the engine loop on `worker_lcore` and returns the app-side
     /// handle plus the lcore join handle. The engine/port/pool are moved to
     /// the worker lcore and owned there for the loop's lifetime.
+    ///
+    /// `pool` is what the worker builds outgoing packets from. It may be
+    /// the pool the port receives into, but a separate one keeps those
+    /// packets in warm memory: see [`Mempool::create_for_transmit`].
     pub fn spawn(
         engine: TcpEngine,
         port: EthPort,

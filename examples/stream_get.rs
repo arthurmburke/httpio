@@ -80,8 +80,10 @@ mod dpdk_app {
             local_ip,
             gateway: None,
         });
+        let tx_pool = Mempool::create_for_transmit("stream_tx_pool", 1024, socket_id as i32)
+            .expect("failed to create transmit mbuf pool");
         let (worker, worker_join) =
-            WorkerHandle::spawn(engine, port, pool, worker_lcore).expect("worker spawn failed");
+            WorkerHandle::spawn(engine, port, tx_pool, worker_lcore).expect("worker spawn failed");
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
