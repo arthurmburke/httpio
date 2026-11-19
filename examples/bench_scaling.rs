@@ -21,6 +21,20 @@
 //! `BENCH_SCALING_SECONDS` (3), `BENCH_SCALING_CONNECTIONS` per worker (1),
 //! `BENCH_SCALING_CHUNK` bytes per write (65536), and
 //! `BENCH_SEND_CAPACITY` / `BENCH_SEND_MAX_CAPACITY` set the run.
+//!
+//! `BENCH_SCALING_MODE` picks what crosses between the application and the
+//! workers: `upload` (the default) writes to a peer that discards;
+//! `download` reads from a peer that sends as fast as it is allowed;
+//! `echo` writes one chunk and reads it back, over and over, and reports
+//! the round-trip time as well. `echo-raw` is that with no application
+//! thread: one engine echoing from its own lcore, which is what the
+//! round trip costs before anything crosses to an application.
+//!
+//! `BENCH_SCALING_READ_DELAY_US=N` makes a `download` reader take N
+//! microseconds over each chunk, so the worker's ring to it stays full.
+//!
+//! `BENCH_SCALING_REGISTER=1` registers each application thread with EAL,
+//! which gives it a mempool cache to free received mbufs into.
 
 #[cfg(not(dpdk))]
 fn main() {
@@ -69,6 +83,53 @@ mod imp {
     const SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 99, 0, 2);
     const POOL_MBUFS: u32 = 8191;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Upload,
+        Download,
+        Echo,
+        EchoRaw,
+    }
+
+    /// `echo` without a worker or an application: the engine itself sends
+    /// a chunk and waits for it to come back, on the worker's lcore.
+    fn raw_echo(
+        mut engine: TcpEngine,
+        port: EthPort,
+        pool: Mempool,
+        chunk: usize,
+        trips: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+    ) {
+        use httpio::core::time::Instant;
+        let payload = Bytes::from(vec![0x5a; chunk]);
+        let tuple = engine.connect(SERVER_IP, 80, 49152).unwrap();
+        engine.set_nodelay(tuple, true);
+        let mut events = Vec::new();
+        let mut pending = None;
+        while !stop.load(Ordering::Relaxed) {
+            engine.poll_into(&port, &pool, Instant::now(), &mut events);
+            if engine.state(tuple) != Some(httpio::dpdk::tcp::state::TcpState::Established) {
+                continue;
+            }
+            let read = pending.get_or_insert_with(|| {
+                engine.send(tuple, payload.clone());
+                0
+            });
+            loop {
+                let data = engine.recv(tuple, usize::MAX);
+                if data.is_empty() {
+                    break;
+                }
+                *read += data.len();
+            }
+            if *read >= chunk {
+                pending = None;
+                trips.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn setting(name: &str, default: usize) -> usize {
         std::env::var(name).map_or(default, |v| v.parse().unwrap())
     }
@@ -109,9 +170,21 @@ mod imp {
         .unwrap()
     }
 
-    /// One worker's counterpart: accepts whatever connects and discards
-    /// what arrives, counting it.
-    fn sink(port: EthPort, pool: Mempool, received: Arc<AtomicU64>, stop: Arc<AtomicBool>) {
+    /// One worker's counterpart. It accepts whatever connects, and then:
+    /// discards what arrives, counting it (upload); keeps each connection
+    /// supplied with data to send (download); or sends back what arrives
+    /// (echo).
+    fn sink(
+        port: EthPort,
+        pool: Mempool,
+        received: Arc<AtomicU64>,
+        stop: Arc<AtomicBool>,
+        mode: Mode,
+        chunk: usize,
+    ) {
+        // What a download connection may have queued and unacknowledged.
+        const BACKLOG: usize = 1024 * 1024;
+        let payload = Bytes::from(vec![0x5a; chunk]);
         let mut engine = TcpEngine::new(EngineConfig {
             local_ip: SERVER_IP,
             local_mac: port.mac_addr().unwrap(),
@@ -127,15 +200,27 @@ mod imp {
                 httpio::core::time::Instant::now(),
                 &mut events,
             );
-            connections.extend(std::iter::from_fn(|| engine.accept(80)));
+            while let Some(connection) = engine.accept(80) {
+                engine.set_nodelay(connection, true);
+                connections.push(connection);
+            }
             let mut bytes = 0;
             for &connection in &connections {
+                if mode == Mode::Download {
+                    while engine.buffered_send_bytes(connection) < BACKLOG {
+                        engine.send(connection, payload.clone());
+                    }
+                    continue;
+                }
                 loop {
                     let data = engine.recv(connection, usize::MAX);
                     if data.is_empty() {
                         break;
                     }
                     bytes += data.len() as u64;
+                    if mode == Mode::Echo || mode == Mode::EchoRaw {
+                        engine.send(connection, Bytes::copy_from_slice(&data));
+                    }
                 }
             }
             if bytes != 0 {
@@ -149,6 +234,13 @@ mod imp {
         let seconds = setting("BENCH_SCALING_SECONDS", 3);
         let per_worker = setting("BENCH_SCALING_CONNECTIONS", 1);
         let chunk = setting("BENCH_SCALING_CHUNK", 64 * 1024);
+        let mode = match std::env::var("BENCH_SCALING_MODE").as_deref() {
+            Err(_) | Ok("upload") => Mode::Upload,
+            Ok("download") => Mode::Download,
+            Ok("echo") => Mode::Echo,
+            Ok("echo-raw") => Mode::EchoRaw,
+            Ok(other) => panic!("BENCH_SCALING_MODE: unknown mode {other:?}"),
+        };
         let send_config = SendConfig {
             capacity: setting("BENCH_SEND_CAPACITY", SEND_CAPACITY)
                 .try_into()
@@ -190,7 +282,12 @@ mod imp {
             received.push(count.clone());
             let stop = stop.clone();
             sink_joins
-                .push(dpdk::launch(sink_lcores[q], move || sink(port, pool, count, stop)).unwrap());
+                .push(
+                    dpdk::launch(sink_lcores[q], move || {
+                        sink(port, pool, count, stop, mode, chunk)
+                    })
+                    .unwrap(),
+                );
         }
 
         let pools: Vec<_> = (0..workers).map(|q| pool(format!("worker{q}"))).collect();
@@ -216,6 +313,29 @@ mod imp {
             .zip(worker_lcores)
             .map(|((queue, pool), &lcore)| (TcpEngine::new(config), queue, pool, lcore))
             .collect();
+        if mode == Mode::EchoRaw {
+            assert_eq!(workers, 1, "echo-raw runs one engine");
+            let mut stack: Vec<_> = stack;
+            let (engine, port, pool, lcore) = stack.pop().unwrap();
+            let trips = Arc::new(AtomicU64::new(0));
+            let (count, stop) = (trips.clone(), stop.clone());
+            let _join =
+                dpdk::launch(lcore, move || raw_echo(engine, port, pool, chunk, count, stop))
+                    .unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+            let before = trips.load(Ordering::Relaxed);
+            let measured = Instant::now();
+            std::thread::sleep(Duration::from_secs(seconds as u64));
+            let done = trips.load(Ordering::Relaxed) - before;
+            let elapsed = measured.elapsed().as_secs_f64();
+            println!("workers\tconnections\tchunk\tround_trips_s\tmean_round_trip_us");
+            println!(
+                "1\t1\t{chunk}\t{:.0}\t{:.3}",
+                done as f64 / elapsed,
+                elapsed * 1e6 / done as f64
+            );
+            std::process::exit(0);
+        }
         let (handle, worker_joins) = WorkerHandle::spawn_all(stack).unwrap();
         let handle = handle.with_send_config(send_config);
         assert_eq!(handle.workers(), workers);
@@ -241,9 +361,15 @@ mod imp {
             spare_cpus.len()
         );
         let connected = Arc::new(AtomicU64::new(0));
+        // What each application thread has read (bytes) or completed
+        // (echo round trips): one counter per thread, so none is shared.
+        let app_counts: Vec<_> = (0..connections)
+            .map(|_| Arc::new(AtomicU64::new(0)))
+            .collect();
         let apps: Vec<_> = (0..connections)
             .map(|i| {
                 let handle = handle.clone();
+                let count = app_counts[i].clone();
                 // Each writer its own buffer: clones of one shared buffer would
                 // have every core contending for a single reference count.
                 let payload = Bytes::from(vec![0x5a; chunk]);
@@ -262,6 +388,11 @@ mod imp {
                             0
                         );
                     }
+                    let slow_reader = setting("BENCH_SCALING_READ_DELAY_US", 0);
+                    if setting("BENCH_SCALING_REGISTER", 0) == 1 {
+                        // SAFETY: registers the calling thread; no arguments.
+                        assert_eq!(unsafe { ffi::rte_thread_register() }, 0);
+                    }
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .build()
                         .unwrap();
@@ -277,7 +408,34 @@ mod imp {
                                 .expect("connect");
                         connected.fetch_add(1, Ordering::Relaxed);
                         while !stop.load(Ordering::Relaxed) {
-                            stream.send(payload.clone()).await.expect("send");
+                            match mode {
+                                Mode::Upload => stream.send(payload.clone()).await.expect("send"),
+                                Mode::Download => {
+                                    let data = stream.recv_chunk().await.expect("recv");
+                                    let data = data.expect("peer closed");
+                                    count.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                    if slow_reader != 0 {
+                                        // Falls behind the worker, so
+                                        // its ring fills and stays full.
+                                        let until = Instant::now()
+                                            + Duration::from_micros(slow_reader as u64);
+                                        while Instant::now() < until {
+                                            std::hint::spin_loop();
+                                        }
+                                    }
+                                }
+                                Mode::EchoRaw => unreachable!("no application thread"),
+                                Mode::Echo => {
+                                    stream.send(payload.clone()).await.expect("send");
+                                    let mut read = 0;
+                                    while read < payload.len() {
+                                        let data = stream.recv_chunk().await.expect("recv");
+                                        let data = data.expect("peer closed");
+                                        read += data.len();
+                                    }
+                                    count.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                         }
                     });
                 })
@@ -297,18 +455,36 @@ mod imp {
         let snapshot = |counts: &[Arc<AtomicU64>]| -> Vec<u64> {
             counts.iter().map(|c| c.load(Ordering::Relaxed)).collect()
         };
-        let before = snapshot(&received);
+        // Uploads are counted where they arrive; the other modes by the
+        // application threads, connection `i` belonging to worker
+        // `i % workers`.
+        let counts = if mode == Mode::Upload {
+            &received
+        } else {
+            &app_counts
+        };
+        let before = snapshot(counts);
         let measured = Instant::now();
         std::thread::sleep(Duration::from_secs(seconds as u64));
-        let after = snapshot(&received);
+        let after = snapshot(counts);
         let elapsed = measured.elapsed().as_secs_f64();
+        let done: Vec<u64> = after.iter().zip(&before).map(|(a, b)| a - b).collect();
+        if mode == Mode::Echo {
+            let trips: u64 = done.iter().sum();
+            println!("workers\tconnections\tchunk\tround_trips_s\tmean_round_trip_us");
+            println!(
+                "{workers}\t{connections}\t{chunk}\t{:.0}\t{:.3}",
+                trips as f64 / elapsed,
+                elapsed * 1e6 * connections as f64 / trips as f64
+            );
+            std::process::exit(0);
+        }
 
         let gbit = |bytes: u64| bytes as f64 * 8.0 / elapsed / 1e9;
-        let per_queue: Vec<f64> = after
-            .iter()
-            .zip(&before)
-            .map(|(a, b)| gbit(a - b))
-            .collect();
+        let mut per_queue = vec![0.0; workers];
+        for (i, bytes) in done.iter().enumerate() {
+            per_queue[i % workers] += gbit(*bytes);
+        }
         let total: f64 = per_queue.iter().sum();
         println!("workers\tconnections\ttotal_gbit_s\tper_worker_gbit_s");
         println!(
