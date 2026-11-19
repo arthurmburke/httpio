@@ -247,7 +247,7 @@ mod dpdk_parts {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         eal::init(&args).expect("EAL initialization failed");
         {
-            let rx_pool = Mempool::create("bench-rx", 1023, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
+            let rx_pool = Mempool::new("bench-rx", 1023, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
                 .expect("failed to create the receive mbuf pool");
             // One full-size segment, as received. Each use clones the
             // view (an atomic increment of the mbuf's refcnt, as a `Bytes`
@@ -518,7 +518,7 @@ mod dpdk_parts {
 
     fn engine() {
         {
-            let pool = Mempool::create("bench", 8191, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
+            let pool = Mempool::new("bench", 8191, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
                 .expect("failed to create mbuf pool");
             let port = EthPort::init(0, &pool, 1024, 1024, 1500, -1).expect("port init failed");
             let payload = vec![0xa5u8; MSS];

@@ -223,7 +223,7 @@ fn dpdk_run(_: &[String]) {
 #[cfg(dpdk)]
 fn dpdk_run(args: &[String]) {
     use httpio::dpdk::http::client::builder::Builder;
-    use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+    use httpio::dpdk::mempool::{DEFAULT_MBUF_DATA_ROOM_SIZE, MAX_CACHE_SIZE, transmit_mbufs};
     use httpio::dpdk::tcp::{
         engine::{EngineConfig, TcpEngine},
         stream::{TcpOptions, TcpStream},
@@ -237,7 +237,7 @@ fn dpdk_run(args: &[String]) {
     dpdk::eal::init(&eal_args).unwrap();
     let local_ip = args[split + 1].parse().unwrap();
     let ip = args[split + 2].parse().unwrap();
-    let pool = Mempool::create("bench_h1", 8192, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+    let pool = Mempool::new("bench_h1", 8192, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
     let mut port = EthPort::init(0, &pool, 1024, 1024, 1500, -1).unwrap();
     let tx_burst = u16::try_from(setting(
         "BENCH_TX_BURST",
@@ -262,7 +262,14 @@ fn dpdk_run(args: &[String]) {
     let tx_pool = if setting("BENCH_SHARED_POOL", 0) == 1 {
         pool
     } else {
-        Mempool::create_for_transmit("bench_h1_tx", 1024, -1).unwrap()
+        Mempool::new(
+            "bench_h1_tx",
+            transmit_mbufs(1024),
+            MAX_CACHE_SIZE,
+            DEFAULT_MBUF_DATA_ROOM_SIZE,
+            -1,
+        )
+        .unwrap()
     };
     let (worker, join) = WorkerHandle::spawn(
         engine,

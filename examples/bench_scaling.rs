@@ -99,7 +99,7 @@ mod imp {
     }
 
     fn pool(name: String) -> Mempool {
-        Mempool::create(
+        Mempool::new(
             &name,
             POOL_MBUFS,
             256,

@@ -98,8 +98,7 @@ fn engine_transmits_window_updates_and_final_reset() {
     ])
     .unwrap();
     {
-        let pool =
-            Mempool::create("engine-test", 4095, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+        let pool = Mempool::new("engine-test", 4095, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
         let mut port = EthPort::init(0, &pool, 128, 128, 1500, 0).unwrap();
         for burst in [1, 32, 64, 128, 256, u16::MAX] {
             port.set_tx_burst_limit(std::num::NonZeroU16::new(burst).unwrap());

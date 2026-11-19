@@ -745,8 +745,7 @@ mod tests {
     #[test]
     fn views_share_their_mbuf_and_return_it_with_the_last_one() {
         testing::init();
-        let pool =
-            Mempool::create("mbuf-slice-test", 63, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+        let pool = Mempool::new("mbuf-slice-test", 63, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
         let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
         let free = available();
 

@@ -2508,7 +2508,7 @@ connection: close\r\n\r\n5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n"
         testing::init();
         {
             let pool =
-                Mempool::create("h1-alloc-test", 255, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+                Mempool::new("h1-alloc-test", 255, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
             let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
             let free = available();
             // The response to `message`, received as full-size packets.

@@ -243,7 +243,7 @@ fn dpdk(args: &[String]) {
     dpdk::eal::init(&eal_args).unwrap();
     let breakdown = std::env::var("BENCH_LIBRARY_BREAKDOWN").is_ok_and(|v| v == "1");
     {
-        let pool = Mempool::create(
+        let pool = Mempool::new(
             "library-bench",
             16383,
             256,
@@ -276,8 +276,22 @@ fn dpdk(args: &[String]) {
         assert!(!release || emulate, "BENCH_LIBRARY_TX_POOL needs BENCH_LIBRARY_OFFLOAD");
         let tx_pools = (tx_pool_mode == "separate").then(|| {
             [
-                Mempool::create_for_transmit("library-bench-tx-a", 1024, -1).unwrap(),
-                Mempool::create_for_transmit("library-bench-tx-b", 1024, -1).unwrap(),
+                Mempool::new(
+                    "library-bench-tx-a",
+                    dpdk::mempool::transmit_mbufs(1024),
+                    dpdk::mempool::MAX_CACHE_SIZE,
+                    dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE,
+                    -1,
+                )
+                .unwrap(),
+                Mempool::new(
+                    "library-bench-tx-b",
+                    dpdk::mempool::transmit_mbufs(1024),
+                    dpdk::mempool::MAX_CACHE_SIZE,
+                    dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE,
+                    -1,
+                )
+                .unwrap(),
             ]
         });
         let (a_pool, b_pool) = match &tx_pools {

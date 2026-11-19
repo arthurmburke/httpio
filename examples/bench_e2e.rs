@@ -494,7 +494,7 @@ mod dpdk_mode {
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicU16, Ordering};
 
-    use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+    use httpio::dpdk::mempool::{DEFAULT_MBUF_DATA_ROOM_SIZE, MAX_CACHE_SIZE, transmit_mbufs};
     use httpio::dpdk::tcp::engine::{EngineConfig, TcpEngine};
     use httpio::dpdk::tcp::stream::{TcpOptions, TcpStream};
     use httpio::dpdk::tcp::worker::WorkerHandle;
@@ -531,7 +531,7 @@ mod dpdk_mode {
 
         let (local_ip, server, label) = init(args, "dpdk-raw");
         {
-            let pool = Mempool::create("bench_pool", 8192, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
+            let pool = Mempool::new("bench_pool", 8192, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
                 .expect("failed to create mbuf pool");
             let port = EthPort::init(0, &pool, 1024, 1024, 1500, -1).expect("port init failed");
             let local_mac = port.mac_addr().expect("no MAC address");
@@ -738,7 +738,7 @@ mod dpdk_mode {
         let (local_ip, server, label) = init(args, "dpdk");
         let worker_lcore = dpdk::first_worker_lcore().expect("need two lcores (-l 0-1)");
         let socket = dpdk::lcore::get_core_info(worker_lcore).socket as i32;
-        let pool = Mempool::create("bench_pool", 8192, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, socket)
+        let pool = Mempool::new("bench_pool", 8192, 256, DEFAULT_MBUF_DATA_ROOM_SIZE, socket)
             .expect("failed to create mbuf pool");
         let port = EthPort::init(0, &pool, 1024, 1024, 1500, socket).expect("port init failed");
         let engine = TcpEngine::new(EngineConfig {
@@ -746,8 +746,14 @@ mod dpdk_mode {
             local_ip,
             gateway: None,
         });
-        let tx_pool = Mempool::create_for_transmit("bench_tx_pool", 1024, socket)
-            .expect("failed to create transmit mbuf pool");
+        let tx_pool = Mempool::new(
+            "bench_tx_pool",
+            transmit_mbufs(1024),
+            MAX_CACHE_SIZE,
+            DEFAULT_MBUF_DATA_ROOM_SIZE,
+            socket,
+        )
+        .expect("failed to create transmit mbuf pool");
         let (worker, join) =
             WorkerHandle::spawn(engine, port, tx_pool, worker_lcore).expect("worker launch failed");
 

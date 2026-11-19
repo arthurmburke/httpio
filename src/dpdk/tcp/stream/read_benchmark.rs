@@ -10,7 +10,7 @@ const SEGMENT: usize = 1448;
 fn benchmark_stream_reads() {
     testing::init();
     {
-        let pool = Mempool::create(
+        let pool = Mempool::new(
             "stream-read-bench",
             2047,
             0,

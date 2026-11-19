@@ -40,7 +40,7 @@ mod dpdk_app {
     use http::{Method, Request};
 
     use httpio::dpdk::http::client::builder::Builder;
-    use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+    use httpio::dpdk::mempool::{DEFAULT_MBUF_DATA_ROOM_SIZE, MAX_CACHE_SIZE, transmit_mbufs};
     use httpio::dpdk::net::eth::EthAddr;
     use httpio::dpdk::tcp::engine::EngineConfig;
     use httpio::dpdk::tcp::engine::TcpEngine;
@@ -103,7 +103,7 @@ mod dpdk_app {
 
         let socket_id = dpdk::lcore::get_core_info(worker_lcore).socket;
 
-        let pool = Mempool::create(
+        let pool = Mempool::new(
             "http_mbuf_pool",
             MBUF_POOL_SIZE,
             MBUF_CACHE_SIZE,
@@ -129,8 +129,14 @@ mod dpdk_app {
         });
 
         // Outgoing packets come from a pool of their own, which stays warm.
-        let tx_pool = Mempool::create_for_transmit("http_tx_pool", NB_TX_DESC, socket_id as i32)
-            .expect("failed to create transmit mbuf pool");
+        let tx_pool = Mempool::new(
+            "http_tx_pool",
+            transmit_mbufs(NB_TX_DESC),
+            MAX_CACHE_SIZE,
+            DEFAULT_MBUF_DATA_ROOM_SIZE,
+            socket_id as i32,
+        )
+        .expect("failed to create transmit mbuf pool");
         let (worker, worker_join) = match WorkerHandle::spawn(engine, port, tx_pool, worker_lcore) {
             Ok(pair) => pair,
             Err(e) => {

@@ -38,7 +38,7 @@ pub(crate) fn pool() -> &'static Mempool {
     POOL.get_or_init(|| {
         init();
         // No per-lcore cache: test threads are not EAL lcores.
-        Mempool::create("unit-tests", 8191, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
+        Mempool::new("unit-tests", 8191, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1)
             .expect("the unit-test mbuf pool")
     })
 }

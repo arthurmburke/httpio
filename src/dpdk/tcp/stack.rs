@@ -19,7 +19,9 @@ use std::net::Ipv4Addr;
 use super::engine::{EngineConfig, Gateway, TcpEngine};
 use super::worker::WorkerHandle;
 use crate::dpdk::lcore::LaunchError;
-use crate::dpdk::mempool::{DEFAULT_MBUF_DATA_ROOM_SIZE, MempoolCreateError};
+use crate::dpdk::mempool::{
+    DEFAULT_MBUF_DATA_ROOM_SIZE, MAX_CACHE_SIZE, MempoolCreateError, transmit_mbufs,
+};
 use crate::dpdk::port::{PortError, QueueSteering};
 use crate::dpdk::{EthPort, Mempool, WorkerJoin};
 
@@ -118,7 +120,7 @@ impl StackBuilder {
     /// Mbufs in each worker's receive pool: what its queue has received
     /// and the application has not yet freed. What a worker sends comes
     /// from a second pool, sized from the transmit descriptors (see
-    /// [`Mempool::create_for_transmit`]).
+    /// [`transmit_mbufs`]).
     pub fn pool_mbufs(mut self, mbufs: u32) -> Self {
         self.pool_mbufs = mbufs;
         self
@@ -151,7 +153,7 @@ impl StackBuilder {
         let socket = EthPort::socket(self.port_id);
         let pools = (0..self.lcores.len())
             .map(|queue| {
-                Mempool::create(
+                Mempool::new(
                     &format!("tcp-p{}-q{queue}", self.port_id),
                     self.pool_mbufs,
                     256,
@@ -163,9 +165,11 @@ impl StackBuilder {
             .map_err(StackError::Pool)?;
         let tx_pools = (0..self.lcores.len())
             .map(|queue| {
-                Mempool::create_for_transmit(
+                Mempool::new(
                     &format!("tcp-p{}-q{queue}-tx", self.port_id),
-                    self.tx_descriptors,
+                    transmit_mbufs(self.tx_descriptors),
+                    MAX_CACHE_SIZE,
+                    DEFAULT_MBUF_DATA_ROOM_SIZE,
                     socket,
                 )
             })

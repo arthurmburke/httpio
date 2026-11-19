@@ -68,7 +68,7 @@ mod dpdk_app {
             .unwrap_or(Ipv4Addr::new(192, 168, 1, 10));
         let listen_port: u16 = app_args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7);
 
-        let pool = Mempool::create(
+        let pool = Mempool::new(
             "tcp_mbuf_pool",
             MBUF_POOL_SIZE,
             MBUF_CACHE_SIZE,

@@ -2131,7 +2131,7 @@ mod tests {
         testing::init();
         {
             let pool =
-                Mempool::create("ws-alloc-test", 255, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
+                Mempool::new("ws-alloc-test", 255, 0, DEFAULT_MBUF_DATA_ROOM_SIZE, -1).unwrap();
             let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
             let free = available();
             let (mut ws, wire) = tcp_client(Bytes::new());

@@ -47,7 +47,7 @@ fn each_queue_carries_the_connections_whose_ports_lead_to_it() {
     ])
     .unwrap();
     {
-        let pool = |name| Mempool::create(name, 2047, 0, 2176, -1).unwrap();
+        let pool = |name| Mempool::new(name, 2047, 0, 2176, -1).unwrap();
         let (pool0, pool1, server_pool) = (pool("mq-c0"), pool("mq-c1"), pool("mq-server"));
 
         // A device without flow rules refuses to start with several

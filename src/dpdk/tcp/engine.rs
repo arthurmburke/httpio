@@ -1524,7 +1524,7 @@ mod tests {
         use crate::dpdk::{ffi, testing};
         testing::init();
         {
-            let pool = Mempool::create("offload-test", 1023, 0, 2176, -1).unwrap();
+            let pool = Mempool::new("offload-test", 1023, 0, 2176, -1).unwrap();
             let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
             let baseline = available();
             let now = Instant::now();

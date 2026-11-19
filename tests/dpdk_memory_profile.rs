@@ -79,7 +79,7 @@ mod dpdk {
     }
     impl Fixture {
         fn new(cache_size: u32) -> Self {
-            let pool = Mempool::create(
+            let pool = Mempool::new(
                 "memory-profile",
                 4095,
                 cache_size,

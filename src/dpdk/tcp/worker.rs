@@ -660,7 +660,7 @@ impl WorkerHandle {
     ///
     /// `pool` is what the worker builds outgoing packets from. It may be
     /// the pool the port receives into, but a separate one keeps those
-    /// packets in warm memory: see [`Mempool::create_for_transmit`].
+    /// packets in warm memory: see [`Mempool::new`].
     pub fn spawn(
         engine: TcpEngine,
         port: EthPort,

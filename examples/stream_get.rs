@@ -34,7 +34,7 @@ mod dpdk_app {
     use http::{Method, Request};
 
     use httpio::dpdk::http::client::builder::Builder;
-    use httpio::dpdk::mempool::DEFAULT_MBUF_DATA_ROOM_SIZE;
+    use httpio::dpdk::mempool::{DEFAULT_MBUF_DATA_ROOM_SIZE, MAX_CACHE_SIZE, transmit_mbufs};
     use httpio::dpdk::tcp::engine::{EngineConfig, TcpEngine};
     use httpio::dpdk::tcp::worker::WorkerHandle;
     use httpio::dpdk::{self, EthPort, Mempool};
@@ -62,7 +62,7 @@ mod dpdk_app {
         let worker_lcore = dpdk::first_worker_lcore().expect("need two lcores, e.g. -l 0-1");
         let socket_id = dpdk::lcore::get_core_info(worker_lcore).socket;
 
-        let pool = Mempool::create(
+        let pool = Mempool::new(
             "stream_mbuf_pool",
             8192,
             256,
@@ -80,8 +80,14 @@ mod dpdk_app {
             local_ip,
             gateway: None,
         });
-        let tx_pool = Mempool::create_for_transmit("stream_tx_pool", 1024, socket_id as i32)
-            .expect("failed to create transmit mbuf pool");
+        let tx_pool = Mempool::new(
+            "stream_tx_pool",
+            transmit_mbufs(1024),
+            MAX_CACHE_SIZE,
+            DEFAULT_MBUF_DATA_ROOM_SIZE,
+            socket_id as i32,
+        )
+        .expect("failed to create transmit mbuf pool");
         let (worker, worker_join) =
             WorkerHandle::spawn(engine, port, tx_pool, worker_lcore).expect("worker spawn failed");
 

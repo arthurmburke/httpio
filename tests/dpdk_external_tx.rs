@@ -42,7 +42,7 @@ fn external_payload_lives_through_ack_driver_clone_and_cross_thread_completion()
     ])
     .unwrap();
     {
-        let pool = Mempool::create("external-test", 255, 0, 2176, -1).unwrap();
+        let pool = Mempool::new("external-test", 255, 0, 2176, -1).unwrap();
         let port = EthPort::init(0, &pool, 128, 128, 1500, 0).unwrap();
         let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
         let baseline = available();
