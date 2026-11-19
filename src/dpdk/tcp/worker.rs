@@ -255,15 +255,15 @@ pub type InboundTx = SpscTx<Inbound, IN_CAP>;
 
 pub struct InboundRx {
     ring: SpscRx<Inbound, IN_CAP>,
-    signal: Arc<SendCredit>,
 }
 impl InboundRx {
+    /// Takes the next message. The worker is not told that the ring has
+    /// room again: telling it on every read made each one cost a round of
+    /// cache lines shared with the worker, and a worker visit. A worker
+    /// holding something the ring would not take keeps coming back to the
+    /// connection by itself instead (see `run`).
     pub fn pop(&self) -> Option<Inbound> {
-        let value = self.ring.pop();
-        if value.is_some() {
-            self.signal.notify();
-        }
-        value
+        self.ring.pop()
     }
     pub fn is_closed(&self) -> bool {
         self.ring.is_closed()
@@ -278,9 +278,9 @@ impl InboundRx {
         self.ring.capacity()
     }
 }
-pub(crate) fn inbound_channel(signal: Arc<SendCredit>) -> (InboundTx, InboundRx) {
+pub(crate) fn inbound_channel() -> (InboundTx, InboundRx) {
     let (tx, ring) = spsc::channel();
-    (tx, InboundRx { ring, signal })
+    (tx, InboundRx { ring })
 }
 // The connection-open control ring is MPSC: any number of application
 // threads can share one `WorkerHandle` and open connections concurrently
@@ -836,7 +836,7 @@ impl WorkerHandle {
             self.send_config.capacity.get(),
             self.send_config.max_capacity.get(),
         );
-        let (inbound_tx, inbound_rx) = inbound_channel(outstanding.clone());
+        let (inbound_tx, inbound_rx) = inbound_channel();
         let wake = link.app_ready.wake_handle();
 
         let mut msg = NewConn {
@@ -1039,6 +1039,11 @@ fn run(
             // EOF terminal. The terminal signal goes out only after all
             // data has drained, retrying until the ring accepts it.
             conn.deliver_terminal(&engine);
+            // The application's ring would not take everything. It does
+            // not report making room, so come back next iteration.
+            if conn.pending_in.is_some() || matches!(conn.delivery, Delivery::Terminal(_)) {
+                conn.outstanding.notify();
+            }
 
             // Everything this iteration changed for the connection is
             // visible to the application by now; tell it once.
@@ -1108,7 +1113,7 @@ mod tests {
             },
         };
         let (tx, conn, _) = fixture_with_wake(Some(wake));
-        let (in_tx, in_rx) = inbound_channel(conn.outstanding.clone());
+        let (in_tx, in_rx) = inbound_channel();
         let mut conns = HashMap::default();
         conns.insert(tuple, conn);
         let mut work = HashSet::default();
@@ -1127,9 +1132,11 @@ mod tests {
                 .push(Inbound::Data(crate::dpdk::testing::slice(b"x")))
                 .is_ok()
         );
+        // Reading tells the worker nothing: a worker with a stalled
+        // delivery comes back to the connection by itself.
         assert!(in_rx.pop().is_some());
         collect_ready(&ready_rx, &overflow, &conns, &mut work);
-        assert!(work.remove(&tuple), "reading must wake a stalled delivery");
+        assert!(work.is_empty(), "reading must not schedule the worker");
         drop(tx);
         collect_ready(&ready_rx, &overflow, &conns, &mut work);
         assert!(work.contains(&tuple), "dropping must schedule cleanup");
@@ -1338,7 +1345,7 @@ mod tests {
     fn abort_notifies_both_connecting_and_established_readers() {
         for established in [false, true] {
             let (cmd_tx, cmd_rx, outstanding) = command_channel();
-            let (inbound_tx, _inbound_rx) = inbound_channel(outstanding.clone());
+            let (inbound_tx, _inbound_rx) = inbound_channel();
             let tuple = FourTuple {
                 local_ip: Ipv4Addr::new(10, 0, 0, 1),
                 local_port: 1234,

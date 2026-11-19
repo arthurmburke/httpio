@@ -885,7 +885,7 @@ impl TcpStream {
         Arc<crate::dpdk::tcp::worker::SendCredit>,
     ) {
         let (cmd_tx, cmd_rx, credit) = crate::dpdk::tcp::worker::command_channel();
-        let (inbound_tx, inbound_rx) = crate::dpdk::tcp::worker::inbound_channel(credit.clone());
+        let (inbound_tx, inbound_rx) = crate::dpdk::tcp::worker::inbound_channel();
         let stream = TcpStream {
             cmd_tx,
             inbound_rx,
