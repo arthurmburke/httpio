@@ -1,0 +1,38 @@
+# libFuzzer targets for the HTTP/2 codec's parsers; see fuzz/README.md.
+# Its own workspace, so the nightly-only build never touches the crate's
+# lock file or target directory.
+[package]
+name = "httpio-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+httpio = { path = ".." }
+
+[[bin]]
+name = "h2_connection"
+path = "fuzz_targets/h2_connection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_hpack"
+path = "fuzz_targets/h2_hpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_huffman"
+path = "fuzz_targets/h2_huffman.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

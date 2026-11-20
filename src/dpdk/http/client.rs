@@ -4,14 +4,22 @@
 //! hyper's low-level `client::conn` API, all over `TcpStream`.
 //!
 //! The request/response API uses the `http` crate's types directly:
-//! `http::Request<Bytes>` in, `http::Response<Bytes>` out (the response
-//! body is collected to completion; this client does not stream bodies).
+//! `http::Request<B>` in, `http::Response<R>` out, with bodies encoded and
+//! decoded by [`codec`]; a [`ByteStream`] on either side is streamed
+//! rather than buffered.
 //!
 //! Connection reuse: HTTP/2 connections are pooled per origin
 //! (host, port) and multiplexed -- [`h2::SendRequest`] is `Clone`, so
-//! any number of requests share one TCP+TLS connection until the
-//! server closes it (there is no idle timeout on our side). HTTP/1.1 has
-//! no such multiplexing handle and stays connection-per-request.
+//! any number of requests, buffered or streamed, share one TCP+TLS
+//! connection until the server closes it (there is no idle timeout on our
+//! side). HTTP/1.1 has no such multiplexing handle and stays
+//! connection-per-request.
+//!
+//! A buffered request the server did not process -- it refused the
+//! stream, or announced it was going away before reaching it
+//! ([`h2::H2Error::Refused`]) -- is sent once more, on a new connection
+//! if that one is closing. A streamed request is not: its body may have
+//! been consumed.
 
 use std::borrow::Cow;
 use std::net::Ipv4Addr;
@@ -267,8 +275,7 @@ impl Client {
                 self.send_buffered(Request::from_parts(parts, bytes))
                     .await?
             }
-            // A ByteStream body is sent chunk-by-chunk with chunked framing
-            // over HTTP/1.1, on a connection of its own.
+            // A ByteStream body is sent chunk-by-chunk as it is produced.
             EncodedBody::Stream(stream) => self.send_stream(parts, stream).await?,
         };
 
@@ -331,38 +338,26 @@ impl Client {
                 return send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port).await;
             }
 
-            // Fast path: multiplex onto an existing h2 connection.
-            if let Some(send_request) = self.pooled_h2(&host, port).await {
-                return send_h2_on(send_request, parts, body).await;
-            }
-
-            let tcp = self
-                .dial(&host, port, tcp_options, flush_handle.as_ref())
-                .await?;
-            let server_name = ServerName::try_from(host.as_ref())
-                .map_err(|_| HttpError::InvalidHost)?
-                .to_owned();
-            let tls = self
-                .tls
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
-            let negotiated_h2 = tls.alpn_protocol() == Some(b"h2".as_slice());
-            if negotiated_h2 {
-                let send_request = handshake_h2(tls);
-                // Pool a clone; on a race where two tasks dialed the same
-                // origin concurrently, last-in wins and the loser's
-                // connection just serves its own request and then idles
-                // until the server reaps it.
-                self.h2_pool
-                    .lock()
-                    .await
-                    .entry(host.into_owned())
-                    .or_default()
-                    .insert(port, send_request.clone());
-                send_h2_on(send_request, parts, body).await
-            } else {
-                send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port).await
+            // One more attempt if the server did not process the first:
+            // nothing of the request took effect, so sending it again
+            // cannot repeat anything.
+            let mut retried = false;
+            loop {
+                let connection = self
+                    .connect_tls(&host, port, tcp_options, flush_handle.as_ref())
+                    .await?;
+                let send_request = match connection {
+                    TlsConnection::H2(send_request) => send_request,
+                    TlsConnection::H1(tls) => {
+                        return send_tls_h1(*tls, parts, EncodedBody::Full(body), &host, port)
+                            .await;
+                    }
+                };
+                let body = EncodedBody::Full(body.clone());
+                match send_h2_on(&send_request, &parts, body).await {
+                    Err(error) if !retried && is_refused(&error) => retried = true,
+                    result => return result.map_err(HttpError::from),
+                }
             }
         } else {
             let tcp = self
@@ -377,13 +372,12 @@ impl Client {
     }
 
     /// Sends a request whose body is a [`ByteStream`], chunk-by-chunk as the
-    /// stream yields (with chunked transfer-encoding, since the total
-    /// length is unknown).
+    /// stream yields: as DATA frames on a pooled HTTP/2 connection when
+    /// the origin speaks it, else with chunked transfer-encoding on an
+    /// HTTP/1.1 connection of its own (the total length being unknown).
     ///
-    /// Streaming requests use HTTP/1.1: `https` dials through the h1-only
-    /// ALPN connector and is never pooled. Corking composes (both are
-    /// h1 paths): the held tail is released by the caller's `FlushHandle`,
-    /// exactly as for buffered requests.
+    /// A corked request takes the HTTP/1.1 path, as a buffered one does:
+    /// the held tail is released by the caller's `FlushHandle`.
     async fn send_stream(
         &self,
         mut parts: Parts,
@@ -404,6 +398,22 @@ impl Client {
             .port_u16()
             .unwrap_or(if is_https { 443 } else { 80 });
 
+        if is_https && !tcp_options.cork {
+            let connection = self
+                .connect_tls(&host, port, tcp_options, flush_handle.as_ref())
+                .await?;
+            return match connection {
+                TlsConnection::H2(send_request) => {
+                    send_h2_on(&send_request, &parts, EncodedBody::Stream(body))
+                        .await
+                        .map_err(HttpError::from)
+                }
+                TlsConnection::H1(tls) => {
+                    send_tls_h1(*tls, parts, EncodedBody::Stream(body), &host, port).await
+                }
+            };
+        }
+
         let tcp = self
             .dial(&host, port, tcp_options, flush_handle.as_ref())
             .await?;
@@ -416,10 +426,8 @@ impl Client {
                 .connect(server_name, tcp)
                 .await
                 .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
-            if tcp_options.cork {
-                // Cork only now that the TLS handshake has completed.
-                tls.tcp().request_cork();
-            }
+            // Cork only now that the TLS handshake has completed.
+            tls.tcp().request_cork();
             send_tls_h1(tls, parts, EncodedBody::Stream(body), &host, port).await
         } else {
             // Plain HTTP has no handshake, so cork right away.
@@ -479,6 +487,46 @@ impl Client {
         } else {
             send_h1_upgradable(tcp, request).await
         }
+    }
+
+    /// A connection for an uncorked `https` request: the origin's pooled
+    /// HTTP/2 connection if it has a live one, else a new connection,
+    /// which is pooled if ALPN chose `h2` and handed over as a TLS stream
+    /// for HTTP/1.1 if not.
+    async fn connect_tls(
+        &self,
+        host: &str,
+        port: u16,
+        options: TcpOptions,
+        flush_handle: Option<&FlushHandle>,
+    ) -> Result<TlsConnection, HttpError> {
+        // Fast path: multiplex onto an existing h2 connection.
+        if let Some(send_request) = self.pooled_h2(host, port).await {
+            return Ok(TlsConnection::H2(send_request));
+        }
+        let tcp = self.dial(host, port, options, flush_handle).await?;
+        let server_name = ServerName::try_from(host)
+            .map_err(|_| HttpError::InvalidHost)?
+            .to_owned();
+        let tls = self
+            .tls
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
+        if tls.alpn_protocol() != Some(b"h2".as_slice()) {
+            return Ok(TlsConnection::H1(Box::new(tls)));
+        }
+        let send_request = handshake_h2(tls);
+        // Pool a clone; on a race where two tasks dialed the same origin
+        // concurrently, last-in wins and the loser's connection just
+        // serves its own request and then idles until the server reaps it.
+        self.h2_pool
+            .lock()
+            .await
+            .entry(host.to_owned())
+            .or_default()
+            .insert(port, send_request.clone());
+        Ok(TlsConnection::H2(send_request))
     }
 
     async fn dial(
@@ -644,16 +692,33 @@ fn handshake_h2(tls: TlsStream) -> h2::SendRequest<TlsStream> {
     send_request
 }
 
+/// What [`Client::connect_tls`] connected to.
+enum TlsConnection {
+    /// An HTTP/2 connection, pooled.
+    H2(h2::SendRequest<TlsStream>),
+    /// A fresh TLS stream whose server chose HTTP/1.1.
+    H1(Box<TlsStream>),
+}
+
 /// Sends one request as a new stream on an h2 connection. HTTP/2 derives
 /// `:scheme`, `:authority` and `:path` from the absolute URI the caller
-/// supplied.
+/// supplied. `parts` is borrowed so the caller can send it again.
 async fn send_h2_on(
-    send_request: h2::SendRequest<TlsStream>,
-    parts: Parts,
-    body: Bytes,
-) -> Result<Response<ResponseBody>, HttpError> {
-    let response = send_request.send(parts, EncodedBody::Full(body))?.await?;
+    send_request: &h2::SendRequest<TlsStream>,
+    parts: &Parts,
+    body: EncodedBody,
+) -> Result<Response<ResponseBody>, h2::SendError> {
+    let response = send_request
+        .send_ref(parts, body)
+        .map_err(h2::SendError::Request)?
+        .await?;
     Ok(response.map(ResponseBody::H2))
+}
+
+/// Whether the server left the request unprocessed, so that sending it
+/// again repeats nothing.
+fn is_refused(error: &h2::SendError) -> bool {
+    matches!(error, h2::SendError::H2(h2::H2Error::Refused))
 }
 
 #[cfg(test)]

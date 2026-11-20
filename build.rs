@@ -25,6 +25,8 @@ fn main() {
     // the unexpected_cfgs lint knows it's expected whether or not it's set.
     println!("cargo::rustc-check-cfg=cfg(dpdk)");
     println!("cargo::rustc-check-cfg=cfg(dpdk_linker_lto)");
+    // Set by cargo-fuzz; gates the fuzz entry points (`dpdk::http::h2::fuzzing`).
+    println!("cargo::rustc-check-cfg=cfg(fuzzing)");
     println!("cargo::rerun-if-env-changed=HTTPIO_DPDK_LTO");
 
     // Locate libdpdk and emit its link flags (this also prints the

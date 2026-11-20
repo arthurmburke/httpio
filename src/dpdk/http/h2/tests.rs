@@ -836,6 +836,55 @@ fn resets_and_goaway() {
     );
 }
 
+/// What the client's retry rests on: a refused request can be sent
+/// again from the same parts, which `send_ref` only borrows.
+#[test]
+fn refused_request_is_sent_again_from_the_same_parts() {
+    let mut parts = post("/again");
+    parts.headers.insert("x-attempt", "same".parse().unwrap());
+    let body = Bytes::from_static(b"payload");
+
+    let (send, _conn, peer) = connect();
+    let first = send.send_ref(&parts, full(body.clone())).unwrap();
+    peer.push(goaway(0, Reason::NO_ERROR));
+    assert_eq!(h2_error(block_on(first)), H2Error::Refused);
+    assert!(send.is_closed());
+    let sent_first = peer.take_frames();
+
+    let (send, _conn, peer) = connect();
+    let second = send.send_ref(&parts, full(body.clone())).unwrap();
+    peer.push(headers(1, OK, true));
+    assert_eq!(block_on(second).unwrap().status(), StatusCode::OK);
+    let sent_second = peer.take_frames();
+    // The same request on the wire both times.
+    let request = |frames: &[(FrameHead, Vec<u8>)]| -> Vec<Vec<u8>> {
+        frames
+            .iter()
+            .filter(|(h, _)| matches!(h.kind, kind::HEADERS | kind::DATA))
+            .map(|(_, payload)| payload.clone())
+            .collect()
+    };
+    assert_eq!(request(&sent_first), request(&sent_second));
+    assert_eq!(request(&sent_second).len(), 2);
+
+    // A request held back by the concurrency limit keeps its own copy.
+    let peer = Peer::default();
+    let (send, _conn) = handshake(Mock(peer.clone()));
+    peer.push(settings(&[(setting::MAX_CONCURRENT_STREAMS, 0)]));
+    let mut held = Box::pin(send.send_ref(&parts, full(body)).unwrap());
+    pending(&mut held);
+    drop(parts);
+    peer.push(settings(&[(setting::MAX_CONCURRENT_STREAMS, 1)]));
+    peer.push(headers(1, OK, true));
+    block_on(held).unwrap();
+    let frames = peer.take_frames();
+    let (_, block) = frames
+        .iter()
+        .find(|(h, _)| h.kind == kind::HEADERS)
+        .unwrap();
+    assert!(decode_block(block).contains(&("x-attempt".to_owned(), "same".to_owned())));
+}
+
 #[test]
 fn protocol_violations_close_the_connection_with_goaway() {
     let big = frame(kind::PING, 0, 0, &vec![0; MAX_FRAME_SIZE + 1]);
@@ -1143,6 +1192,25 @@ fn concurrency_limit_holds_requests_back() {
     peer.push(headers(5, OK, true));
     block_on(third).unwrap();
     assert!(peer.take_frames().iter().all(|(h, _)| h.stream <= 5));
+}
+
+/// Found by the random tests: a request that failed while it was still
+/// held back kept its place in the queue, for the slot's next occupant.
+#[test]
+fn failed_waiting_request_leaves_the_queue() {
+    let peer = Peer::default();
+    let (send, _conn) = handshake(Mock(peer.clone()));
+    peer.push(settings(&[(setting::MAX_CONCURRENT_STREAMS, 1)]));
+    let mut first = Box::pin(send.send(get("/1"), empty()).unwrap());
+    pending(&mut first);
+    let waiting = send.send(get("/2"), empty()).unwrap();
+    assert_eq!(send.shared.lock().pending_open.len(), 1);
+    peer.eof();
+    assert_eq!(h2_error(block_on(waiting)), H2Error::Closed);
+    assert_eq!(h2_error(block_on(first)), H2Error::Closed);
+    let inner = send.shared.lock();
+    assert!(inner.pending_open.is_empty());
+    assert_eq!((inner.streams.len, inner.active), (0, 0));
 }
 
 #[test]
@@ -1520,4 +1588,217 @@ fn hyper_server_cancelled_and_unread_responses() {
         assert_eq!(driver.await.unwrap(), Ok(()));
         server.await.unwrap();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Seeded random input (see `fuzzing`)
+// ---------------------------------------------------------------------------
+
+/// xorshift64*: enough for test input, and reproducible from its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    fn chance(&mut self, percent: usize) -> bool {
+        self.below(100) < percent
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[self.below(items.len())]
+    }
+
+    fn bytes(&mut self, len: usize) -> Vec<u8> {
+        (0..len).map(|_| self.next() as u8).collect()
+    }
+}
+
+/// Iterations for the random tests: `H2_FUZZ_ITERS`, or a count that
+/// keeps them a few seconds long.
+fn iterations(default: usize) -> usize {
+    std::env::var("H2_FUZZ_ITERS").map_or(default, |v| v.parse().expect("H2_FUZZ_ITERS"))
+}
+
+/// One frame a server might send: mostly plausible, sometimes not.
+fn random_frame(rng: &mut Rng) -> Vec<u8> {
+    const STREAMS: [u32; 10] = [1, 1, 3, 3, 5, 7, 9, 11, 0, 2];
+    const STATUS: [&str; 8] = ["200", "200", "204", "304", "100", "103", "101", "abc"];
+    let id = rng.pick(&STREAMS);
+    let end = rng.chance(30);
+    match rng.below(16) {
+        0..=3 => {
+            let mut fields = vec![(":status", rng.pick(&STATUS))];
+            if rng.chance(30) {
+                fields.push(("content-length", rng.pick(&["0", "5", "3000", "x", "1, 2"])));
+            }
+            if rng.chance(30) {
+                fields.push((rng.pick(&["x-a", "content-type", ":path", "X-UP"]), "v"));
+            }
+            if rng.chance(10) {
+                let last = 1.min(fields.len() - 1);
+                fields.swap(0, last);
+            }
+            headers(id, &fields, end)
+        }
+        4..=7 => {
+            let len = rng.pick(&[0, 1, 5, 5, 100, 3000, 16_384]);
+            if rng.chance(15) {
+                let pad = rng.below(40) as u8;
+                let mut payload = vec![pad];
+                payload.extend(rng.bytes(len.min(2000)));
+                payload.extend(vec![0; usize::from(pad).saturating_sub(rng.below(3))]);
+                let flags = flag::PADDED | if end { flag::END_STREAM } else { 0 };
+                frame(kind::DATA, flags, id, &payload)
+            } else {
+                data(id, &rng.bytes(len), end)
+            }
+        }
+        8 => window_update(id, rng.pick(&[0, 1, 1000, 65_535, 1 << 20, 0x7fff_ffff])),
+        9 => rst_stream(id, Reason(rng.below(16) as u32)),
+        10 => goaway(rng.pick(&STREAMS), Reason(rng.below(3) as u32)),
+        11 => {
+            let flags = if rng.chance(30) { flag::ACK } else { 0 };
+            let len = rng.pick(&[8, 8, 8, 7]);
+            frame(kind::PING, flags, 0, &rng.bytes(len))
+        }
+        12 => {
+            let entries: Vec<(u16, u32)> = (0..rng.below(4))
+                .map(|_| {
+                    let value = rng.pick(&[0, 1, 2, 100, 16_384, 65_535, 1 << 20, u32::MAX]);
+                    (rng.below(8) as u16, value)
+                })
+                .collect();
+            settings(&entries)
+        }
+        13 => {
+            // A header block in pieces, or a stray continuation.
+            let fields = block(&[(":status", "200"), ("x-long", &"v".repeat(60))]);
+            let cut = rng.below(fields.len());
+            let mut out = frame(kind::HEADERS, 0, id, &fields[..cut]);
+            if rng.chance(80) {
+                out.extend(frame(
+                    kind::CONTINUATION,
+                    flag::END_HEADERS,
+                    id,
+                    &fields[cut..],
+                ));
+            }
+            out
+        }
+        14 => {
+            // HPACK that uses the tables, valid or not.
+            let mut payload = vec![0x88, 0x40 | rng.below(64) as u8];
+            let len = rng.below(12);
+            payload.extend(rng.bytes(len));
+            frame(kind::HEADERS, flag::END_HEADERS, id, &payload)
+        }
+        _ => {
+            let kind = rng.pick(&[kind::PRIORITY, kind::PUSH_PROMISE, 0x0a, 0x42, 0xff]);
+            let flags = rng.next() as u8;
+            let len = rng.pick(&[0, 4, 5, 8, 30]);
+            frame(kind, flags, id, &rng.bytes(len))
+        }
+    }
+}
+
+/// An input for [`fuzzing::connection`]: two control bytes, then a run
+/// of frames that has sometimes been damaged.
+fn random_connection_input(rng: &mut Rng) -> Vec<u8> {
+    let mut input = rng.bytes(2);
+    if rng.chance(90) {
+        input[0] |= 0x80;
+    }
+    for _ in 0..rng.below(40) {
+        input.extend(random_frame(rng));
+    }
+    if rng.chance(25) && input.len() > 2 {
+        for _ in 0..1 + rng.below(4) {
+            let at = 2 + rng.below(input.len() - 2);
+            input[at] ^= 1 << rng.below(8);
+        }
+    }
+    if rng.chance(10) && input.len() > 2 {
+        input.truncate(2 + rng.below(input.len() - 2));
+    }
+    if rng.chance(5) {
+        let len = rng.below(64);
+        let junk = rng.bytes(len);
+        input.extend(junk);
+    }
+    input
+}
+
+#[test]
+fn random_frame_sequences_never_break_the_connection() {
+    for seed in 1..=iterations(1500) as u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let input = random_connection_input(&mut rng);
+        let run = std::panic::catch_unwind(|| fuzzing::connection(&input));
+        assert!(run.is_ok(), "seed {seed}: input {input:02x?}");
+    }
+}
+
+#[test]
+fn random_bytes_never_break_the_decoders() {
+    for seed in 1..=iterations(20_000) as u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let len = rng.below(80);
+        let mut input = rng.bytes(len);
+        // Bias towards what the decoders treat specially: indexes, the
+        // literal prefixes, table size updates, all-ones padding.
+        for byte in input.iter_mut() {
+            if rng.chance(30) {
+                *byte = rng.pick(&[0x00, 0x40, 0x20, 0x3f, 0x7f, 0x80, 0x88, 0xbe, 0xff, 0x01]);
+            }
+        }
+        let run = std::panic::catch_unwind(|| {
+            fuzzing::hpack(&input);
+            fuzzing::huffman(&input);
+            fuzzing::connection(&input);
+        });
+        assert!(run.is_ok(), "seed {seed}: input {input:02x?}");
+    }
+}
+
+/// Writes inputs like the ones above where the libFuzzer targets look for
+/// their seed corpus: `H2_FUZZ_CORPUS=fuzz/corpus cargo test write_fuzz_corpus -- --ignored`.
+#[test]
+#[ignore = "writes files; run it to seed fuzz/corpus"]
+fn write_fuzz_corpus() {
+    let root = std::path::PathBuf::from(std::env::var("H2_FUZZ_CORPUS").expect("H2_FUZZ_CORPUS"));
+    let dir = root.join("h2_connection");
+    std::fs::create_dir_all(&dir).unwrap();
+    for seed in 1..=200u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        std::fs::write(
+            dir.join(format!("seed-{seed:03}")),
+            random_connection_input(&mut rng),
+        )
+        .unwrap();
+    }
+    // The elaborate response of the tests above, whole.
+    let mut input = vec![0x80 | 31, 0];
+    input.extend(elaborate_response().0);
+    std::fs::write(dir.join("elaborate"), input).unwrap();
+    let dir = root.join("h2_hpack");
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocks: [&[u8]; 3] = [
+        &[2, 0x48, 0x03, b'3', b'0', b'2', 0x58, 0x01],
+        &[1, 0x88, 0xc1, 0xc0, 0xbf],
+        &[
+            3, 0x40, 0x01, b'a', 0x82, 0x64, 0x02, 0x3f, 0x03, 0xbe, 0x20, 0x00, 0x00,
+        ],
+    ];
+    for (i, block) in blocks.iter().enumerate() {
+        std::fs::write(dir.join(format!("block-{i}")), block).unwrap();
+    }
 }

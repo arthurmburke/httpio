@@ -62,6 +62,9 @@
 //! checked, and malformed input is an error, never a panic.
 
 mod frame;
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzzing;
 mod hpack;
 mod huffman;
 #[cfg(test)]
@@ -1149,7 +1152,11 @@ impl<T: Transport> Inner<T> {
         stream.head = None;
         stream.data.clear();
         stream.upload = Upload::Done;
-        stream.pending = None;
+        // A request that was still waiting to be sent leaves the queue,
+        // or its slot's next occupant would inherit its place in it.
+        if stream.pending.take().is_some() {
+            self.pending_open.retain(|&pending| pending != index);
+        }
         let buffered = std::mem::take(&mut stream.buffered);
         self.release_connection(buffered);
         self.close_stream(index);
@@ -1704,10 +1711,10 @@ impl<T: Transport> Inner<T> {
             if increment == 0 {
                 return Err(Reason::PROTOCOL_ERROR);
             }
-            self.send_window += increment;
-            if self.send_window > MAX_WINDOW {
+            if self.send_window + increment > MAX_WINDOW {
                 return Err(Reason::FLOW_CONTROL_ERROR);
             }
+            self.send_window += increment;
             for index in std::mem::take(&mut self.conn_blocked) {
                 if let Some(stream) = self.streams.get_mut(index) {
                     stream.conn_blocked = false;
@@ -1880,7 +1887,18 @@ impl<T: Transport> Inner<T> {
             }
             self.flush(io_cx, wake);
             match self.read(io_cx, wake) {
-                Read::Closed => {}
+                // The connection is over, which fails every unfinished
+                // stream; should this one have been missed, fail it here
+                // rather than spin.
+                Read::Closed => {
+                    let finished = self
+                        .streams
+                        .get(index)
+                        .is_none_or(|stream| stream.has_event());
+                    if !finished {
+                        self.fail_stream(index, self.error.unwrap_or(H2Error::Closed));
+                    }
+                }
                 Read::Progress => {
                     // All for other streams so far: let their tasks run
                     // before reading on.
@@ -1996,6 +2014,18 @@ impl<T: Transport> SendRequest<T> {
         parts: request::Parts,
         body: EncodedBody,
     ) -> Result<ResponseFuture<T>, HttpError> {
+        self.send_ref(&parts, body)
+    }
+
+    /// [`send`](Self::send) for a caller that keeps `parts`, to send the
+    /// request again if this attempt is refused ([`H2Error::Refused`]).
+    /// The head is encoded from the borrowed parts; they are copied only
+    /// if the request has to wait for the server's concurrency limit.
+    pub fn send_ref(
+        &self,
+        parts: &request::Parts,
+        body: EncodedBody,
+    ) -> Result<ResponseFuture<T>, HttpError> {
         if hpack::authority(&parts.uri, &parts.headers).is_none() {
             return Err(HttpError::MissingHost);
         }
@@ -2020,10 +2050,10 @@ impl<T: Transport> SendRequest<T> {
             .multi
             .store(inner.streams.len > 1, Ordering::SeqCst);
         if inner.can_open() {
-            inner.open_stream(index, &parts, body);
+            inner.open_stream(index, parts, body);
         } else {
             inner.streams.get_mut(index).expect("just inserted").pending =
-                Some(Box::new((parts, body)));
+                Some(Box::new((parts.clone(), body)));
             inner.pending_open.push_back(index);
         }
         Ok(ResponseFuture {

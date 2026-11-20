@@ -1,6 +1,7 @@
 //! The HPACK Huffman code (RFC 7541 §5.2, Appendix B): decoding, which a
 //! client needs for response headers. Requests are sent without Huffman
-//! coding (see [`super::hpack`]), so encoding exists only for the tests.
+//! coding (see [`super::hpack`]), so encoding exists only for the tests
+//! and the fuzzers.
 //!
 //! Decoding reads the input through a 64-bit window. Codes of up to
 //! [`PRIMARY_BITS`] bits -- every printable ASCII character the common
@@ -378,7 +379,7 @@ pub(super) fn decode(src: &[u8], dst: &mut BytesMut) -> Result<(), InvalidHuffma
 }
 
 /// Appends the encoding of `src` to `dst`.
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 pub(super) fn encode(src: &[u8], dst: &mut Vec<u8>) {
     let mut window = 0u64;
     let mut bits = 0u32;

@@ -585,6 +585,16 @@ impl Decoder {
         Ok((name, value))
     }
 
+    /// What must hold between header blocks, whatever was decoded.
+    #[cfg(any(test, fuzzing))]
+    pub(super) fn check_invariants(&self) {
+        let size: usize = self.table.iter().map(Entry::size).sum();
+        assert_eq!(self.size, size, "the table's size is its entries'");
+        assert!(self.size <= self.max_size);
+        assert!(self.max_size <= DEFAULT_TABLE_SIZE);
+        assert!(self.values.is_empty() || self.values.capacity() >= self.values.len());
+    }
+
     /// Adds an entry at the front of the dynamic table, evicting from the
     /// back to make room. An entry larger than the whole table empties it
     /// and is not added (RFC 7541 §4.4).
