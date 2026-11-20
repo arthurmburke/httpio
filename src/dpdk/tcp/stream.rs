@@ -36,7 +36,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::core::spinlock::SpinLock;
 use crate::dpdk::tcp::app_wake::AppWake;
-use crate::dpdk::tcp::worker::{CmdTx, Command, Inbound, InboundRx, OpenError, WorkerHandle};
+use crate::dpdk::tcp::worker::{
+    CmdTx, Command, Inbound, InboundRx, OpenError, SendCredit, WorkerHandle,
+};
 use crate::dpdk::{DmaWriter, MbufSlice};
 
 /// Per-connection TCP transport options. Attach to an HTTP request via
@@ -72,11 +74,18 @@ impl Default for TcpOptions {
 /// into the request's extensions, start the request, and call
 /// [`flush`](Self::flush) whenever the held tail should go out.
 ///
-/// It carries a lock-free flag rather than a channel: the paired
-/// `TcpStream` observes the flag while it polls and enqueues the actual
-/// `Flush` command itself, so the flush stays correctly ordered *after*
-/// the request bytes it releases, and the handle stays `Send + Sync`
-/// (required to live in `http::Extensions`) without any lock.
+/// Once the request's connection exists, [`flush`](Self::flush) tells the
+/// TCP worker directly: it sets a flag the worker shares with the
+/// connection and puts the connection on the worker's notification queue.
+/// The worker releases the tail on its next turn, after whatever the
+/// stream had already written. Nothing on the application side has to run
+/// for that -- not the request's task, not the runtime -- so the reaction
+/// time is the worker's alone, whatever the calling thread does next.
+///
+/// Before the connection exists the handle only records the request, and
+/// the stream enqueues the flush itself when it is next polled. Either
+/// way the handle stays `Send + Sync` (required to live in
+/// `http::Extensions`) and may be used from any thread.
 ///
 /// ```ignore
 /// let flush = FlushHandle::new();
@@ -92,11 +101,13 @@ pub struct FlushHandle {
 }
 
 /// Shared by a [`FlushHandle`] and the stream it releases.
-struct FlushState {
+pub(crate) struct FlushState {
     requested: AtomicBool,
     /// The paired stream's waker slot, once it has connected, so a flush
     /// request reaches a stream that is waiting for the worker.
     stream: SpinLock<Option<Arc<AppWake>>>,
+    /// The paired stream's line to its worker, once it has connected.
+    worker: SpinLock<Option<Arc<SendCredit>>>,
 }
 
 impl Default for FlushState {
@@ -104,6 +115,7 @@ impl Default for FlushState {
         Self {
             requested: AtomicBool::new(false),
             stream: SpinLock::new(None),
+            worker: SpinLock::new(None),
         }
     }
 }
@@ -114,11 +126,22 @@ impl FlushHandle {
     }
 
     /// Requests release of the connection's held tail segment. Fire and
-    /// forget: the paired `TcpStream` picks this up on its next poll and
-    /// enqueues the flush (ordered after any pending writes). Calling
-    /// before the connection exists is fine -- it takes effect once the
-    /// request starts.
+    /// forget: with the connection up, the worker is told at once and
+    /// sends the tail on its next turn (after any writes the stream has
+    /// already handed it). Calling before the connection exists is fine --
+    /// the paired `TcpStream` then picks the request up when it is polled.
     pub fn flush(&self) {
+        // Called under the lock rather than on a clone taken out of it: a
+        // clone would write the reference count, which shares a cache line
+        // with state the worker keeps writing, and so wait for that line
+        // before the request could even be made.
+        let told = self
+            .state
+            .worker
+            .with(|worker| worker.as_ref().is_some_and(|worker| worker.request_flush()));
+        if told {
+            return;
+        }
         self.state.requested.store(true, Ordering::Release);
         // The request is set before the wake, and the stream checks it
         // again after storing its waker, so it cannot be missed.
@@ -128,8 +151,13 @@ impl FlushHandle {
         }
     }
 
-    fn attach(&self, stream: &Arc<AppWake>) -> Arc<FlushState> {
+    pub(crate) fn attach(
+        &self,
+        stream: &Arc<AppWake>,
+        worker: &Arc<SendCredit>,
+    ) -> Arc<FlushState> {
         self.state.stream.with(|slot| *slot = Some(stream.clone()));
+        self.state.worker.with(|slot| *slot = Some(worker.clone()));
         self.state.clone()
     }
 }
@@ -332,10 +360,11 @@ impl TcpStream {
                 ),
             })?;
 
+        let flush = flush.map(|flush| flush.attach(&endpoints.wake, endpoints.cmd_tx.credit()));
         let mut stream = Self {
             cmd_tx: endpoints.cmd_tx,
             inbound_rx: endpoints.inbound_rx,
-            flush: flush.map(|flush| flush.attach(&endpoints.wake)),
+            flush,
             wake: Some(Parker(endpoints.wake)),
             state: StreamState::Connecting,
             read_chunk: None,
@@ -1132,7 +1161,9 @@ mod tests {
     fn a_flush_request_reaches_a_stream_that_is_waiting() {
         let (mut stream, cmd_rx, _inbound_tx, _notifier, wake) = parked_fixture();
         let flush = FlushHandle::new();
-        stream.flush = Some(flush.attach(&wake));
+        // No worker behind this stream: the request goes through the
+        // stream, which has to be woken for it.
+        stream.flush = Some(flush.attach(&wake, stream.cmd_tx.credit()));
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

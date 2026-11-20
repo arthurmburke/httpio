@@ -13,6 +13,8 @@ pub mod mempool;
 mod metrics;
 pub mod net;
 pub mod port;
+#[cfg(feature = "tx-probe")]
+pub mod probe;
 pub mod steering;
 pub mod tcp;
 #[cfg(test)]

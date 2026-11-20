@@ -437,9 +437,13 @@ impl EthPort {
             let raw = unsafe { mbufs.as_mut_ptr().add(accepted).cast::<*mut ffi::rte_mbuf>() };
             #[cfg(feature = "tcp-metrics")]
             let metrics_start = std::time::Instant::now();
+            #[cfg(feature = "tx-probe")]
+            let probe_armed = super::probe::before_transmit();
             let sent = unsafe {
                 ffi::rte_eth_tx_burst(self.port_id, self.queue_id, raw, n as u16)
             } as usize;
+            #[cfg(feature = "tx-probe")]
+            super::probe::after_transmit(probe_armed, sent);
             #[cfg(feature = "tcp-metrics")]
             super::metrics::record(|m| {
                 m.tx_calls += 1;

@@ -25,7 +25,7 @@
 use crate::core::time::{Duration, Instant};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
@@ -108,6 +108,16 @@ struct Wake {
     queued: AtomicBool,
 }
 
+/// Corked connections whose flush flag the worker reads on every turn of
+/// its loop (see [`SendCredit::flush`]); any beyond this many are reached
+/// through the notification queue, a few hundred nanoseconds later.
+const WATCHED_FLUSHES: usize = 16;
+
+/// A value on a cache line of its own, so that the thread writing it and
+/// the thread reading it share that line and nothing else.
+#[repr(align(128))]
+struct OwnLine<T>(T);
+
 pub(crate) struct SendCredit {
     wake: Option<Wake>,
     /// Current credit: written by the worker, read by the application.
@@ -118,9 +128,66 @@ pub(crate) struct SendCredit {
     app_gone: AtomicBool,
     pub(crate) bytes: AtomicUsize,
     pub(crate) failed: AtomicBool,
+    /// A [`FlushHandle`](super::stream::FlushHandle) asked for the held
+    /// tail to be released: set from whichever thread called it, taken by
+    /// the worker. A flag beside the command ring rather than a command on
+    /// it, because the ring has one producer (the stream) and the request
+    /// must not wait for that producer's task to be scheduled.
+    ///
+    /// While the connection is corked the worker reads this on every turn
+    /// of its loop instead of waiting to be notified, so setting it costs
+    /// the request one cache line crossing between the cores -- hence a
+    /// line of its own, which nothing else dirties.
+    ///
+    /// A count of requests rather than a flag to be cleared: the worker
+    /// compares it with [`flush_seen`](Self::flush_seen), which only it
+    /// writes, so taking a request does not pull this line back to the
+    /// worker's core for a write.
+    flush: OwnLine<AtomicU32>,
+    /// The value of `flush` the worker has acted on. Worker-only.
+    flush_seen: AtomicU32,
 }
 
 impl SendCredit {
+    /// Asks the worker, directly, to release the connection's held tail
+    /// once it has applied every command already on the ring. `false`,
+    /// doing nothing, when no worker is listening (a stream built without
+    /// one, in tests).
+    pub(crate) fn request_flush(&self) -> bool {
+        // The flag before anything else, even before looking at the rest
+        // of this struct: a worker watching it acts on this store alone,
+        // and every other field here sits on lines the worker writes,
+        // which would have to cross between the cores first.
+        let previous = self.flush.0.fetch_add(1, Ordering::AcqRel);
+        if self.wake.is_none() {
+            // Nobody to act on it: as if it had been seen.
+            self.flush_seen
+                .store(previous.wrapping_add(1), Ordering::Release);
+            return false;
+        }
+        // For a connection the worker is not watching; after the flag, so
+        // the visit it causes sees it.
+        self.notify();
+        true
+    }
+
+    /// Whether a flush request is pending, without taking it.
+    fn flush_requested(&self) -> bool {
+        self.flush.0.load(Ordering::Acquire) != self.flush_seen.load(Ordering::Relaxed)
+    }
+
+    /// Takes the pending flush requests, however many: one release serves
+    /// them all. This runs for every connection the worker visits, and
+    /// almost none has one.
+    fn take_flush(&self) -> bool {
+        let requested = self.flush.0.load(Ordering::Acquire);
+        if requested == self.flush_seen.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.flush_seen.store(requested, Ordering::Relaxed);
+        true
+    }
+
     fn notify(&self) {
         if let Some(wake) = &self.wake {
             if !wake.queued.swap(true, Ordering::AcqRel) && wake.sender.tx.push(wake.tuple).is_err()
@@ -185,6 +252,12 @@ impl CmdTx {
         self.ring.is_closed()
     }
 
+    /// The state shared with the worker, through which a flush can be
+    /// requested without going through the ring.
+    pub(crate) fn credit(&self) -> &Arc<SendCredit> {
+        &self.outstanding
+    }
+
     /// Send commands also reserve byte credit, released only after ACK or discard.
     pub fn push(&self, cmd: Command) -> Result<(), Command> {
         let bytes = match &cmd {
@@ -240,6 +313,8 @@ fn command_channel_with_wake(
         app_gone: AtomicBool::new(false),
         bytes: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
+        flush: OwnLine(AtomicU32::new(0)),
+        flush_seen: AtomicU32::new(0),
     });
     (
         CmdTx {
@@ -934,6 +1009,9 @@ fn run(
     let mut events = Vec::new();
     let mut work = HashSet::default();
     let mut closing = HashSet::default();
+    // Corked connections, whose flush requests are looked for directly: a
+    // corked request exists to be released the instant it is flushed.
+    let mut watched: Vec<(FourTuple, Arc<SendCredit>)> = Vec::new();
     while !stop.get() {
         #[cfg(feature = "tcp-metrics")]
         crate::dpdk::metrics::record(|m| m.worker_iterations += 1);
@@ -979,6 +1057,13 @@ fn run(
 
         collect_ready(&ready_rx, &overflow, &conns, &mut work);
         work.extend(closing.iter().copied());
+        // A flush request on a watched connection: visit it now. The flag
+        // is taken below, once the connection's commands are applied.
+        for (tuple, credit) in &watched {
+            if credit.flush_requested() {
+                work.insert(*tuple);
+            }
+        }
         // 2. Apply commands only to notified connections.
         for tuple in &work {
             let Some(conn) = conns.get_mut(tuple) else {
@@ -995,7 +1080,13 @@ fn run(
                         conn.engine_bytes += data.len();
                         engine.send(conn.tuple, data);
                     }
-                    Command::SetCork(c) => engine.set_cork(conn.tuple, c),
+                    Command::SetCork(corked) => {
+                        engine.set_cork(conn.tuple, corked);
+                        watched.retain(|(tuple, _)| *tuple != conn.tuple);
+                        if corked && watched.len() < WATCHED_FLUSHES {
+                            watched.push((conn.tuple, conn.outstanding.clone()));
+                        }
+                    }
                     Command::Flush => engine.flush(conn.tuple),
                     Command::Close => conn.close(&mut engine),
                 }
@@ -1004,6 +1095,12 @@ fn run(
             // the rest without waiting for the application to push again.
             if !conn.cmd_rx.is_empty() {
                 conn.outstanding.notify();
+            } else if conn.outstanding.take_flush() {
+                // A flush requested past the ring. Applied only with the
+                // ring drained, so it releases everything written before
+                // it was asked for, as a command at the ring's end would;
+                // until then the request stays set for the next visit.
+                engine.flush(conn.tuple);
             }
         }
 
@@ -1058,6 +1155,7 @@ fn run(
             if !conn.retain_after_drop(&mut engine, now) {
                 conns.remove(&tuple);
                 closing.remove(&tuple);
+                watched.retain(|(watched, _)| *watched != tuple);
             } else if conn.is_orphaned() {
                 closing.insert(tuple);
             }
@@ -1096,6 +1194,57 @@ mod tests {
             .unwrap();
         let conn = WorkerConn::new(tuple, cmd_rx, outstanding, inbound_tx);
         (tx, conn, engine)
+    }
+
+    /// A `FlushHandle` reaches the worker without the stream: nothing goes
+    /// on the command ring, the connection is notified, and the request
+    /// is there to be taken once, however often it was made.
+    #[test]
+    fn a_flush_handle_tells_the_worker_directly() {
+        let (_, base, _) = fixture();
+        let tuple = base.tuple;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let overflow = Arc::new(AtomicBool::new(false));
+        let wake = Wake {
+            tuple,
+            queued: AtomicBool::new(false),
+            sender: ReadySender {
+                tx: ready_tx,
+                overflow: overflow.clone(),
+            },
+        };
+        let (tx, conn, _) = fixture_with_wake(Some(wake));
+        let (_notifier, ready) = crate::dpdk::tcp::app_wake::channel();
+        let flush = crate::dpdk::tcp::stream::FlushHandle::new();
+        let _state = flush.attach(&ready.wake_handle(), tx.credit());
+        assert!(!conn.outstanding.flush_requested());
+
+        // From another thread, as a caller reacting to something would.
+        let handle = flush.clone();
+        std::thread::spawn(move || {
+            handle.flush();
+            handle.flush();
+        })
+        .join()
+        .unwrap();
+        assert!(conn.cmd_rx.is_empty(), "the ring has one producer");
+        assert!(conn.outstanding.flush_requested());
+        let mut conns = HashMap::default();
+        conns.insert(tuple, conn);
+        let mut work = HashSet::default();
+        collect_ready(&ready_rx, &overflow, &conns, &mut work);
+        assert!(work.contains(&tuple), "an unwatched connection is notified");
+        let conn = &conns[&tuple];
+        assert!(conn.outstanding.take_flush());
+        assert!(!conn.outstanding.take_flush(), "two requests, one release");
+        assert!(!conn.outstanding.flush_requested());
+        flush.flush();
+        assert!(conn.outstanding.take_flush());
+
+        // With no worker behind the stream the request is not left here.
+        let (tx, conn, _) = fixture_with_wake(None);
+        assert!(!tx.credit().request_flush());
+        assert!(!conn.outstanding.flush_requested());
     }
 
     #[test]

@@ -82,3 +82,10 @@ codegen-units = 1
 [features]
 # Diagnostic counters/timers; compiled out of normal builds.
 tcp-metrics = []
+# When the worker next transmits, for latency benchmarks (`dpdk::probe`,
+# `examples/bench_cork.rs`); compiled out of normal builds.
+tx-probe = []
+
+[[example]]
+name = "bench_cork"
+required-features = ["tx-probe"]
