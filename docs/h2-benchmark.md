@@ -111,5 +111,7 @@ scripts/bench_h2.sh > h2.tsv
 
 `BENCH_H2_REPEATS`, `BENCH_H2_ROUNDS`, `BENCH_H2_PROTO=tls|h2c`,
 `BENCH_H2_METHOD`, `BENCH_H2_BYTES` and `BENCH_H2_CONCURRENCY` narrow or
-resize the run; `BENCH_H2_MODES=dpdk-h2` runs one client, and
+resize the run; `BENCH_H2_MODES=dpdk-h2` runs one client;
+`BENCH_H2_MODES=dpdk-client` runs the TLS cases through `Client` itself,
+after checking that streamed uploads share its pooled connection; and
 `BENCH_H2_WRAP="perf record -g -o /tmp/perf.data"` profiles it.

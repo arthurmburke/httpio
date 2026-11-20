@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Run as root in the DPDK devcontainer (NET_ADMIN and network namespaces).
-# Same server, veth link, MTU, NODELAY and disabled offloads for both clients:
-# this crate's HTTP/2 codec (dpdk-h2) and hyper's (dpdk-hyper), each over the
-# DPDK TCP and TLS streams on one reused connection. See examples/bench_h2.rs
-# for the columns; client_us is the one that leaves the kernel side out.
+# Same server, veth link, MTU, NODELAY and disabled offloads for every client:
+# this crate's HTTP codecs (dpdk-h2) and hyper's (dpdk-hyper) over the DPDK TCP
+# and TLS streams, and hyper over kernel sockets (kernel). See
+# examples/bench_h2.rs for the protocols, workloads and columns; client_us is
+# the one that leaves the kernel side out.
 # Uses dedicated names and refuses to overwrite existing network resources.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -41,6 +42,14 @@ ip netns exec "$NS" taskset -c 2 "$BIN" server 10.72.0.2 &
 SERVER_PID=$!
 sleep 1
 kill -0 "$SERVER_PID"
+# hyper over kernel sockets, while the kernel still owns the client address.
+# BENCH_H2_KERNEL=0 leaves it out.
+if [[ "${BENCH_H2_KERNEL:-1}" == 1 ]]; then
+    for ((r=1; r<=REPEATS; r++)); do
+        echo "# repeat=$r backend=kernel"
+        taskset -c 0 "$BIN" kernel 10.72.0.2
+    done
+fi
 ip addr del 10.72.0.1/24 dev "$DEV"
 # Packet sockets receive before tc ingress; keep the kernel from forwarding
 # traffic addressed to the userspace stack.
@@ -50,13 +59,19 @@ for ((r=1; r<=REPEATS; r++)); do
     # Alternate order to reduce consistent order bias.
     modes=(dpdk-h2 dpdk-hyper)
     if ((r % 2 == 0)); then modes=(dpdk-hyper dpdk-h2); fi
-    # BENCH_H2_MODES="dpdk-h2" runs one client only.
+    # BENCH_H2_MODES="dpdk-h2" runs one client only; "dpdk-client" runs the
+    # TLS cases through the crate's HTTP client and checks that streamed
+    # uploads and every other request share one pooled connection.
     if [[ -n "${BENCH_H2_MODES:-}" ]]; then read -ra modes <<<"$BENCH_H2_MODES"; fi
     for mode in "${modes[@]}"; do
         echo "# repeat=$r backend=$mode"
         # A fresh source IP prevents server TIME_WAIT from a previous process
         # colliding with the new stack's independently chosen ephemeral ports.
-        if [[ "$mode" == dpdk-hyper ]]; then host=$((11 + r * 2)); else host=$((10 + r * 2)); fi
+        case "$mode" in
+            dpdk-hyper) host=$((11 + r * 2)) ;;
+            dpdk-client) host=$((100 + r)) ;;
+            *) host=$((10 + r * 2)) ;;
+        esac
         # BENCH_H2_WRAP="perf record -o /tmp/perf.data" profiles the client.
         ${BENCH_H2_WRAP:-} "$BIN" "$mode" -l 0-1 --no-huge --no-pci --log-level=error --vdev=net_af_packet0,iface="$DEV" -- "10.72.0.$host" 10.72.0.2
     done
