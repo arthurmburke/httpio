@@ -19,6 +19,7 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static READY_NS: AtomicU64 = AtomicU64::new(0);
 static SENT_NS: AtomicU64 = AtomicU64::new(0);
 static BURSTS: AtomicU64 = AtomicU64::new(0);
+static PREBUILT: AtomicU64 = AtomicU64::new(0);
 
 /// The monotonic clock in nanoseconds, the probe's time base.
 pub fn now_ns() -> u64 {
@@ -51,6 +52,17 @@ pub fn fired() -> Option<(u64, u64)> {
 /// has gone quiet.
 pub fn bursts() -> u64 {
     BURSTS.load(Ordering::Relaxed)
+}
+
+/// Corked tails sent, on their flush, as the packet built while they were
+/// held (`TcpEngine::prebuilt_sent`, summed over the workers).
+pub fn prebuilt_sent() -> u64 {
+    PREBUILT.load(Ordering::Relaxed)
+}
+
+/// A flushed tail went out as its prebuilt packet.
+pub(crate) fn sent_prebuilt() {
+    PREBUILT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The worker is about to hand a burst to the driver. Returns whether the

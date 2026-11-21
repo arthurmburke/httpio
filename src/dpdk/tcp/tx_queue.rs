@@ -34,6 +34,39 @@ impl SendBuffer {
         self.len == 0
     }
 
+    /// The first `max_len` bytes as shared slices, left in the buffer:
+    /// what [`take`](Self::take) would remove, fragment for fragment.
+    pub fn peek(&self, max_len: usize) -> Payload {
+        let len = max_len.min(self.len);
+        // (chunk, bytes of it within the first `len`), front to back.
+        let parts = || {
+            let mut remaining = len;
+            self.chunks.iter().map_while(move |chunk| {
+                if remaining == 0 {
+                    return None;
+                }
+                let n = remaining.min(chunk.len());
+                remaining -= n;
+                Some((chunk, n))
+            })
+        };
+        let count = parts().count();
+        let mut out = Payload::default();
+        if count > INLINE_FRAGMENTS {
+            let rest: Vec<Bytes> = parts()
+                .skip(INLINE_FRAGMENTS)
+                .map(|(chunk, n)| chunk.slice(..n))
+                .collect();
+            out.overflow = Some(Arc::from(rest));
+        }
+        for (i, (chunk, n)) in parts().take(INLINE_FRAGMENTS).enumerate() {
+            out.chunks[i] = chunk.slice(..n);
+            out.count = i + 1;
+        }
+        out.len = len;
+        out
+    }
+
     /// Removes up to max_len bytes as shared slices, without coalescing.
     /// Common fragment lists fit inline; overflow stores only shared metadata.
     pub fn take(&mut self, max_len: usize) -> Payload {
@@ -248,5 +281,37 @@ impl Payload {
 impl PartialEq<[u8]> for Payload {
     fn eq(&self, other: &[u8]) -> bool {
         self.len == other.len() && self.chunks().flat_map(|b| b.iter()).eq(other.iter())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peek_shares_what_take_would_remove() {
+        for fragments in [1usize, 2, 3, 6] {
+            let chunks: Vec<Bytes> = (0..fragments)
+                .map(|i| Bytes::from(vec![i as u8 + 1; 10 + i]))
+                .collect();
+            let total: usize = chunks.iter().map(Bytes::len).sum();
+            for len in [0, 1, 10, 11, total - 1, total, total + 5] {
+                let mut buffer = SendBuffer::default();
+                for chunk in &chunks {
+                    buffer.push(chunk.clone());
+                }
+                let peeked = buffer.peek(len);
+                assert_eq!(buffer.len(), total, "peeking removes nothing");
+                let taken = buffer.take(len);
+                assert_eq!(peeked.len(), taken.len());
+                assert_eq!(peeked.len(), len.min(total));
+                // The same fragments of the same memory, in the same order.
+                let fragments = |payload: &Payload| -> Vec<(*const u8, usize)> {
+                    payload.chunks().map(|b| (b.as_ptr(), b.len())).collect()
+                };
+                assert_eq!(fragments(&peeked), fragments(&taken));
+                assert_eq!(buffer.len(), total - taken.len());
+            }
+        }
     }
 }

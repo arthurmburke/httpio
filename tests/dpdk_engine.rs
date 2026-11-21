@@ -83,6 +83,149 @@ fn output(port: &EthPort) -> Vec<tcp::TcpHeader> {
         .collect()
 }
 
+/// TCP packets the engine put on the wire, with their payloads.
+fn tcp_output(port: &EthPort) -> Vec<(tcp::TcpHeader, Vec<u8>)> {
+    port.rx_burst(64)
+        .into_iter()
+        .filter_map(|packet| {
+            let frame = packet.data();
+            if eth::EthHeader::parse(frame)?.ethertype != eth::ETHERTYPE_IPV4 {
+                return None;
+            }
+            let ip = ipv4::Ipv4Header::parse(&frame[eth::ETH_HDR_LEN..], true)?;
+            let segment = &frame[eth::ETH_HDR_LEN + ipv4::IPV4_HDR_LEN
+                ..eth::ETH_HDR_LEN + ip.total_length as usize];
+            let (header, _) = tcp::TcpHeader::parse(segment, ip.src, ip.dst, true)?;
+            let payload = segment[header.wire_len()..].to_vec();
+            Some((header, payload))
+        })
+        .collect()
+}
+
+/// A corked tail's packet is built while the tail is held and sent as it
+/// is on the flush -- but only when it is still the right packet.
+fn corked_tails_are_sent_from_prebuilt_packets(port: &EthPort, pool: &Mempool) {
+    let available = unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) };
+    let mut engine = TcpEngine::new(EngineConfig {
+        local_ip: LOCAL_IP,
+        local_mac: LOCAL_MAC,
+        gateway: None,
+    });
+    let now = Instant::now();
+    let mut reply = ethernet_packet(pool, arp::ETHERTYPE_ARP, arp::ARP_HDR_LEN);
+    arp::ArpPacket {
+        operation: arp::OP_REPLY,
+        sender_mac: PEER_MAC,
+        sender_ip: PEER_IP,
+        target_mac: LOCAL_MAC,
+        target_ip: LOCAL_IP,
+    }
+    .write(&mut reply.data_mut()[eth::ETH_HDR_LEN..]);
+    assert!(port.tx_burst(vec![reply]).is_empty());
+    engine.poll(port, pool, now);
+    let tuple = engine.connect(PEER_IP, 80, 5000).unwrap();
+    engine.poll(port, pool, now);
+    let syn = output(port).remove(0);
+    let mut peer = tcp::TcpHeader {
+        src_port: 80,
+        dst_port: 5000,
+        seq: 7000,
+        ack: syn.seq.wrapping_add(1),
+        flags: tcp::flags::SYN | tcp::flags::ACK,
+        window: u16::MAX,
+        urgent_pointer: 0,
+        options: tcp::TcpOptions::default(),
+    };
+    inject_tcp(port, pool, &peer, &[]);
+    engine.poll(port, pool, now);
+    output(port);
+    peer.seq += 1;
+    peer.flags = tcp::flags::ACK;
+    engine.set_cork(tuple, true);
+
+    // Staged in two writes, held, then flushed: one packet, the one built
+    // while it waited.
+    engine.send(tuple, Bytes::from_static(b"held "));
+    engine.poll(port, pool, now);
+    engine.send(tuple, Bytes::from_static(b"tail"));
+    engine.poll(port, pool, now);
+    assert!(tcp_output(port).is_empty(), "the tail must be held");
+    assert_eq!(engine.prebuilt_sent(), 0);
+    engine.flush(tuple);
+    engine.poll(port, pool, now);
+    let sent = tcp_output(port);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, b"held tail");
+    assert_eq!(sent[0].0.ack, peer.seq);
+    assert!(sent[0].0.has_flag(tcp::flags::PSH));
+    assert_eq!(engine.prebuilt_sent(), 1);
+    peer.ack = sent[0].0.seq.wrapping_add(9);
+    inject_tcp(port, pool, &peer, &[]);
+    engine.poll(port, pool, now);
+    assert!(tcp_output(port).is_empty());
+
+    // The peer sends data while a tail is held, and the application reads
+    // it: the packet is rebuilt with the new acknowledgement and window,
+    // and that one is sent.
+    engine.send(tuple, Bytes::from_static(b"second"));
+    engine.poll(port, pool, now);
+    inject_tcp(port, pool, &peer, &[9; 10]);
+    peer.seq += 10;
+    engine.poll(port, pool, now);
+    engine.recv_each(tuple, usize::MAX, |_| true);
+    engine.poll(port, pool, now);
+    assert!(tcp_output(port).is_empty());
+    engine.flush(tuple);
+    engine.poll(port, pool, now);
+    let sent = tcp_output(port);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, b"second");
+    assert_eq!(sent[0].0.ack, peer.seq);
+    assert_eq!(engine.prebuilt_sent(), 2);
+    peer.ack = sent[0].0.seq.wrapping_add(6);
+
+    // Data from the peer and the flush in the same poll: the packet built
+    // earlier acknowledges too little, so it is not the one sent.
+    engine.send(tuple, Bytes::from_static(b"third"));
+    engine.poll(port, pool, now);
+    inject_tcp(port, pool, &peer, &[9; 5]);
+    peer.seq += 5;
+    engine.flush(tuple);
+    engine.poll(port, pool, now);
+    let sent = tcp_output(port);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, b"third");
+    assert_eq!(sent[0].0.ack, peer.seq, "a stale packet was sent");
+    assert_eq!(engine.prebuilt_sent(), 2);
+    peer.ack = sent[0].0.seq.wrapping_add(5);
+    inject_tcp(port, pool, &peer, &[]);
+    engine.poll(port, pool, now);
+    tcp_output(port);
+
+    // Uncorking releases a held tail just as a flush does.
+    engine.send(tuple, Bytes::from_static(b"fourth"));
+    engine.poll(port, pool, now);
+    assert!(tcp_output(port).is_empty());
+    engine.set_cork(tuple, false);
+    engine.poll(port, pool, now);
+    let sent = tcp_output(port);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, b"fourth");
+    assert_eq!(engine.prebuilt_sent(), 3);
+
+    // A tail still held when the engine goes takes its packet with it.
+    engine.set_cork(tuple, true);
+    engine.send(tuple, Bytes::from_static(b"never sent"));
+    engine.poll(port, pool, now);
+    assert!(tcp_output(port).is_empty());
+    engine.recv_each(tuple, usize::MAX, |_| true);
+    drop(engine);
+    assert_eq!(
+        unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },
+        available
+    );
+}
+
 #[test]
 fn engine_transmits_window_updates_and_final_reset() {
     let cpu = unsafe { libc::sched_getcpu() };
@@ -150,6 +293,8 @@ fn engine_transmits_window_updates_and_final_reset() {
             );
         }
         port.set_tx_burst_limit(std::num::NonZeroU16::new(64).unwrap());
+
+        corked_tails_are_sent_from_prebuilt_packets(&port, &pool);
 
         let mut engine = TcpEngine::new(EngineConfig {
             local_ip: LOCAL_IP,

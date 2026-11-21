@@ -20,11 +20,11 @@ use bytes::Bytes;
 
 use crate::core::hashmap::HashMap;
 use crate::core::hashset::HashSet;
-use table::{ConnId, ConnTable};
 use crate::dpdk::net::arp::ArpTable;
 use crate::dpdk::net::eth::EthAddr;
 use crate::dpdk::net::{arp, eth, ipv4, tcp};
 use crate::dpdk::{EthPort, Mbuf, MbufSlice, Mempool};
+use table::{ConnId, ConnTable};
 
 use super::seq::Seq;
 use super::state::TcpState;
@@ -79,6 +79,31 @@ enum NextHop {
     Resolving { since: Instant },
 }
 
+/// The packet for a corked connection's held tail, built while the tail
+/// waits so that the flush only has to hand it to the port.
+///
+/// It is a prediction and nothing more. The TCP state machine knows
+/// nothing of it and produces the segment at the flush exactly as it
+/// would otherwise; the packet is used only if that segment's header is
+/// the one predicted here, byte for byte, with as much payload and for the
+/// same next hop. A header names its sequence number, and a connection's
+/// bytes at a sequence number never change, so a match means the same
+/// packet. Anything else (the peer sent data, the application read some
+/// or wrote more) and the packet is built afresh, as if this did not
+/// exist.
+struct Prebuilt {
+    header: tcp::TcpHeader,
+    payload_len: usize,
+    mac: EthAddr,
+    mbuf: Mbuf,
+}
+
+impl Prebuilt {
+    fn is_for(&self, header: &tcp::TcpHeader, payload_len: usize, mac: EthAddr) -> bool {
+        self.payload_len == payload_len && self.mac == mac && self.header == *header
+    }
+}
+
 /// One tracked connection: the TCP state machine plus the engine's own
 /// bookkeeping for it.
 struct Conn {
@@ -91,6 +116,8 @@ struct Conn {
     /// Whether the connection is on the engine's `active` list, which
     /// therefore never holds it twice.
     active: bool,
+    /// The held tail's packet, ready for a flush; see [`Prebuilt`].
+    prebuilt: Option<Prebuilt>,
 }
 
 impl Conn {
@@ -101,6 +128,7 @@ impl Conn {
             next_hop: NextHop::Resolved,
             queued_tx: 0,
             active: false,
+            prebuilt: None,
         }
     }
 }
@@ -196,6 +224,8 @@ pub struct TcpEngine {
     listeners: HashSet<u16>,
     connections: ConnTable<Conn>,
     connections_opened: u64,
+    /// Flushed tails sent as the packet built ahead of time.
+    prebuilt_sent: u64,
     accept_queues: HashMap<u16, VecDeque<FourTuple>>,
     /// Future deadlines, one per connection, filed under its slot in
     /// `connections`. A connection enters `active` when its timer is due,
@@ -237,6 +267,7 @@ impl TcpEngine {
             listeners: HashSet::default(),
             connections: ConnTable::default(),
             connections_opened: 0,
+            prebuilt_sent: 0,
             accept_queues: HashMap::default(),
             arp: ArpTable::new(),
             pending_arp_replies: Vec::new(),
@@ -350,6 +381,12 @@ impl TcpEngine {
         self.connections_opened
     }
 
+    /// How many corked tails went out, on their flush, as the packet built
+    /// while they were held (rather than one built at the flush).
+    pub fn prebuilt_sent(&self) -> u64 {
+        self.prebuilt_sent
+    }
+
     pub fn accept(&mut self, port: u16) -> Option<FourTuple> {
         self.accept_queues.get_mut(&port)?.pop_front()
     }
@@ -438,8 +475,9 @@ impl TcpEngine {
                 break;
             }
         }
-        // Reading only needs a poll when it produced a window update.
-        if any && conn.tcb.has_pending_output() {
+        // Reading only needs a poll when it produced a window update, or
+        // changed the window a prebuilt packet was given.
+        if any && (conn.tcb.has_pending_output() || conn.prebuilt.is_some()) {
             Self::mark_active(&mut self.active, conn, id);
         }
     }
@@ -628,6 +666,9 @@ impl TcpEngine {
             if !conn.tcb.has_pending_output() {
                 if conn.tcb.is_closed() {
                     remove(connections, id);
+                } else if conn.tcb.is_corked() || conn.prebuilt.is_some() {
+                    // Nothing to send; perhaps a held tail to have ready.
+                    prepare_held_tail(conn, pool, config, arp, now, tx_offload, tx_max_segments);
                 }
                 continue;
             }
@@ -692,22 +733,35 @@ impl TcpEngine {
                 // joins the batch for the port. It waits in `pending_tx`
                 // only when the pool has no mbuf for it, or behind earlier
                 // packets that are already waiting for one.
-                if self.pending_tx.is_empty()
-                    && let Some(mbuf) = build_tcp_packet(
-                        pool,
-                        config.local_mac,
-                        mac,
-                        tuple,
-                        &header,
-                        payload,
-                        tx_offload,
-                        tso_mss,
-                        tx_max_segments,
-                    )
-                {
-                    self.tx_owners.push(owned.then_some((id, seg.seq)));
-                    self.tx_batch.push(mbuf);
-                    continue;
+                if self.pending_tx.is_empty() {
+                    // The packet built while this segment was a held
+                    // tail, if that is the segment this still is.
+                    let ready = match conn.prebuilt.take() {
+                        Some(prebuilt)
+                            if tso_mss == 0 && prebuilt.is_for(&header, payload.len(), mac) =>
+                        {
+                            self.prebuilt_sent += 1;
+                            #[cfg(feature = "tx-probe")]
+                            crate::dpdk::probe::sent_prebuilt();
+                            Some(prebuilt.mbuf)
+                        }
+                        _ => build_tcp_packet(
+                            pool,
+                            config.local_mac,
+                            mac,
+                            tuple,
+                            &header,
+                            payload,
+                            tx_offload,
+                            tso_mss,
+                            tx_max_segments,
+                        ),
+                    };
+                    if let Some(mbuf) = ready {
+                        self.tx_owners.push(owned.then_some((id, seg.seq)));
+                        self.tx_batch.push(mbuf);
+                        continue;
+                    }
                 }
                 self.pending_tx.push_back(PendingTcp {
                     id,
@@ -722,6 +776,10 @@ impl TcpEngine {
             }
             if !owned {
                 remove(connections, id);
+            } else if conn.tcb.is_corked() || conn.prebuilt.is_some() {
+                // What was sent may have left a tail held, or changed
+                // the header one will carry.
+                prepare_held_tail(conn, pool, config, arp, now, tx_offload, tx_max_segments);
             }
         }
 
@@ -925,11 +983,7 @@ impl TcpEngine {
 
     /// A queued packet left the engine, accepted by the port or given up
     /// on: either way its retransmission timer runs from now.
-    fn transmitted(
-        connections: &mut ConnTable<Conn>,
-        (id, seq): (ConnId, Seq),
-        now: Instant,
-    ) {
+    fn transmitted(connections: &mut ConnTable<Conn>, (id, seq): (ConnId, Seq), now: Instant) {
         // An owned packet's connection is still tracked: `abort`
         // discards a connection's queued packets along with it.
         if let Some(conn) = connections.by_id_mut(id) {
@@ -1130,6 +1184,58 @@ fn external_segment_count(payload: &Payload, max_segments: usize) -> Option<usiz
         }
     }
     Some(count)
+}
+
+/// Keeps `conn.prebuilt` in step with the tail the connection holds:
+/// builds the packet a flush would send now if there is none or the one
+/// there no longer fits, and drops it if no tail is held (or its next hop
+/// is unknown, or the pool has no mbuf to spare). Cheap when nothing
+/// changed: a header is predicted and compared, nothing is built.
+fn prepare_held_tail(
+    conn: &mut Conn,
+    pool: &Mempool,
+    config: &EngineConfig,
+    arp: &ArpTable,
+    now: Instant,
+    tx_cksum_offload: bool,
+    max_segments: usize,
+) {
+    let tuple = conn.tcb.tuple;
+    let held = conn.tcb.held_tail().and_then(|(header, len)| {
+        let mac = arp.lookup(config.next_hop(tuple.remote_ip), now)?;
+        Some((header, len, mac))
+    });
+    let Some((header, payload_len, mac)) = held else {
+        conn.prebuilt = None;
+        return;
+    };
+    if conn
+        .prebuilt
+        .as_ref()
+        .is_some_and(|prebuilt| prebuilt.is_for(&header, payload_len, mac))
+    {
+        return;
+    }
+    // The old packet goes back to the pool before the new one is taken.
+    conn.prebuilt = None;
+    let payload = conn.tcb.held_tail_payload(payload_len);
+    conn.prebuilt = build_tcp_packet(
+        pool,
+        config.local_mac,
+        mac,
+        tuple,
+        &header,
+        &payload,
+        tx_cksum_offload,
+        0,
+        max_segments,
+    )
+    .map(|mbuf| Prebuilt {
+        header,
+        payload_len,
+        mac,
+        mbuf,
+    });
 }
 
 /// Builds the packet for one of a connection's segments. `None` if the
@@ -1782,6 +1888,100 @@ mod tests {
             assert_eq!(engine.readable_len(tuple), 0);
             assert_eq!(available(), baseline);
         }
+    }
+
+    #[test]
+    fn held_tail_is_built_ahead_and_only_an_exact_match_is_sent() {
+        use crate::dpdk::{ffi, testing};
+        testing::init();
+        let pool = Mempool::new("prebuilt-test", 63, 0, 2176, -1).unwrap();
+        let available = || unsafe { ffi::rte_mempool_avail_count(pool.as_raw()) };
+        let baseline = available();
+        let now = Instant::now();
+        let config = cfg("10.0.0.1/24", None);
+        let mac = EthAddr::new([2, 0, 0, 0, 0, 9]);
+        let (mut tcb, peer) = established_tcb(1300, now);
+        let tuple = tcb.tuple;
+        let mut arp = ArpTable::new();
+        assert!(arp.learn(tuple.remote_ip, mac, true, now));
+        let prepare = |conn: &mut Conn, arp: &ArpTable| {
+            prepare_held_tail(conn, &pool, &config, arp, now, false, 1)
+        };
+
+        tcb.set_cork(true);
+        tcb.send(Bytes::from_static(b"held "));
+        tcb.send(Bytes::from_static(b"tail"));
+        let mut conn = Conn::new(tcb, AcceptState::NotApplicable);
+        prepare(&mut conn, &arp);
+        let built = conn.prebuilt.as_ref().expect("a tail is held");
+        let wire = built.mbuf.data().to_vec();
+        assert_eq!(&wire[54..], b"held tail");
+        let (parsed, _) = tcp::TcpHeader::parse(&wire[34..], tuple.local_ip, tuple.remote_ip, true)
+            .expect("a valid segment, checksum included");
+        assert_eq!(parsed, built.header);
+        assert_eq!(available(), baseline - 1);
+        // Nothing changed: the same packet is kept, not rebuilt.
+        let first = built.mbuf.as_raw();
+        prepare(&mut conn, &arp);
+        assert_eq!(conn.prebuilt.as_ref().unwrap().mbuf.as_raw(), first);
+
+        // The peer sends data: the packet is rebuilt to acknowledge it.
+        conn.tcb.on_segment(&peer, testing::slice(&[1; 10]), now);
+        prepare(&mut conn, &arp);
+        assert_eq!(conn.prebuilt.as_ref().unwrap().header.ack, peer.seq + 10);
+        assert_eq!(available(), baseline - 1, "the old packet went back");
+
+        // The flush produces that very segment, and the packet built ahead
+        // is, byte for byte, the one that would be built now.
+        conn.tcb.flush();
+        let mut segments = Vec::new();
+        conn.tcb.poll_output_queued(now, &mut segments, 8);
+        assert_eq!(segments.len(), 1);
+        let header = conn.tcb.to_header(&segments[0]);
+        let payload = conn.tcb.queued_payload(&segments[0].payload);
+        let prebuilt = conn.prebuilt.take().unwrap();
+        assert!(prebuilt.is_for(&header, payload.len(), mac));
+        let fresh = build_tcp_packet(
+            &pool,
+            config.local_mac,
+            mac,
+            tuple,
+            &header,
+            payload,
+            false,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(prebuilt.mbuf.data(), fresh.data());
+        // Anything else is not a match.
+        let mut other = header.clone();
+        other.window ^= 1;
+        assert!(!prebuilt.is_for(&other, payload.len(), mac));
+        assert!(!prebuilt.is_for(&header, payload.len() + 1, mac));
+        assert!(!prebuilt.is_for(&header, payload.len(), EthAddr::ZERO));
+        drop((prebuilt, fresh));
+
+        // No tail, no packet; nor without a next hop, nor once uncorked.
+        prepare(&mut conn, &arp);
+        assert!(conn.prebuilt.is_none());
+        conn.tcb.send(Bytes::from_static(b"again"));
+        prepare(&mut conn, &ArpTable::new());
+        assert!(conn.prebuilt.is_none());
+        prepare(&mut conn, &arp);
+        assert!(conn.prebuilt.is_some());
+        conn.tcb.set_cork(false);
+        prepare(&mut conn, &arp);
+        assert!(conn.prebuilt.is_none());
+        // A connection that goes away takes its packet with it.
+        conn.tcb.set_cork(true);
+        conn.tcb.send(Bytes::from_static(b"more"));
+        assert!(conn.tcb.poll_output(now).len() <= 1);
+        conn.tcb.send(Bytes::from_static(b"left behind"));
+        prepare(&mut conn, &arp);
+        assert!(conn.prebuilt.is_some());
+        drop(conn);
+        assert_eq!(available(), baseline);
     }
 
     #[test]

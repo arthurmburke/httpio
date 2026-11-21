@@ -1,16 +1,16 @@
 # Reaction time of a corked request
 
-Measured 2026-11-19 with `scripts/bench_cork.sh`. A corked request does
+Measured 2026-11-20 with `scripts/bench_cork.sh`. A corked request does
 its work ahead of time -- connection, TLS handshake, encoding, encryption
 -- and waits in the TCP engine as one held segment. Its reaction time is
 how long `FlushHandle::flush()` takes to get that segment to the NIC.
 
-**Result:** 0.79 us from `flush()` to the packet being ready for the
-driver (median; 0.38 us at best, 1.08 us at the 90th percentile), and it no
+**Result:** 0.67 us from `flush()` to the packet being ready for the
+driver (median; 0.3 us at best, 0.9 us at the 90th percentile), and it no
 longer depends on what the calling thread does next. Before, it was
 1.17 us when the caller yielded to the runtime at once and 11.1 us when it
 kept working for 10 us first. Sending the same upload from scratch on an
-open HTTP/2 connection takes 1.71 us.
+open HTTP/2 connection takes about 2 us.
 
 ## What is measured
 
@@ -35,18 +35,19 @@ development VM, not a bare-metal NIC. The clock ticks every 42 ns.
 
 ## Results
 
-`ready`, microseconds; medians of three repeats of 500 flushes (the
-"before" column is one repeat of 300):
+`ready`, microseconds; medians of three repeats of 500 flushes ("before"
+is one repeat of 300, "direct" is the first change below on its own):
 
-| Case | Trigger | Before, p50 | p50 | min | p90 | p99 |
-|---|---|---:|---:|---:|---:|---:|
-| cork, HTTP/1.1 | yield | 1.17 | 0.79 | 0.38 | 1.08 | 2.83 |
-| cork, HTTP/1.1 | busy10 | 11.08 | 0.79 | 0.38 | 1.08 | 2.83 |
-| cork, HTTP/1.1 over TLS | yield | 1.21 | 0.79 | 0.38 | 1.08 | 3.62 |
-| cork, HTTP/1.1 over TLS | busy10 | 11.12 | 0.88 | 0.33 | 1.08 | 3.50 |
-| HTTP/2, reused connection | send | 1.58 | 1.71 | 1.17 | 4.33 | 12.83 |
+| Case | Trigger | Before, p50 | Direct, p50 | Now, p50 | min | p90 | p99 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| cork, HTTP/1.1 | yield | 1.17 | 0.79 | 0.67 | 0.33 | 0.92 | 2.29 |
+| cork, HTTP/1.1 | busy10 | 11.08 | 0.79 | 0.67 | 0.33 | 0.88 | 2.67 |
+| cork, HTTP/1.1 over TLS | yield | 1.21 | 0.79 | 0.67 | 0.29 | 0.92 | 2.46 |
+| cork, HTTP/1.1 over TLS | busy10 | 11.12 | 0.88 | 0.67 | 0.29 | 0.83 | 2.42 |
+| HTTP/2, reused connection | send | 1.58 | 1.71 | 2.17 | 1.17 | 5.83 | 10.38 |
 
-`sent` p50 is 8-10 us in every case, the system call.
+`sent` p50 is 8-10 us in every case, the system call. The HTTP/2 row is
+untouched by either change; its spread between runs is its own.
 
 ## What changed
 
@@ -72,10 +73,29 @@ Now `flush()` tells the worker itself:
 A flush made before the connection exists still goes through the stream,
 as before.
 
+Then the packet itself is built ahead:
+
+- **A prebuilt packet per held tail.** Whenever the engine visits a
+  corked connection and leaves a tail held, it builds the packet a flush
+  would send right then -- mbuf, headers, payload copy, checksum -- and
+  keeps it with the connection. At the flush the TCP state machine
+  produces the segment exactly as it always did, and the packet is used
+  only if that segment's header is the predicted one, byte for byte, with
+  the same payload length and next hop; a header names its sequence
+  number, and a connection's bytes at a sequence number never change, so a
+  match is the same packet. If the peer sent data in between, or the
+  application read some or wrote more, the engine has either rebuilt the
+  packet on that visit or simply builds one at the flush as before. The
+  state machine knows nothing of any of this.
+
+The benchmark's `prebuilt` column counts the flushes that went out this
+way: all of them, in every corked case.
+
 ## Where the rest goes
 
 With temporary stage timers (each costs about 40 ns, so the total reads
-high), a flush after 3 ms of quiet spends roughly:
+high), a flush after 3 ms of quiet spent roughly this before the packet
+was prebuilt:
 
 | Stage | ns |
 |---|---:|
@@ -84,29 +104,30 @@ high), a flush after 3 ms of quiet spends roughly:
 | generating the segment (TCP state) | ~170 |
 | building the packet (mbuf, headers, payload copy, checksum) | ~170 |
 
-The worker's idle loop turns in 30-140 ns, so the first stage is mostly
-cache lines moving between the two cores, not waiting for the loop.
+Prebuilding removes the last row; the median fell by 120 ns. The worker's
+idle loop turns in 30-140 ns, so the first row is mostly cache lines
+moving between the two cores, not waiting for the loop.
 
 **It depends on how long the request has been staged.** Held for 50 ms
-before the flush, the median rises to 1.0-1.2 us and the 90th percentile to
-3-4 us: the connection's state and the payload are no longer in the
-worker's cache. On this VM that is aggravated by the host moving virtual
-CPUs around; how much remains on a pinned core of a real machine is not
-something this setup can tell.
+before the flush, the median is 0.9-1.2 us and the 90th percentile 3-4 us,
+with or without the prebuilt packet (which was used every time): the
+connection's state is no longer in the worker's cache, and that costs more
+than the build did. On this VM that is aggravated by the host moving
+virtual CPUs around; how much remains on a pinned core of a real machine
+is not something this setup can tell.
 
 ## What could still be done
 
-- **Build the packet when the request is staged**, and reuse it at the
-  flush if the header the TCP state produces then is the same. Removes the
-  build stage, which is also the part that reads the payload from another
-  core's cache. Estimated 150-200 ns, more for a request held long.
 - **Send before receiving on a turn that has a flush**: skips the receive
   burst and timer pass ahead of the output. Estimated under 100 ns.
+- **Commit the segment ahead of time**, so that a flush is only a
+  transmit and the TCP bookkeeping follows it. That would remove the
+  segment-generation stage as well, and the part of the long-hold cost
+  that is TCP state gone cold, but it changes the state machine: what the
+  held segment acknowledges would be fixed when it is staged, and ACKs for
+  data arriving meanwhile would need their own path.
 
-Neither is done here. Both touch the engine's output loop, and the second
-stage of the first idea (committing the segment ahead of time, so a flush
-is only a transmit) would change when ACKs can be sent while a tail is
-held.
+Neither is done here.
 
 ## Reproduce
 

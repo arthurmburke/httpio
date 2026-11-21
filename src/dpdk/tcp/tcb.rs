@@ -1344,7 +1344,9 @@ impl Tcb {
         self.update_persist(now);
     }
 
-    fn make_segment<P>(&self, seq: Seq, flags: u8, payload: P, mss: Option<u16>) -> OutSegment<P> {
+    /// The window field a segment with `flags` would carry now, and the
+    /// shift it is scaled by.
+    fn window_field(&self, flags: u8) -> (u16, u8) {
         let free = self
             .receive_capacity()
             .saturating_sub(self.recv_buffer.readable_len() as u32);
@@ -1353,7 +1355,60 @@ impl Tcb {
         } else {
             0
         };
-        let window = (free >> scale).min(u16::MAX as u32) as u16;
+        ((free >> scale).min(u16::MAX as u32) as u16, scale)
+    }
+
+    /// The header of the segment a flush would release right now, and
+    /// the length of its payload, while a corked tail is being held:
+    /// `None` when nothing is held, or when a flush would send something
+    /// other than that one segment first.
+    ///
+    /// For building the packet ahead of the flush. It commits nothing: the
+    /// header is only a prediction, to be compared with the one the flush
+    /// really produces (see `TcpEngine`'s `Prebuilt`).
+    pub(crate) fn held_tail(&self) -> Option<(TcpHeader, usize)> {
+        if !self.corked
+            || self.flush_requested
+            || self.send_buffer.is_empty()
+            || !self.state.can_send()
+            || self.persist == Persist::ProbeDue
+        {
+            return None;
+        }
+        // As `send_new_data` decides it: a tail shorter than a segment,
+        // all of which the windows let through.
+        let len = self.send_buffer.len();
+        let mss = self.peer_mss.min(self.local_mss) as usize;
+        let available = self.send_room(self.out_of_flight()) as usize;
+        if len >= mss || available < len {
+            return None;
+        }
+        let flags = flags::ACK | flags::PSH;
+        let (window, _) = self.window_field(flags);
+        let segment = OutSegment {
+            seq: self.snd_nxt,
+            ack: self.rcv_nxt,
+            flags,
+            window,
+            payload: QueuedPayload::none(),
+            mss: None,
+        };
+        Some((self.to_header(&segment), len))
+    }
+
+    /// The first `len` bytes waiting to be sent, still waiting: the
+    /// payload of the segment [`held_tail`](Self::held_tail) describes.
+    pub(crate) fn held_tail_payload(&self, len: usize) -> Payload {
+        self.send_buffer.peek(len)
+    }
+
+    /// Whether the connection is corked (see [`set_cork`](Self::set_cork)).
+    pub(crate) fn is_corked(&self) -> bool {
+        self.corked
+    }
+
+    fn make_segment<P>(&self, seq: Seq, flags: u8, payload: P, mss: Option<u16>) -> OutSegment<P> {
+        let (window, scale) = self.window_field(flags);
         self.rcv_advertised
             .set(self.rcv_nxt + (u32::from(window) << scale));
         OutSegment {
@@ -2134,6 +2189,56 @@ mod tests {
         assert!(!tcb.retransmit_now);
         tcb.tick(later + tcb.rto.rto());
         assert!(tcb.retransmit_now);
+    }
+
+    #[test]
+    fn held_tail_predicts_the_flushed_segment_without_committing_it() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        // Nothing held: no cork, then no data.
+        assert!(tcb.held_tail().is_none());
+        tcb.set_cork(true);
+        assert!(tcb.held_tail().is_none());
+        tcb.send(Bytes::from_static(b"held "));
+        tcb.send(Bytes::from_static(b"tail"));
+        assert!(tcb.poll_output(now).is_empty());
+
+        let advertised = tcb.rcv_advertised.get();
+        let (predicted, len) = tcb.held_tail().unwrap();
+        assert_eq!(len, 9);
+        assert!(tcb.held_tail_payload(len) == b"held tail"[..]);
+        assert_eq!(predicted.seq, tcb.snd_nxt.0);
+        assert_eq!(predicted.flags, flags::ACK | flags::PSH);
+        // Looking commits nothing.
+        assert_eq!(tcb.send_buffer.len(), 9);
+        assert_eq!(tcb.rcv_advertised.get(), advertised);
+        assert_eq!(tcb.held_tail().unwrap().0, predicted);
+
+        // What the peer sends changes what the flush will carry.
+        let data = header(tcb.rcv_nxt, tcb.snd_nxt, flags::ACK, u16::MAX);
+        tcb.on_segment(&data, slice(&[7; 100]), now);
+        let (after, _) = tcb.held_tail().unwrap();
+        assert_ne!(after, predicted);
+        assert_eq!(after.ack, predicted.ack + 100);
+
+        // The flush produces exactly the segment predicted.
+        tcb.flush();
+        assert!(tcb.held_tail().is_none(), "no longer held");
+        let output = tcb.poll_output(now);
+        assert_eq!(output.len(), 1);
+        assert_eq!(tcb.to_header(&output[0]), after);
+        assert!(output[0].payload == b"held tail"[..]);
+
+        // More than a segment is not a tail; what is left of it is.
+        tcb.send(Bytes::from(vec![1; 3000]));
+        assert!(tcb.held_tail().is_none());
+        let sent: usize = tcb
+            .poll_output(now)
+            .iter()
+            .map(|segment| segment.payload.len())
+            .sum();
+        assert!(sent > 0 && sent < 3000, "full segments flow, a tail stays");
+        assert_eq!(tcb.held_tail().unwrap().1, 3000 - sent);
     }
 
     #[test]

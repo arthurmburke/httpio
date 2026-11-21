@@ -20,6 +20,9 @@
 //! - `sent`: the driver call returned. For a poll-mode NIC the two are
 //!   nearly the same; for `af_packet` the difference is a system call.
 //!
+//! `prebuilt` counts the flushes whose segment went out as the packet the
+//! engine had built while it was held, rather than one built at the flush.
+//!
 //! What the flushing task does next matters, so each corked case runs
 //! twice: `yield`, where it yields to the runtime at once, and `busy10`,
 //! where it works for 10 microseconds first (a caller that has more to do
@@ -149,7 +152,7 @@ mod run {
         (ready - start, sent - start)
     }
 
-    fn report(case: &str, trigger: &str, samples: &[(u64, u64)]) {
+    fn report(case: &str, trigger: &str, samples: &[(u64, u64)], prebuilt: u64) {
         let column = |pick: fn(&(u64, u64)) -> u64| {
             let mut values: Vec<u64> = samples.iter().map(pick).collect();
             values.sort_unstable();
@@ -165,7 +168,7 @@ mod run {
             )
         };
         println!(
-            "{case}\t{trigger}\t{}\t{}\t{}",
+            "{case}\t{trigger}\t{}\t{}\t{}\t{prebuilt}",
             samples.len(),
             column(|s| s.0),
             column(|s| s.1)
@@ -209,7 +212,7 @@ mod run {
         let rounds = setting("BENCH_CORK_ROUNDS", 500);
         let warmup = setting("BENCH_CORK_WARMUP", 20);
         println!(
-            "case\ttrigger\tsamples\tready_min_us\tready_p50_us\tready_p90_us\tready_p99_us\tready_mean_us\tsent_min_us\tsent_p50_us\tsent_p90_us\tsent_p99_us\tsent_mean_us"
+            "case\ttrigger\tsamples\tready_min_us\tready_p50_us\tready_p90_us\tready_p99_us\tready_mean_us\tsent_min_us\tsent_p50_us\tsent_p90_us\tsent_p99_us\tsent_mean_us\tprebuilt"
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -227,13 +230,17 @@ mod run {
             for (case, url) in [("cork-h1", &plain), ("cork-h1-tls", &tls)] {
                 for (trigger, busy_ns) in [("yield", 0), ("busy10", 10_000)] {
                     let mut samples = Vec::with_capacity(rounds);
+                    let mut prebuilt = 0;
                     for round in 0..warmup + rounds {
+                        if round == warmup {
+                            prebuilt = probe::prebuilt_sent();
+                        }
                         let sample = corked(&client, url, busy_ns).await;
                         if round >= warmup {
                             samples.push(sample);
                         }
                     }
-                    report(case, trigger, &samples);
+                    report(case, trigger, &samples, probe::prebuilt_sent() - prebuilt);
                 }
             }
             let mut samples = Vec::with_capacity(rounds);
@@ -243,7 +250,7 @@ mod run {
                     samples.push(sample);
                 }
             }
-            report("h2-reused", "send", &samples);
+            report("h2-reused", "send", &samples, 0);
         });
         drop(worker);
         join.wait();
