@@ -73,6 +73,17 @@ Now `flush()` tells the worker itself:
 A flush made before the connection exists still goes through the stream,
 as before.
 
+- **A flush is final, and cannot come too early.** It used to be a
+  one-shot release of whatever tail was held at that moment. One made
+  while the request was still being staged -- during the connect or the
+  TLS handshake -- found nothing to release, was spent, and left the
+  request held for good: flushing 2 or 20 turns of the runtime after
+  starting a request lost it eight times out of eight. Now a flush
+  uncorks the connection, and the handle remembers it, so a stream that
+  comes to cork after the flush does not. The benchmark checks this
+  before it measures: requests flushed at eight points from "at once" to
+  "long since staged", cleartext and TLS, must all be answered.
+
 Then the packet itself is built ahead:
 
 - **A prebuilt packet per held tail.** Whenever the engine visits a
@@ -115,6 +126,25 @@ connection's state is no longer in the worker's cache, and that costs more
 than the build did. On this VM that is aggravated by the host moving
 virtual CPUs around; how much remains on a pinned core of a real machine
 is not something this setup can tell.
+
+Over seconds it is far worse. Measured later the same day, 6-10 flushes
+per point, cleartext, the caller kept busy for the hold so that its own
+wake-up is not part of it:
+
+| Held for | `ready` p50, us |
+|---|---:|
+| 3 ms | 0.67 |
+| 50 ms | 0.8-1.2 |
+| 2 s | 4-8 |
+| 10 s | 10-11 |
+| 62 s | 13 |
+
+The prebuilt packet was used every time; the time goes in reaching it. An
+experiment that had the worker re-read each held connection's state every
+100 us brought the 2 s figure down to 3-5 us in some runs and not in
+others, so cold data is part of it but not all. These are small samples on
+a VM whose virtual CPUs move between cores; the shape needs confirming on
+a pinned core before it is worth engineering against.
 
 ## What could still be done
 

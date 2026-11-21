@@ -12,6 +12,10 @@
 //! -- waits for the connection to go quiet, then flushes and asks the
 //! worker's transmit probe (`dpdk::probe`) when the segment left.
 //!
+//! Before measuring, it checks that a flush cannot come too early:
+//! requests flushed at every stage of being staged (before the connection
+//! exists, during its handshakes, once held) must all be answered.
+//!
 //! Two times are reported per case, both from the instant before
 //! `flush()`:
 //!
@@ -30,10 +34,13 @@
 //! corking for comparison: an HTTP/2 request sent, from scratch, on a
 //! connection that is already open.
 //!
+//! BENCH_CORK_CASE (`cork-h1`, `cork-h1-tls`, `h2-reused`) and
+//! BENCH_CORK_TRIGGER (`yield`, `busy10`) select cases.
 //! BENCH_CORK_ROUNDS and BENCH_CORK_WARMUP override the samples per case;
 //! BENCH_CORK_HOLD_MS keeps each request staged that much longer before
 //! the flush (it is flushed as soon as the connection has been quiet for
-//! 3 ms otherwise).
+//! 3 ms otherwise), with the calling thread asleep for the hold, or busy
+//! if BENCH_CORK_HOLD_SPIN=1.
 
 fn main() {
     #[cfg(all(dpdk, feature = "tx-probe"))]
@@ -100,6 +107,32 @@ mod run {
         }
     }
 
+    /// A flush cannot come too early: flushed after `yields` turns of the
+    /// runtime -- before the connection exists, during its handshakes, or
+    /// once it is staged -- the request must still be answered.
+    async fn flushed_early(client: &Client, url: &str, yields: usize) {
+        let flush = FlushHandle::new();
+        let mut request = post(url);
+        request.extensions_mut().insert(TcpOptions {
+            cork: true,
+            ..TcpOptions::default()
+        });
+        request.extensions_mut().insert(flush.clone());
+        let client = client.clone();
+        let mut task = tokio::spawn(async move { client.request::<Raw, Raw>(request).await });
+        for _ in 0..yields {
+            tokio::task::yield_now().await;
+        }
+        flush.flush();
+        let Ok(response) = tokio::time::timeout(Duration::from_secs(3), &mut task).await else {
+            task.abort();
+            panic!("a flush {yields} turns into {url} was lost: the request is still held");
+        };
+        let response = response.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().0.as_ref(), b"ok");
+    }
+
     /// One corked request: staged, then flushed. `busy_ns` is how long the
     /// flushing task keeps the thread after `flush()` before it yields.
     async fn corked(client: &Client, url: &str, busy_ns: u64) -> (u64, u64) {
@@ -115,7 +148,13 @@ mod run {
         quiet().await;
         // Longer on the shelf, if asked: what a flush touches goes cold.
         let hold = setting("BENCH_CORK_HOLD_MS", 0);
-        if hold > 0 {
+        if hold > 0 && setting("BENCH_CORK_HOLD_SPIN", 0) == 1 {
+            // Keep the calling thread busy for the hold instead of asleep.
+            let until = probe::now_ns() + hold as u64 * 1_000_000;
+            while probe::now_ns() < until {
+                tokio::task::yield_now().await;
+            }
+        } else if hold > 0 {
             tokio::time::sleep(Duration::from_millis(hold as u64)).await;
         }
         assert!(!task.is_finished(), "the request was not held");
@@ -227,8 +266,23 @@ mod run {
             let plain = format!("http://{ip}:{H1_PORT}");
             let tls = format!("https://test.local:{H1_TLS_PORT}");
             let h2 = format!("https://test.local:{H2_TLS_PORT}");
+            // Whenever the flush comes, the request is released.
+            for url in [&plain, &tls] {
+                for yields in [0, 1, 2, 5, 20, 100, 500, 5_000] {
+                    for _ in 0..3 {
+                        flushed_early(&client, url, yields).await;
+                    }
+                }
+            }
+            eprintln!("flushes at every stage of staging: all answered");
             for (case, url) in [("cork-h1", &plain), ("cork-h1-tls", &tls)] {
+                if std::env::var("BENCH_CORK_CASE").is_ok_and(|only| only != case) {
+                    continue;
+                }
                 for (trigger, busy_ns) in [("yield", 0), ("busy10", 10_000)] {
+                    if std::env::var("BENCH_CORK_TRIGGER").is_ok_and(|only| only != trigger) {
+                        continue;
+                    }
                     let mut samples = Vec::with_capacity(rounds);
                     let mut prebuilt = 0;
                     for round in 0..warmup + rounds {
@@ -244,6 +298,9 @@ mod run {
                 }
             }
             let mut samples = Vec::with_capacity(rounds);
+            if std::env::var("BENCH_CORK_CASE").is_ok_and(|only| only != "h2-reused") {
+                return;
+            }
             for round in 0..warmup + rounds {
                 let sample = h2_reused(&client, &h2).await;
                 if round >= warmup {

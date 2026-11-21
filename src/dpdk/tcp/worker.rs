@@ -1100,7 +1100,14 @@ fn run(
                 // ring drained, so it releases everything written before
                 // it was asked for, as a command at the ring's end would;
                 // until then the request stays set for the next visit.
-                engine.flush(conn.tuple);
+                //
+                // It uncorks rather than releasing one tail: a flush is
+                // the request's release, so whatever of it arrives later
+                // is not held either. (A one-shot release that found
+                // nothing held yet would be spent, and the request would
+                // then wait for a flush that had already come.)
+                engine.set_cork(conn.tuple, false);
+                watched.retain(|(tuple, _)| *tuple != conn.tuple);
             }
         }
 

@@ -53,8 +53,10 @@ pub struct TcpOptions {
     /// TCP_CORK-style hold with a *manual* release: the bulk of the
     /// request flows as full-MSS segments, but the final sub-MSS tail is
     /// held back until an explicit [`FlushHandle::flush`] (or the
-    /// connection closes, which flushes implicitly). The cork is applied
-    /// at connect time, so the TCP/TLS handshakes are unaffected. Since a
+    /// connection closes, which flushes implicitly). The flush uncorks the
+    /// connection for good: nothing written after it is held either. The
+    /// cork is applied once the TCP/TLS handshakes are over, so they are
+    /// unaffected. Since a
     /// manually-held tail is incompatible with a shared multiplexed
     /// connection, corked `https` requests negotiate HTTP/1.1 and are
     /// never pooled. Takes precedence over `nodelay`.
@@ -82,9 +84,16 @@ impl Default for TcpOptions {
 /// for that -- not the request's task, not the runtime -- so the reaction
 /// time is the worker's alone, whatever the calling thread does next.
 ///
-/// Before the connection exists the handle only records the request, and
-/// the stream enqueues the flush itself when it is next polled. Either
-/// way the handle stays `Send + Sync` (required to live in
+/// A flush is final, and it cannot come too early. It uncorks the
+/// connection rather than releasing one tail: whatever the request still
+/// has to write goes out as it is written. And the handle remembers that
+/// it was flushed, so a flush made before the request has been staged --
+/// before the connection exists, during its handshakes, between the
+/// request's writes -- means the request is simply never held. (A
+/// one-shot release would be lost in every one of those cases, leaving
+/// the request waiting for a flush that had already happened.)
+///
+/// The handle stays `Send + Sync` (required to live in
 /// `http::Extensions`) and may be used from any thread.
 ///
 /// ```ignore
@@ -102,6 +111,11 @@ pub struct FlushHandle {
 
 /// Shared by a [`FlushHandle`] and the stream it releases.
 pub(crate) struct FlushState {
+    /// [`FlushHandle::flush`] has been called. Never cleared: a stream
+    /// that sees it does not cork, whenever it looks.
+    flushed: AtomicBool,
+    /// A flush the stream has to pass on itself, as a command, because no
+    /// worker could be told directly (the connection did not exist yet).
     requested: AtomicBool,
     /// The paired stream's waker slot, once it has connected, so a flush
     /// request reaches a stream that is waiting for the worker.
@@ -113,6 +127,7 @@ pub(crate) struct FlushState {
 impl Default for FlushState {
     fn default() -> Self {
         Self {
+            flushed: AtomicBool::new(false),
             requested: AtomicBool::new(false),
             stream: SpinLock::new(None),
             worker: SpinLock::new(None),
@@ -125,12 +140,17 @@ impl FlushHandle {
         Self::default()
     }
 
-    /// Requests release of the connection's held tail segment. Fire and
-    /// forget: with the connection up, the worker is told at once and
-    /// sends the tail on its next turn (after any writes the stream has
-    /// already handed it). Calling before the connection exists is fine --
-    /// the paired `TcpStream` then picks the request up when it is polled.
+    /// Releases the request: the held tail goes out, and nothing more is
+    /// held on its connection. Fire and forget: with the connection up,
+    /// the worker is told at once and sends the tail on its next turn
+    /// (after any writes the stream has already handed it). Calling it
+    /// before the request has been staged, at any point, is fine -- the
+    /// request then goes out as it is written, unheld. Calling it again
+    /// does nothing.
     pub fn flush(&self) {
+        // First, and for good: from here on the stream will not cork,
+        // however far it has got (see `TcpStream::request_cork`).
+        self.state.flushed.store(true, Ordering::SeqCst);
         // Called under the lock rather than on a clone taken out of it: a
         // clone would write the reference count, which shares a cache line
         // with state the worker keeps writing, and so wait for that line
@@ -379,10 +399,29 @@ impl TcpStream {
     /// handshake (if any) and before writing the request body: corking
     /// earlier would hold the sub-MSS handshake records. The command is
     /// ordered ahead of subsequent writes on the same ring.
+    ///
+    /// Does nothing if the connection's [`FlushHandle`] has already been
+    /// flushed: the request was released before it was staged, so it is
+    /// not to be held at all.
     pub fn request_cork(&self) {
+        let flushed = || {
+            self.flush
+                .as_ref()
+                .is_some_and(|flush| flush.flushed.load(Ordering::SeqCst))
+        };
+        if flushed() {
+            return;
+        }
         // Best-effort: the command ring is empty right after connect, so a
         // single push cannot fail here in practice.
         let _ = self.cmd_tx.push(Command::SetCork(true));
+        // A flush that came between the look and the push may already have
+        // been taken by the worker, ahead of the cork: undo it. (One that
+        // comes after this look finds the cork on the ring, which the
+        // worker applies before it.)
+        if flushed() {
+            let _ = self.cmd_tx.push(Command::SetCork(false));
+        }
     }
 
     /// Lends the stream a body that is about to be written through
@@ -637,13 +676,13 @@ impl TcpStream {
         };
     }
 
-    /// If the user requested a flush, enqueue it now (ordered after any
-    /// writes already pushed). Re-arms on a full command ring so it isn't
-    /// lost.
+    /// If a flush was requested that no worker could be told of directly,
+    /// pass it on now: uncork (ordered after any writes already pushed).
+    /// Re-arms on a full command ring so it isn't lost.
     fn drain_flush(&self) {
         if let Some(flush) = &self.flush
             && flush.requested.swap(false, Ordering::AcqRel)
-            && self.cmd_tx.push(Command::Flush).is_err()
+            && self.cmd_tx.push(Command::SetCork(false)).is_err()
         {
             flush.requested.store(true, Ordering::Release);
         }
@@ -1177,9 +1216,69 @@ mod tests {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
-            assert!(matches!(cmd_rx.pop(), Some(Command::Flush)));
+            assert!(matches!(cmd_rx.pop(), Some(Command::SetCork(false))));
             reader.abort();
         });
+    }
+
+    /// A flush is final and cannot come too early: whenever it happens,
+    /// the request ends up not held.
+    #[test]
+    fn a_flush_before_the_cork_means_the_request_is_never_held() {
+        // Flushed before the connection is even attached: no cork at all.
+        let (mut stream, cmd_rx, _inbound_tx, _notifier, wake) = parked_fixture();
+        let flush = FlushHandle::new();
+        flush.flush();
+        stream.flush = Some(flush.attach(&wake, stream.cmd_tx.credit()));
+        stream.request_cork();
+        let mut commands = Vec::new();
+        while let Some(command) = cmd_rx.pop() {
+            commands.push(command);
+        }
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, Command::SetCork(true))),
+            "a released request was corked"
+        );
+
+        // Flushed after attaching but before the cork (during the
+        // handshakes): the same.
+        let (mut stream, cmd_rx, _inbound_tx, _notifier, wake) = parked_fixture();
+        let flush = FlushHandle::new();
+        stream.flush = Some(flush.attach(&wake, stream.cmd_tx.credit()));
+        flush.flush();
+        stream.request_cork();
+        let mut corked = false;
+        while let Some(command) = cmd_rx.pop() {
+            if let Command::SetCork(cork) = command {
+                corked = cork;
+            }
+        }
+        assert!(!corked);
+
+        // Corked first, flushed later: the uncork follows the cork, and a
+        // second flush adds nothing.
+        let (mut stream, cmd_rx, _inbound_tx, _notifier, wake) = parked_fixture();
+        let flush = FlushHandle::new();
+        stream.flush = Some(flush.attach(&wake, stream.cmd_tx.credit()));
+        stream.request_cork();
+        assert!(matches!(cmd_rx.pop(), Some(Command::SetCork(true))));
+        flush.flush();
+        stream.drain_flush();
+        assert!(matches!(cmd_rx.pop(), Some(Command::SetCork(false))));
+        flush.flush();
+        stream.drain_flush();
+        assert!(matches!(cmd_rx.pop(), Some(Command::SetCork(false)) | None));
+        // And corking again after the flush does nothing.
+        stream.request_cork();
+        assert!(cmd_rx.pop().is_none());
+
+        // Without a handle the stream corks as asked.
+        let (stream, cmd_rx, _inbound_tx, _notifier, _wake) = parked_fixture();
+        stream.request_cork();
+        assert!(matches!(cmd_rx.pop(), Some(Command::SetCork(true))));
+        assert!(cmd_rx.pop().is_none());
     }
 
     #[test]
