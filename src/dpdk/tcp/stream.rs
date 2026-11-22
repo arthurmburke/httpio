@@ -58,8 +58,10 @@ pub struct TcpOptions {
     /// cork is applied once the TCP/TLS handshakes are over, so they are
     /// unaffected. Since a
     /// manually-held tail is incompatible with a shared multiplexed
-    /// connection, corked `https` requests negotiate HTTP/1.1 and are
-    /// never pooled. Takes precedence over `nodelay`.
+    /// connection, corked `https` requests go over HTTP/1.1, each with a
+    /// connection to itself for as long as it lasts; the connection is
+    /// then kept for the next HTTP/1.1 request to the origin, which may
+    /// cork it again. Takes precedence over `nodelay`.
     pub cork: bool,
 }
 
@@ -179,6 +181,16 @@ impl FlushHandle {
         self.state.stream.with(|slot| *slot = Some(stream.clone()));
         self.state.worker.with(|slot| *slot = Some(worker.clone()));
         self.state.clone()
+    }
+}
+
+impl FlushState {
+    /// Cuts the handle off from its connection, which is going on to
+    /// another request: a late `flush` on the old handle must not release
+    /// that one.
+    fn detach(&self) {
+        self.worker.with(|slot| *slot = None);
+        self.stream.with(|slot| *slot = None);
     }
 }
 
@@ -421,6 +433,49 @@ impl TcpStream {
         // worker applies before it.)
         if flushed() {
             let _ = self.cmd_tx.push(Command::SetCork(false));
+        }
+    }
+
+    /// Pairs the connection with the flush handle of the next request it
+    /// carries, in place of the last one's (which can no longer reach it),
+    /// or with none. For a connection reused between requests; follow it
+    /// with [`request_cork`](Self::request_cork) to hold that request.
+    pub fn set_flush_handle(&mut self, flush: Option<&FlushHandle>) {
+        if let Some(previous) = self.flush.take() {
+            previous.detach();
+        }
+        self.flush = flush.map(|flush| match &self.wake {
+            Some(Parker(wake)) => flush.attach(wake, self.cmd_tx.credit()),
+            None => flush.state.clone(),
+        });
+    }
+
+    /// Whether the connection, idle between two requests, can carry
+    /// another: it is open, the peer has sent nothing unread, and no tail
+    /// of the last request is still held (a request given a
+    /// [`FlushHandle`] counts as held until that handle is flushed).
+    /// Registers no waker.
+    pub fn reusable(&mut self) -> bool {
+        if self
+            .flush
+            .as_ref()
+            .is_some_and(|flush| !flush.flushed.load(Ordering::SeqCst))
+        {
+            return false;
+        }
+        self.drain_flush();
+        self.drain_inbound();
+        self.state == StreamState::Open
+            && self.read_chunk.is_none()
+            && !self.cmd_tx.failed()
+            && !self.cmd_tx.is_closed()
+    }
+
+    /// Forgets the waker of the last poll, for a caller that polled only to
+    /// look and is not waiting.
+    pub fn unpark(&self) {
+        if let Some(Parker(wake)) = &self.wake {
+            wake.unpark();
         }
     }
 
@@ -1219,6 +1274,61 @@ mod tests {
             assert!(matches!(cmd_rx.pop(), Some(Command::SetCork(false))));
             reader.abort();
         });
+    }
+
+    /// A connection that goes on to another request is corked again for
+    /// it, under that request's handle, and the last request's handle no
+    /// longer reaches it.
+    #[test]
+    fn a_reused_connection_is_corked_again_under_the_next_handle() {
+        let (mut stream, cmd_rx, _inbound_tx, _notifier, _wake) = parked_fixture();
+        let drain = || std::iter::from_fn(|| cmd_rx.pop()).collect::<Vec<_>>();
+
+        let first = FlushHandle::new();
+        stream.set_flush_handle(Some(&first));
+        stream.request_cork();
+        // Held, so not to be handed to another request yet.
+        assert!(!stream.reusable());
+        first.flush();
+        assert!(stream.reusable());
+        let commands = drain();
+        assert!(matches!(commands.first(), Some(Command::SetCork(true))));
+        assert!(matches!(commands.last(), Some(Command::SetCork(false))));
+
+        // The next request: corked afresh, and held until its own flush.
+        let second = FlushHandle::new();
+        stream.set_flush_handle(Some(&second));
+        stream.request_cork();
+        assert!(matches!(drain()[..], [Command::SetCork(true)]));
+        assert!(!stream.reusable());
+
+        // A late flush on the first handle releases nothing.
+        first.flush();
+        stream.drain_flush();
+        assert!(drain().is_empty(), "the old handle released the new request");
+        assert!(!stream.reusable());
+
+        second.flush();
+        stream.drain_flush();
+        assert!(matches!(drain()[..], [Command::SetCork(false)]));
+        assert!(stream.reusable());
+
+        // A request with no handle leaves the connection free at once.
+        stream.set_flush_handle(None);
+        assert!(stream.reusable());
+    }
+
+    /// A connection the peer closed, or wrote on unasked, is not reused.
+    #[test]
+    fn a_closed_connection_is_not_reusable() {
+        let (mut stream, _cmd_rx, inbound_tx, _credit) = TcpStream::test_stream();
+        assert!(stream.reusable());
+        drop(inbound_tx);
+        assert!(!stream.reusable());
+
+        let (mut stream, cmd_rx, _inbound_tx, _credit) = TcpStream::test_stream();
+        drop(cmd_rx);
+        assert!(!stream.reusable());
     }
 
     /// A flush is final and cannot come too early: whenever it happens,

@@ -42,7 +42,8 @@ IPv4 + TCP, no kernel network stack involved.
   (curl `--resolve` style); certificates still validate against the
   hostname. HTTP/2 connections are pooled per origin and multiplexed
   (requests to the same host share one TCP+TLS connection until the
-  server closes it); HTTP/1.1 is connection-per-request. No redirects.
+  server closes it); an HTTP/1.1 connection carries one request at a
+  time and is kept for the origin's next one. No redirects.
   Per-request transport tuning: insert a `TcpOptions { nodelay, cork }`
   into the request's `http::Extensions` to control TCP_NODELAY and
   TCP_CORK-style coalescing for the connection that request uses (a

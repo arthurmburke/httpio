@@ -12,8 +12,15 @@
 //! (host, port) and multiplexed -- [`h2::SendRequest`] is `Clone`, so
 //! any number of requests, buffered or streamed, share one TCP+TLS
 //! connection until the server closes it (there is no idle timeout on our
-//! side). HTTP/1.1 has no such multiplexing handle and stays
-//! connection-per-request.
+//! side). An HTTP/1.1 connection carries one request at a time; when its
+//! response has been read it is kept, per origin, and the next HTTP/1.1
+//! request to that origin takes it instead of connecting again (corked
+//! requests included -- the connection is corked afresh for each). A
+//! connection the server closed while it was idle is noticed and dropped
+//! when it is next looked at. One it closes just as a request is sent on
+//! it fails that request, which is not sent again here: the server may
+//! have acted on it. A reused connection keeps the `nodelay` setting it
+//! was opened with.
 //!
 //! A buffered request the server did not process -- it refused the
 //! stream, or announced it was going away before reaching it
@@ -23,8 +30,8 @@
 
 use std::borrow::Cow;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
 use http::request::Parts;
@@ -52,6 +59,24 @@ use crate::http::errors::HttpError;
 /// the key.
 // Nested maps permit borrowed host lookups without constructing an origin key.
 type H2Pool = Arc<AsyncMutex<HashMap<String, HashMap<u16, h2::SendRequest<TlsStream>>>>>;
+
+/// The idle HTTP/1.1 connections, per origin (host, port), over one kind
+/// of transport. Bodies return connections to it as they finish, from
+/// inside a poll, so it is behind a plain mutex, held only for a lookup.
+type H1Pool<T> = Arc<Mutex<HashMap<String, HashMap<u16, Arc<h1::Idle<T>>>>>>;
+
+/// The idle set for an origin, made on first use.
+fn idle_connections<T>(pool: &H1Pool<T>, host: &str, port: u16) -> Arc<h1::Idle<T>> {
+    let mut pool = pool.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(idle) = pool.get(host).and_then(|ports| ports.get(&port)) {
+        return idle.clone();
+    }
+    pool.entry(host.to_owned())
+        .or_default()
+        .entry(port)
+        .or_default()
+        .clone()
+}
 
 /// First port of the ephemeral range handed out by the client.
 const EPHEMERAL_FIRST: u16 = 49152;
@@ -219,6 +244,8 @@ pub mod builder {
                 resolve: self.resolve,
                 next_port: Arc::new(AtomicU16::new(next_port)),
                 h2_pool: Arc::new(Mutex::new(HashMap::default())),
+                h1_tls_pool: Default::default(),
+                h1_plain_pool: Default::default(),
             }
         }
     }
@@ -235,6 +262,11 @@ pub struct Client {
     resolve: HashMap<String, Ipv4Addr>,
     next_port: Arc<AtomicU16>,
     h2_pool: H2Pool,
+    /// Idle `https` HTTP/1.1 connections, whichever ALPN offer they were
+    /// opened with.
+    h1_tls_pool: H1Pool<TlsStream>,
+    /// Idle plain `http` connections.
+    h1_plain_pool: H1Pool<TcpStream>,
 }
 
 impl Client {
@@ -320,22 +352,14 @@ impl Client {
 
         if is_https {
             // Corked requests can't share a multiplexed h2 connection, so
-            // they always take the h1 path (h1-only ALPN, no pooling).
+            // they always take the h1 path, each on a connection it has to
+            // itself for as long as it lasts.
             if tcp_options.cork {
-                let tcp = self
-                    .dial(&host, port, tcp_options, flush_handle.as_ref())
+                let (tls, idle) = self
+                    .corked_tls_h1(&host, port, tcp_options, flush_handle.as_ref())
                     .await?;
-                let server_name = ServerName::try_from(host.as_ref())
-                    .map_err(|_| HttpError::InvalidHost)?
-                    .to_owned();
-                let tls = self
-                    .tls_h1
-                    .connect(server_name, tcp)
-                    .await
-                    .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
-                // Cork only now that the TLS handshake has completed.
-                tls.tcp().request_cork();
-                return send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port).await;
+                return send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port, idle)
+                    .await;
             }
 
             // One more attempt if the server did not process the first:
@@ -348,9 +372,16 @@ impl Client {
                     .await?;
                 let send_request = match connection {
                     TlsConnection::H2(send_request) => send_request,
-                    TlsConnection::H1(tls) => {
-                        return send_tls_h1(*tls, parts, EncodedBody::Full(body), &host, port)
-                            .await;
+                    TlsConnection::H1(tls, idle) => {
+                        return send_tls_h1(
+                            *tls,
+                            parts,
+                            EncodedBody::Full(body),
+                            &host,
+                            port,
+                            idle,
+                        )
+                        .await;
                     }
                 };
                 let body = EncodedBody::Full(body.clone());
@@ -360,14 +391,10 @@ impl Client {
                 }
             }
         } else {
-            let tcp = self
-                .dial(&host, port, tcp_options, flush_handle.as_ref())
+            let (tcp, idle) = self
+                .plain_h1(&host, port, tcp_options, flush_handle.as_ref())
                 .await?;
-            // Plain HTTP has no handshake, so cork right away.
-            if tcp_options.cork {
-                tcp.request_cork();
-            }
-            send_plain_h1(tcp, parts, EncodedBody::Full(body), &host, port).await
+            send_plain_h1(tcp, parts, EncodedBody::Full(body), &host, port, idle).await
         }
     }
 
@@ -408,34 +435,79 @@ impl Client {
                         .await
                         .map_err(HttpError::from)
                 }
-                TlsConnection::H1(tls) => {
-                    send_tls_h1(*tls, parts, EncodedBody::Stream(body), &host, port).await
+                TlsConnection::H1(tls, idle) => {
+                    send_tls_h1(*tls, parts, EncodedBody::Stream(body), &host, port, idle).await
                 }
             };
         }
 
-        let tcp = self
-            .dial(&host, port, tcp_options, flush_handle.as_ref())
-            .await?;
         if is_https {
-            let server_name = ServerName::try_from(host.as_ref())
-                .map_err(|_| HttpError::InvalidHost)?
-                .to_owned();
-            let tls = self
-                .tls_h1
-                .connect(server_name, tcp)
-                .await
-                .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
-            // Cork only now that the TLS handshake has completed.
-            tls.tcp().request_cork();
-            send_tls_h1(tls, parts, EncodedBody::Stream(body), &host, port).await
+            let (tls, idle) = self
+                .corked_tls_h1(&host, port, tcp_options, flush_handle.as_ref())
+                .await?;
+            send_tls_h1(tls, parts, EncodedBody::Stream(body), &host, port, idle).await
         } else {
-            // Plain HTTP has no handshake, so cork right away.
-            if tcp_options.cork {
-                tcp.request_cork();
-            }
-            send_plain_h1(tcp, parts, EncodedBody::Stream(body), &host, port).await
+            let (tcp, idle) = self
+                .plain_h1(&host, port, tcp_options, flush_handle.as_ref())
+                .await?;
+            send_plain_h1(tcp, parts, EncodedBody::Stream(body), &host, port, idle).await
         }
+    }
+
+    /// A corked `https` HTTP/1.1 connection, with where it goes when its
+    /// response has been read: one the origin left idle if there is one,
+    /// else a new one offering only `http/1.1`. Corked here, the TLS
+    /// handshake being over either way, for `flush_handle` to release.
+    async fn corked_tls_h1(
+        &self,
+        host: &str,
+        port: u16,
+        options: TcpOptions,
+        flush_handle: Option<&FlushHandle>,
+    ) -> Result<(TlsStream, Arc<h1::Idle<TlsStream>>), HttpError> {
+        let idle = idle_connections(&self.h1_tls_pool, host, port);
+        let tls = match idle.take() {
+            Some(mut tls) => {
+                tls.set_flush_handle(flush_handle);
+                tls
+            }
+            None => {
+                let tcp = self.dial(host, port, options, flush_handle).await?;
+                let server_name = ServerName::try_from(host)
+                    .map_err(|_| HttpError::InvalidHost)?
+                    .to_owned();
+                self.tls_h1
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| HttpError::TlsHandshake(e.kind()))?
+            }
+        };
+        tls.tcp().request_cork();
+        Ok((tls, idle))
+    }
+
+    /// A plain `http` connection, with where it goes when its response has
+    /// been read: one the origin left idle if there is one, else a new one.
+    /// Corked if `options` say so; plain HTTP has no handshake to wait for.
+    async fn plain_h1(
+        &self,
+        host: &str,
+        port: u16,
+        options: TcpOptions,
+        flush_handle: Option<&FlushHandle>,
+    ) -> Result<(TcpStream, Arc<h1::Idle<TcpStream>>), HttpError> {
+        let idle = idle_connections(&self.h1_plain_pool, host, port);
+        let tcp = match idle.take() {
+            Some(mut tcp) => {
+                tcp.set_flush_handle(flush_handle);
+                tcp
+            }
+            None => self.dial(host, port, options, flush_handle).await?,
+        };
+        if options.cork {
+            tcp.request_cork();
+        }
+        Ok((tcp, idle))
     }
 
     /// Sends `request` over a fresh HTTP/1.1 connection with protocol-
@@ -490,9 +562,9 @@ impl Client {
     }
 
     /// A connection for an uncorked `https` request: the origin's pooled
-    /// HTTP/2 connection if it has a live one, else a new connection,
-    /// which is pooled if ALPN chose `h2` and handed over as a TLS stream
-    /// for HTTP/1.1 if not.
+    /// HTTP/2 connection if it has a live one, else an HTTP/1.1 connection
+    /// it left idle, else a new connection, which is pooled if ALPN chose
+    /// `h2` and handed over as a TLS stream for HTTP/1.1 if not.
     async fn connect_tls(
         &self,
         host: &str,
@@ -504,6 +576,11 @@ impl Client {
         if let Some(send_request) = self.pooled_h2(host, port).await {
             return Ok(TlsConnection::H2(send_request));
         }
+        let idle = idle_connections(&self.h1_tls_pool, host, port);
+        if let Some(mut tls) = idle.take() {
+            tls.set_flush_handle(flush_handle);
+            return Ok(TlsConnection::H1(Box::new(tls), idle));
+        }
         let tcp = self.dial(host, port, options, flush_handle).await?;
         let server_name = ServerName::try_from(host)
             .map_err(|_| HttpError::InvalidHost)?
@@ -514,7 +591,7 @@ impl Client {
             .await
             .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
         if tls.alpn_protocol() != Some(b"h2".as_slice()) {
-            return Ok(TlsConnection::H1(Box::new(tls)));
+            return Ok(TlsConnection::H1(Box::new(tls), idle));
         }
         let send_request = handshake_h2(tls);
         // Pool a clone; on a race where two tasks dialed the same origin
@@ -635,25 +712,26 @@ async fn send_plain_h1(
     body: EncodedBody,
     host: &str,
     port: u16,
+    idle: Arc<h1::Idle<TcpStream>>,
 ) -> Result<Response<ResponseBody>, HttpError> {
     rewrite_to_origin_form(&mut parts, host, port, 80)?;
-    let response = h1::send_over_tcp(tcp, parts, body).await?;
+    let response = h1::send_over_tcp_reusing(tcp, parts, body, idle).await?;
     Ok(response.map(ResponseBody::H1))
 }
 
 /// `https` HTTP/1.1 over the same codec, exchanging plaintext `Bytes` with
-/// the TLS stream. The connection ends when the response body does; no
-/// `close_notify` is sent first, the request having asked the server to
-/// close (`Connection: close`).
+/// the TLS stream. When the response body ends the connection goes to
+/// `idle` for the next request, or is dropped if it cannot carry one.
 async fn send_tls_h1(
     tls: TlsStream,
     mut parts: Parts,
     body: EncodedBody,
     host: &str,
     port: u16,
+    idle: Arc<h1::Idle<TlsStream>>,
 ) -> Result<Response<ResponseBody>, HttpError> {
     rewrite_to_origin_form(&mut parts, host, port, 443)?;
-    let response = h1::send_over_tls(tls, parts, body).await?;
+    let response = h1::send_over_tls_reusing(tls, parts, body, idle).await?;
     Ok(response.map(ResponseBody::H1Tls))
 }
 
@@ -696,8 +774,9 @@ fn handshake_h2(tls: TlsStream) -> h2::SendRequest<TlsStream> {
 enum TlsConnection {
     /// An HTTP/2 connection, pooled.
     H2(h2::SendRequest<TlsStream>),
-    /// A fresh TLS stream whose server chose HTTP/1.1.
-    H1(Box<TlsStream>),
+    /// A TLS stream to a server that chose HTTP/1.1, new or left idle by
+    /// an earlier request, and the idle set it returns to.
+    H1(Box<TlsStream>, Arc<h1::Idle<TlsStream>>),
 }
 
 /// Sends one request as a new stream on an h2 connection. HTTP/2 derives

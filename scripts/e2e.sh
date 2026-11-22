@@ -175,16 +175,28 @@ grep -q "connections_opened=1" "$err" \
     || { echo "FAIL h2 reuse: expected 1 connection:"; grep connections_opened "$err"; exit 1; }
 echo "PASS HTTP/2 connection reuse (2 requests, 1 connection)"
 
-# ...and HTTP/1.1 has no multiplexing handle, so the same double-fetch
-# against the h1 TLS server dials twice.
-fresh_net
-err=$(mktemp)
-H1URL=https://test.local:8443/hello.txt
-out=$("${RUN[@]}" "$H1URL" "$H1URL" "${TLS_ARGS[@]}" 2>"$err") \
-    || { echo "FAIL h1 double fetch: client error"; cat "$err"; exit 1; }
-grep -q "connections_opened=2" "$err" \
-    || { echo "FAIL h1 double fetch: expected 2 connections:"; grep connections_opened "$err"; exit 1; }
-echo "PASS HTTP/1.1 remains connection-per-request"
+# HTTP/1.1 connection reuse: a connection carries one request at a time
+# and is kept for the next, so the same double fetch against an h1 server
+# opens one connection too -- plain, over TLS, and corked (where the
+# connection is corked afresh for the second request).
+h1_reuse() { # name, url, args...
+    local name=$1 url=$2; shift 2
+    local out err
+    fresh_net
+    err=$(mktemp)
+    out=$("${RUN[@]}" "$url" "$url" "$@" 2>"$err") \
+        || { echo "FAIL $name: client error"; cat "$err"; exit 1; }
+    [ "$(grep -c "hello from e2e" <<<"$out")" -eq 2 ] || { echo "FAIL $name: expected 2 bodies"; exit 1; }
+    [ "$(grep -c "HTTP/1.1 200" "$err")" -eq 2 ] || { echo "FAIL $name: expected 2 HTTP/1.1 responses"; exit 1; }
+    grep -q "connections_opened=1" "$err" \
+        || { echo "FAIL $name: expected 1 connection:"; grep connections_opened "$err"; exit 1; }
+    rm -f "$err"
+    echo "PASS $name (2 requests, 1 connection)"
+}
+h1_reuse "HTTP/1.1 plaintext connection reuse"  http://10.9.0.2:8080/hello.txt
+h1_reuse "HTTP/1.1 TLS connection reuse"        https://test.local:8443/hello.txt "${TLS_ARGS[@]}"
+h1_reuse "HTTP/1.1 TLS corked connection reuse" https://test.local:8443/hello.txt "${TLS_ARGS[@]}" --cork
+h1_reuse "HTTP/1.1 plaintext corked connection reuse" http://10.9.0.2:8080/hello.txt --cork
 
 # Negative: without --ca the server cert chains to an unknown CA, so the
 # TLS handshake must be rejected -- proves validation is actually on.

@@ -27,8 +27,13 @@
 //! plaintext and the copies that remain are the TLS layer's), and an
 //! in-memory transport for the unit tests here.
 //!
-//! Scope: one request per connection (`Connection: close` unless the caller
-//! chose otherwise); the connection is dropped when the response body ends.
+//! Scope: one request at a time per connection, no pipelining. A request
+//! sent with [`send_over_tcp`] / [`send_over_tls`] asks the server to close
+//! (`Connection: close` unless the caller chose otherwise) and its
+//! connection is dropped when the response body ends. One sent with
+//! [`send_over_tcp_reusing`] / [`send_over_tls_reusing`] leaves the
+//! connection open, and a response read to its framed end hands the
+//! connection to an [`Idle`] set for the next request to take.
 //! Protocol upgrades (`101`, WebSocket) stay on hyper.
 //!
 //! The response side parses untrusted input: the head is bounded
@@ -41,6 +46,7 @@ use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, ready};
 
 use bytes::{Bytes, BytesMut};
@@ -121,6 +127,82 @@ pub trait Transport {
         }
         Poll::Ready(Ok(()))
     }
+
+    /// Whether the connection, idle between two exchanges, can carry
+    /// another: it is open, the peer has sent nothing since the last
+    /// response, and nothing of the last request is still held back. Asked
+    /// when a connection goes into an [`Idle`] set and again when it comes
+    /// out. Must not leave a waker behind: nobody is waiting on an idle
+    /// connection.
+    ///
+    /// `false` unless the transport says otherwise, which keeps a
+    /// connection to one request.
+    fn reusable(&mut self) -> bool {
+        false
+    }
+}
+
+/// Most connections one [`Idle`] set keeps; one returned beyond that is
+/// closed.
+pub const MAX_IDLE_CONNECTIONS: usize = 8;
+
+/// The idle connections to one origin: those whose last response was read
+/// to its framed end over a connection both sides left open. A [`Body`]
+/// puts its connection here when it finishes; the client takes one out
+/// for the next request instead of connecting again.
+pub struct Idle<T> {
+    connections: Mutex<Vec<T>>,
+}
+
+impl<T> Default for Idle<T> {
+    fn default() -> Self {
+        Self {
+            connections: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl<T: Transport> Idle<T> {
+    /// The most recently used connection that can still carry a request.
+    /// The ones found dead on the way (closed by the server while idle)
+    /// are dropped.
+    pub fn take(&self) -> Option<T> {
+        loop {
+            let mut io = self
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop()?;
+            if io.reusable() {
+                return Some(io);
+            }
+        }
+    }
+
+    fn put(&self, mut io: T) {
+        if !io.reusable() {
+            return;
+        }
+        let mut connections = self
+            .connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if connections.len() < MAX_IDLE_CONNECTIONS {
+            connections.push(io);
+        }
+    }
+
+    /// How many connections are idle.
+    pub fn len(&self) -> usize {
+        self.connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl Transport for TcpStream {
@@ -136,6 +218,10 @@ impl Transport for TcpStream {
 
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<MbufSlice>>> {
         TcpStream::poll_recv_chunk(self, cx)
+    }
+
+    fn reusable(&mut self) -> bool {
+        TcpStream::reusable(self)
     }
 }
 
@@ -163,6 +249,10 @@ impl Transport for TlsStream {
         queue: &mut VecDeque<Bytes>,
     ) -> Poll<io::Result<()>> {
         TlsStream::poll_send_queue(self, cx, queue)
+    }
+
+    fn reusable(&mut self) -> bool {
+        TlsStream::reusable(self)
     }
 }
 
@@ -247,6 +337,9 @@ enum ConnectionHeader {
     CallerSet,
     /// One request per connection, so tell the server.
     Close,
+    /// The connection is to carry further requests: no header, since an
+    /// HTTP/1.1 connection persists unless told otherwise.
+    Persist,
 }
 
 /// A request whose framing has been decided and validated, ready to have
@@ -313,6 +406,15 @@ impl PreparedRequest {
         })
     }
 
+    /// Leaves the connection open for further requests instead of asking
+    /// the server to close it. A `Connection` header the caller set stands.
+    pub fn persistent(mut self) -> Self {
+        if self.connection == ConnectionHeader::Close {
+            self.connection = ConnectionHeader::Persist;
+        }
+        self
+    }
+
     /// Serialises the request line and headers into one buffer: in place in
     /// DMA memory when `dma` is given and has room (so the worker attaches
     /// it to the packet with no copy), else on the heap (the worker copies
@@ -366,7 +468,7 @@ impl PreparedRequest {
             FramingHeader::Chunked => out.put(b"transfer-encoding: chunked\r\n"),
         }
         match self.connection {
-            ConnectionHeader::CallerSet => {}
+            ConnectionHeader::CallerSet | ConnectionHeader::Persist => {}
             ConnectionHeader::Close => out.put(b"connection: close\r\n"),
         }
         out.put(b"\r\n");
@@ -385,13 +487,29 @@ impl PreparedRequest {
     /// as the response body is read and drops it when that body ends.
     pub async fn exchange<T: Transport + Unpin>(
         self,
+        io: T,
+        head: Bytes,
+    ) -> Result<Response<Body<T>>, HttpError> {
+        self.exchange_reusing(io, head, None).await
+    }
+
+    /// [`exchange`](Self::exchange), with somewhere for the connection to
+    /// go afterwards. The returned body hands `io` to `home` instead of
+    /// dropping it when the connection is left ready for another request:
+    /// this one was [`persistent`](Self::persistent) and went out whole,
+    /// the server did not say it would close, and the response was read
+    /// to an end its framing marks, with nothing after it.
+    pub async fn exchange_reusing<T: Transport + Unpin>(
+        self,
         mut io: T,
         head: Bytes,
+        home: Option<Arc<Idle<T>>>,
     ) -> Result<Response<Body<T>>, HttpError> {
         let Self {
             parts,
             body,
             framing,
+            connection,
             ..
         } = self;
         let mut upload = Some(Upload::new(head, body, framing));
@@ -433,10 +551,27 @@ impl PreparedRequest {
         })
         .await?;
         let decoder = response_decoder(&parts.method, &parts_in)?;
-        let mut body = Body::new(io, rest, decoder);
-        body.continue_upload(upload);
+        let home = home.filter(|_| {
+            connection == ConnectionHeader::Persist
+                && decoder != Decoder::UntilEof
+                && response_persists(&parts_in)
+        });
+        let body = Body::with_upload(io, rest, decoder, upload, home);
         Ok(Response::from_parts(parts_in, body))
     }
+}
+
+/// Whether the server leaves the connection open after this response: an
+/// HTTP/1.1 response that does not say `Connection: close` (RFC 9112
+/// §9.3). An HTTP/1.0 connection is not reused, whatever it says.
+fn response_persists(parts: &response::Parts) -> bool {
+    parts.version == Version::HTTP_11
+        && !parts
+            .headers
+            .get_all(header::CONNECTION)
+            .iter()
+            .flat_map(|value| value.as_bytes().split(|&b| b == b','))
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"close"))
 }
 
 /// Sends one request over a fresh plain-TCP connection, with its head
@@ -462,6 +597,33 @@ pub async fn send_over_tls(
     let request = PreparedRequest::new(parts, body)?;
     let head = request.encode_head(None);
     request.exchange(tls, head).await
+}
+
+/// [`send_over_tcp`] over a connection that is kept: the request does not
+/// ask the server to close, and `tcp` goes to `home` once the response has
+/// been read, if it is fit to carry another request.
+pub async fn send_over_tcp_reusing(
+    mut tcp: TcpStream,
+    parts: request::Parts,
+    body: EncodedBody,
+    home: Arc<Idle<TcpStream>>,
+) -> Result<Response<Body<TcpStream>>, HttpError> {
+    let request = PreparedRequest::new(parts, body)?.persistent();
+    let head = request.encode_head(tcp.dma_writer());
+    request.exchange_reusing(tcp, head, Some(home)).await
+}
+
+/// [`send_over_tls`] over a connection that is kept; see
+/// [`send_over_tcp_reusing`].
+pub async fn send_over_tls_reusing(
+    tls: TlsStream,
+    parts: request::Parts,
+    body: EncodedBody,
+    home: Arc<Idle<TlsStream>>,
+) -> Result<Response<Body<TlsStream>>, HttpError> {
+    let request = PreparedRequest::new(parts, body)?.persistent();
+    let head = request.encode_head(None);
+    request.exchange_reusing(tls, head, Some(home)).await
 }
 
 /// Turns a codec response into the typed response `Client::request`
@@ -1271,9 +1433,11 @@ impl Decoder {
     fn decode<B: RecvBuf>(&mut self, buf: &mut B) -> Result<Option<B>, H1Error> {
         loop {
             match self {
-                Decoder::Done | Decoder::Failed => {
-                    // Anything after the framed end is not ours; the
-                    // connection closes with the body.
+                // Anything after the framed end is not ours. It is left in
+                // `buf` for the body to see: a connection the server wrote
+                // more on is not one to reuse.
+                Decoder::Done => return Ok(None),
+                Decoder::Failed => {
                     *buf = B::default();
                     return Ok(None);
                 }
@@ -1341,9 +1505,11 @@ impl Decoder {
 /// A response body read from the connection it owns. Yields payload as
 /// slices of the received chunks (no copy), via [`Stream`] or
 /// [`poll_chunk`](Self::poll_chunk), or all at once via
-/// [`collect`](Self::collect). The connection is dropped as soon as the
-/// body ends or fails, and stays open as long as the body is unfinished
-/// and alive. After an error the body yields nothing more.
+/// [`collect`](Self::collect). The connection is given up as soon as the
+/// body ends or fails -- dropped, or handed to an [`Idle`] set when it can
+/// carry another request (see [`PreparedRequest::exchange_reusing`]) --
+/// and stays open as long as the body is unfinished and alive. After an
+/// error the body yields nothing more.
 pub struct Body<T: Transport> {
     /// `None` once the body has finished.
     io: Option<T>,
@@ -1355,10 +1521,28 @@ pub struct Body<T: Transport> {
     /// What is left of the request, when the response began before all of
     /// it was sent: sent on as the body is read, dropped when it ends.
     upload: Option<Upload>,
+    /// Where the connection goes if the body ends with it fit for another
+    /// request. `None` when it is to be dropped whatever happens.
+    home: Option<Arc<Idle<T>>>,
 }
 
 impl<T: Transport + Unpin> Body<T> {
+    #[cfg(test)]
     fn new(io: T, buffered: T::Recv, decoder: Decoder) -> Self {
+        Self::with_upload(io, buffered, decoder, None, None)
+    }
+
+    /// `upload` is the unsent rest of the request (see
+    /// [`PreparedRequest::exchange`]). It is dropped at once if the
+    /// response has no body to read: with the connection given up there
+    /// is nowhere to send it.
+    fn with_upload(
+        io: T,
+        buffered: T::Recv,
+        decoder: Decoder,
+        upload: Option<Upload>,
+        home: Option<Arc<Idle<T>>>,
+    ) -> Self {
         let length_hint = match decoder {
             Decoder::Length { remaining } => Some(remaining),
             _ => None,
@@ -1368,26 +1552,30 @@ impl<T: Transport + Unpin> Body<T> {
             buffered,
             decoder,
             length_hint,
-            upload: None,
+            upload,
+            home,
         };
         body.release_if_finished();
         body
     }
 
-    /// Hands the body the unsent rest of the request (see
-    /// [`PreparedRequest::exchange`]). Dropped at once if the response has
-    /// no body to read: with the connection gone there is nowhere to send.
-    fn continue_upload(&mut self, upload: Option<Upload>) {
-        if self.io.is_some() {
-            self.upload = upload;
-        }
-    }
-
+    /// Gives the connection up once the body has ended or failed: to its
+    /// [`Idle`] set if it is in step for another request -- the body ended
+    /// at its framed end, the whole request went out, and the server sent
+    /// nothing more -- and dropped otherwise.
     fn release_if_finished(&mut self) {
-        if self.decoder.is_finished() {
-            self.io = None;
-            self.upload = None;
-            self.buffered = T::Recv::default();
+        if !self.decoder.is_finished() {
+            return;
+        }
+        let in_step = self.decoder == Decoder::Done
+            && self.upload.is_none()
+            && self.buffered.is_empty();
+        self.upload = None;
+        self.buffered = T::Recv::default();
+        if let (Some(io), Some(home)) = (self.io.take(), self.home.take())
+            && in_step
+        {
+            home.put(io);
         }
     }
 
@@ -1459,6 +1647,8 @@ impl<T: Transport + Unpin> Body<T> {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(Some(chunk))) => self.buffered = chunk,
                 Poll::Ready(Ok(None)) => {
+                    // The connection is over, however the body fares.
+                    self.home = None;
                     if let Err(e) = self.decoder.on_eof() {
                         return self.fail(e);
                     }
@@ -1544,6 +1734,8 @@ mod tests {
         sent: std::sync::Arc<std::sync::Mutex<Vec<Bytes>>>,
         stall: bool,
         polls: usize,
+        /// What it answers when asked whether it can carry another request.
+        reusable: bool,
     }
 
     impl Mock {
@@ -1553,7 +1745,13 @@ mod tests {
                 sent: Default::default(),
                 stall: false,
                 polls: 0,
+                reusable: false,
             }
+        }
+
+        fn reusable(mut self) -> Self {
+            self.reusable = true;
+            self
         }
 
         fn stalling(mut self) -> Self {
@@ -1595,6 +1793,10 @@ mod tests {
                 Some(Read::Error(kind)) => Poll::Ready(Err(kind.into())),
                 None => Poll::Ready(Ok(None)),
             }
+        }
+
+        fn reusable(&mut self) -> bool {
+            self.reusable
         }
     }
 
@@ -2234,6 +2436,147 @@ connection: close\r\n\r\n"
         assert_eq!(decimal(0, &mut [0; 20]), b"0");
         assert_eq!(decimal(u64::MAX, &mut [0; 20]), b"18446744073709551615");
         assert_eq!(hex(u64::MAX, &mut [0; 16]), b"ffffffffffffffff");
+    }
+
+    /// Sends a persistent GET into a reusable mock that answers with
+    /// `chunks`, reads the whole response, and returns the request as sent
+    /// and how many connections were left idle.
+    fn reuse_after(chunks: &[&'static [u8]]) -> (String, usize) {
+        let request = PreparedRequest::new(
+            parts(Method::GET, "/r", &[]),
+            EncodedBody::Full(Bytes::new()),
+        )
+        .unwrap()
+        .persistent();
+        let head = request.encode_head(None);
+        let mock = Mock::new(chunks.iter().map(|chunk| Bytes::from_static(chunk)))
+            .stalling()
+            .reusable();
+        let sent = mock.sent.clone();
+        let idle = Arc::new(Idle::default());
+        let _ = block_on(async {
+            let response = request
+                .exchange_reusing(mock, head, Some(idle.clone()))
+                .await?;
+            Ok::<_, HttpError>(response.into_body().collect().await)
+        });
+        (text(&sent.lock().unwrap()), idle.len())
+    }
+
+    #[test]
+    fn a_connection_is_kept_when_the_response_ends_at_its_framed_end() {
+        // Content-Length.
+        let (request, idle) = reuse_after(&[b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello"]);
+        assert_eq!(request, "GET /r HTTP/1.1\r\nhost: example.com\r\n\r\n");
+        assert_eq!(idle, 1);
+        // Split across reads, and an explicit keep-alive.
+        let (_, idle) = reuse_after(&[
+            b"HTTP/1.1 200 OK\r\nconnection: keep-alive\r\ncontent-length: 5\r\n\r\nhe",
+            b"llo",
+        ]);
+        assert_eq!(idle, 1);
+        // Chunked.
+        let (_, idle) = reuse_after(&[
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+            b"0\r\n\r\n",
+        ]);
+        assert_eq!(idle, 1);
+        // No body at all: kept as soon as the head is read.
+        let (_, idle) = reuse_after(&[b"HTTP/1.1 204 No Content\r\n\r\n"]);
+        assert_eq!(idle, 1);
+        let (_, idle) = reuse_after(&[b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n"]);
+        assert_eq!(idle, 1);
+    }
+
+    #[test]
+    fn a_connection_is_dropped_when_it_cannot_carry_another_request() {
+        // The server says it will close.
+        let (_, idle) = reuse_after(&[
+            b"HTTP/1.1 200 OK\r\nConnection: Keep-Alive, Close\r\ncontent-length: 2\r\n\r\nok",
+        ]);
+        assert_eq!(idle, 0);
+        // HTTP/1.0.
+        let (_, idle) = reuse_after(&[b"HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nok"]);
+        assert_eq!(idle, 0);
+        // The body runs to the end of the connection.
+        let (_, idle) = reuse_after(&[b"HTTP/1.1 200 OK\r\n\r\nall of it"]);
+        assert_eq!(idle, 0);
+        // The connection ends inside the body.
+        let (_, idle) = reuse_after(&[b"HTTP/1.1 200 OK\r\ncontent-length: 9\r\n\r\nshort"]);
+        assert_eq!(idle, 0);
+        // The server wrote past the framed end.
+        let (_, idle) = reuse_after(&[b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nokEXTRA"]);
+        assert_eq!(idle, 0);
+        let (_, idle) = reuse_after(&[
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\nEXTRA",
+        ]);
+        assert_eq!(idle, 0);
+        let (_, idle) = reuse_after(&[b"HTTP/1.1 204 No Content\r\n\r\nEXTRA"]);
+        assert_eq!(idle, 0);
+        // Malformed framing.
+        let (_, idle) = reuse_after(&[
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nzz\r\n",
+        ]);
+        assert_eq!(idle, 0);
+    }
+
+    #[test]
+    fn only_a_persistent_request_on_a_willing_transport_is_kept() {
+        let response: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+        let exchange = |persistent: bool, reusable: bool, connection: &[(&str, &str)]| {
+            let mut request = PreparedRequest::new(
+                parts(Method::GET, "/", connection),
+                EncodedBody::Full(Bytes::new()),
+            )
+            .unwrap();
+            if persistent {
+                request = request.persistent();
+            }
+            let head = request.encode_head(None);
+            let mut mock = Mock::new([Bytes::from_static(response)]);
+            mock.reusable = reusable;
+            let idle = Arc::new(Idle::default());
+            block_on(async {
+                let response = request
+                    .exchange_reusing(mock, head, Some(idle.clone()))
+                    .await
+                    .unwrap();
+                response.into_body().collect().await.unwrap();
+            });
+            idle.len()
+        };
+        assert_eq!(exchange(true, true, &[]), 1);
+        // The request asked the server to close.
+        assert_eq!(exchange(false, true, &[]), 0);
+        // The caller's own `Connection` header: theirs to manage.
+        assert_eq!(exchange(true, true, &[("connection", "close")]), 0);
+        // The transport is not fit for another request (closed meanwhile,
+        // or a corked tail never released).
+        assert_eq!(exchange(true, false, &[]), 0);
+    }
+
+    #[test]
+    fn idle_connections_come_out_newest_first_and_dead_ones_are_dropped() {
+        let idle = Idle::default();
+        for (polls, reusable) in [(1, true), (2, true), (3, true)] {
+            let mut mock = Mock::new([]).reusable();
+            mock.polls = polls;
+            mock.reusable = reusable;
+            idle.put(mock);
+        }
+        // Not fit when it is returned: never stored.
+        idle.put(Mock::new([]));
+        assert_eq!(idle.len(), 3);
+        // Dies while idle: skipped on the way out.
+        idle.connections.lock().unwrap()[2].reusable = false;
+        assert_eq!(idle.take().map(|mock| mock.polls), Some(2));
+        assert_eq!(idle.take().map(|mock| mock.polls), Some(1));
+        assert!(idle.take().is_none());
+        // Bounded.
+        for _ in 0..MAX_IDLE_CONNECTIONS + 3 {
+            idle.put(Mock::new([]).reusable());
+        }
+        assert_eq!(idle.len(), MAX_IDLE_CONNECTIONS);
     }
 
     #[test]

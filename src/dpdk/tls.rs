@@ -421,6 +421,32 @@ impl TlsStream {
         &self.tcp
     }
 
+    /// Pairs the connection with the next request's flush handle; see
+    /// [`TcpStream::set_flush_handle`].
+    pub fn set_flush_handle(&mut self, flush: Option<&crate::dpdk::tcp::stream::FlushHandle>) {
+        self.tcp.set_flush_handle(flush);
+    }
+
+    /// Whether the connection, idle between two requests, can carry
+    /// another: the session is live in both directions, nothing is queued
+    /// either way, and the peer has sent no application data and has not
+    /// closed. Records that are not application data (session tickets,
+    /// key updates) are processed here. Registers no waker.
+    pub fn reusable(&mut self) -> bool {
+        if !matches!(self.session, Session::Live)
+            || self.read != ReadState::Open
+            || self.write != WriteState::Open
+            || !self.plaintext.is_empty()
+            || !self.tx.is_empty()
+        {
+            return false;
+        }
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let quiet = self.poll_recv(&mut cx).is_pending();
+        self.tcp.unpark();
+        quiet && self.tx.is_empty() && self.tcp.reusable()
+    }
+
     /// Zero-copy-shaped write of owned plaintext; see
     /// [`poll_send`](Self::poll_send).
     pub async fn send(&mut self, data: Bytes) -> io::Result<()> {
@@ -1836,6 +1862,47 @@ mod tests {
                 // cleanly once the response is out.
                 server.await.unwrap();
             }
+        });
+    }
+
+    /// Several requests, one after another, over one connection: each
+    /// response read to its end leaves the stream idle, and the next
+    /// request takes it from there.
+    #[test]
+    fn h1_codec_reuses_the_connection() {
+        use crate::dpdk::http::h1;
+        use crate::http::codec::EncodedBody;
+
+        run(async {
+            let server = server_config(&[&rustls::version::TLS13], &[b"http/1.1"]);
+            let (client, server) =
+                established(client_config(&[b"http/1.1"]), server, &[1448, 3, 9000]).await;
+            let server = tokio::spawn(serve(server, false));
+            let idle = Arc::new(h1::Idle::default());
+            let mut client = Some(client);
+            for (path, len) in [("/a", 0), ("/b", 70_000), ("/c", 5)] {
+                let tls = client.take().expect("the connection was not kept");
+                let parts = hyper::Request::post(path)
+                    .header("host", "test.local")
+                    .body(())
+                    .unwrap()
+                    .into_parts()
+                    .0;
+                let body = EncodedBody::Full(Bytes::from(pattern(len, 7)));
+                let response = h1::send_over_tls_reusing(tls, parts, body, idle.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 200);
+                assert!(idle.is_empty(), "kept before its response was read");
+                let body = response.into_body().collect().await.unwrap();
+                assert_eq!(&body[..], &expected_reply(path, len)[..]);
+                assert_eq!(idle.len(), 1);
+                client = idle.take();
+            }
+            // Still open: the server ends only once the connection is dropped.
+            assert!(!server.is_finished());
+            drop(client);
+            server.await.unwrap();
         });
     }
 
