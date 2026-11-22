@@ -16,6 +16,10 @@
 //! requests flushed at every stage of being staged (before the connection
 //! exists, during its handshakes, once held) must all be answered.
 //!
+//! Likewise for calling a request off: terminated through its handle at
+//! each of those stages, it must fail, and the server's count of requests
+//! received must not move.
+//!
 //! Two times are reported per case, both from the instant before
 //! `flush()`:
 //!
@@ -30,7 +34,9 @@
 //! What the flushing task does next matters, so each corked case runs
 //! twice: `yield`, where it yields to the runtime at once, and `busy10`,
 //! where it works for 10 microseconds first (a caller that has more to do
-//! at the moment it decides to send). `h2-reused` is the alternative to
+//! at the moment it decides to send). `terminate` calls the request off
+//! instead: the packet timed is the reset, and nothing of the request is
+//! sent. `h2-reused` is the alternative to
 //! corking for comparison: an HTTP/2 request sent, from scratch, on a
 //! connection that is already open.
 //!
@@ -133,9 +139,50 @@ mod run {
         assert_eq!(response.body().0.as_ref(), b"ok");
     }
 
-    /// One corked request: staged, then flushed. `busy_ns` is how long the
-    /// flushing task keeps the thread after `flush()` before it yields.
-    async fn corked(client: &Client, url: &str, busy_ns: u64) -> (u64, u64) {
+    /// How many requests have reached the server.
+    async fn served(client: &Client, plain: &str) -> usize {
+        let request = Request::get(format!("{plain}/served"))
+            .body(Raw(Bytes::new()))
+            .unwrap();
+        let response = client.request::<Raw, Raw>(request).await.unwrap();
+        std::str::from_utf8(&response.body().0)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// A request called off through its handle after `yields` turns of the
+    /// runtime -- before it has a connection, during the handshakes, or
+    /// held -- must fail promptly rather than wait or be sent.
+    async fn terminated_early(client: &Client, url: &str, yields: usize) {
+        let handle = FlushHandle::new();
+        let mut request = post(url);
+        request.extensions_mut().insert(TcpOptions {
+            cork: true,
+            ..TcpOptions::default()
+        });
+        request.extensions_mut().insert(handle.clone());
+        let client = client.clone();
+        let mut task = tokio::spawn(async move { client.request::<Raw, Raw>(request).await });
+        for _ in 0..yields {
+            tokio::task::yield_now().await;
+        }
+        handle.terminate();
+        let Ok(outcome) = tokio::time::timeout(Duration::from_secs(3), &mut task).await else {
+            task.abort();
+            panic!("a request terminated {yields} turns into {url} is still waiting");
+        };
+        assert!(
+            outcome.unwrap().is_err(),
+            "a request terminated {yields} turns into {url} was answered"
+        );
+    }
+
+    /// One corked request: staged, then flushed -- or, with `terminate`,
+    /// called off, in which case the packet timed is the reset. `busy_ns`
+    /// is how long the calling task keeps the thread afterwards before it
+    /// yields.
+    async fn corked(client: &Client, url: &str, busy_ns: u64, terminate: bool) -> (u64, u64) {
         let flush = FlushHandle::new();
         let mut request = post(url);
         request.extensions_mut().insert(TcpOptions {
@@ -161,17 +208,25 @@ mod run {
 
         probe::arm();
         let start = probe::now_ns();
-        flush.flush();
+        if terminate {
+            flush.terminate();
+        } else {
+            flush.flush();
+        }
         while probe::now_ns() - start < busy_ns {
             std::hint::spin_loop();
         }
         let (ready, sent) = fired().await;
 
-        let response = tokio::time::timeout(Duration::from_secs(10), task)
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
             .await
-            .expect("no response to the flushed request")
-            .unwrap()
+            .expect("the request neither answered nor failed")
             .unwrap();
+        if terminate {
+            assert!(outcome.is_err(), "a terminated request was answered");
+            return (ready - start, sent - start);
+        }
+        let response = outcome.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.version(), Version::HTTP_11);
         assert_eq!(response.body().0.as_ref(), b"ok");
@@ -275,11 +330,31 @@ mod run {
                 }
             }
             eprintln!("flushes at every stage of staging: all answered");
+            // Whenever the termination comes, the request fails, and the
+            // server never sees it.
+            let before = served(&client, &plain).await;
+            for url in [&plain, &tls] {
+                for yields in [0, 1, 2, 5, 20, 100, 500, 5_000] {
+                    for _ in 0..3 {
+                        terminated_early(&client, url, yields).await;
+                    }
+                }
+            }
+            let reached = served(&client, &plain).await - before;
+            assert_eq!(reached, 0, "terminated requests reached the server");
+            // And the client is none the worse for it.
+            flushed_early(&client, &plain, 500).await;
+            flushed_early(&client, &tls, 500).await;
+            eprintln!("terminations at every stage of staging: all failed, none sent");
             for (case, url) in [("cork-h1", &plain), ("cork-h1-tls", &tls)] {
                 if std::env::var("BENCH_CORK_CASE").is_ok_and(|only| only != case) {
                     continue;
                 }
-                for (trigger, busy_ns) in [("yield", 0), ("busy10", 10_000)] {
+                for (trigger, busy_ns, terminate) in [
+                    ("yield", 0, false),
+                    ("busy10", 10_000, false),
+                    ("terminate", 0, true),
+                ] {
                     if std::env::var("BENCH_CORK_TRIGGER").is_ok_and(|only| only != trigger) {
                         continue;
                     }
@@ -289,7 +364,7 @@ mod run {
                         if round == warmup {
                             prebuilt = probe::prebuilt_sent();
                         }
-                        let sample = corked(&client, url, busy_ns).await;
+                        let sample = corked(&client, url, busy_ns, terminate).await;
                         if round >= warmup {
                             samples.push(sample);
                         }

@@ -213,12 +213,28 @@ fn corked_tails_are_sent_from_prebuilt_packets(port: &EthPort, pool: &Mempool) {
     assert_eq!(sent[0].1, b"fourth");
     assert_eq!(engine.prebuilt_sent(), 3);
 
-    // A tail still held when the engine goes takes its packet with it.
+    // A held tail whose connection is reset is never sent: the peer gets
+    // the reset and nothing else, and the packet built for the tail goes
+    // back to the pool with it.
+    let next = sent[0].0.seq.wrapping_add(6);
     engine.set_cork(tuple, true);
     engine.send(tuple, Bytes::from_static(b"never sent"));
     engine.poll(port, pool, now);
     assert!(tcp_output(port).is_empty());
     engine.recv_each(tuple, usize::MAX, |_| true);
+    engine.reset(tuple);
+    let events = engine.poll(port, pool, now);
+    assert!(events.contains(&(tuple, Event::Reset)));
+    let sent = tcp_output(port);
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].0.has_flag(tcp::flags::RST));
+    assert_eq!(sent[0].0.seq, next);
+    assert!(sent[0].1.is_empty(), "held data went out with the reset");
+    assert_eq!(engine.state(tuple), None);
+    assert_eq!(engine.prebuilt_sent(), 3);
+    engine.reset(tuple);
+    engine.poll(port, pool, now);
+    assert!(tcp_output(port).is_empty());
     drop(engine);
     assert_eq!(
         unsafe { httpio::dpdk::ffi::rte_mempool_avail_count(pool.as_raw()) },

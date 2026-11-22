@@ -539,6 +539,26 @@ impl Tcb {
         self.flush_requested = true;
     }
 
+    /// Application-initiated abort (RFC 9293 §3.10.5): the connection
+    /// is over now. Nothing more of what was written is sent -- not a
+    /// corked or Nagle-held tail, not what the windows were holding back --
+    /// and the peer is told with a reset rather than a FIN, which would
+    /// have to follow that data. Reported as [`Event::Reset`], like any
+    /// other reset. Nothing to do on a connection that is already closed.
+    pub fn abort(&mut self) {
+        if self.is_closed() {
+            return;
+        }
+        self.send_buffer = SendBuffer::default();
+        self.handshake_out = None;
+        // The peer has nothing to reset once both FINs are through.
+        if self.state != TcpState::TimeWait {
+            self.reset_out = Some(ResetOut::AtSndNxt);
+        }
+        self.state = TcpState::Closed;
+        self.events.push(Event::Reset);
+    }
+
     fn flight_size(&self) -> u32 {
         self.snd_nxt.distance(self.snd_una).max(0) as u32
     }
@@ -2189,6 +2209,39 @@ mod tests {
         assert!(!tcb.retransmit_now);
         tcb.tick(later + tcb.rto.rto());
         assert!(tcb.retransmit_now);
+    }
+
+    #[test]
+    fn abort_resets_the_peer_and_sends_nothing_that_was_held() {
+        let now = Instant::now();
+        let mut tcb = establish(now);
+        tcb.set_cork(true);
+        tcb.send(Bytes::from_static(b"never to be sent"));
+        assert!(tcb.poll_output(now).is_empty());
+        let next = tcb.snd_nxt;
+        tcb.abort();
+        assert!(tcb.is_closed());
+        let resets = |tcb: &Tcb| tcb.events.iter().filter(|e| **e == Event::Reset).count();
+        assert_eq!(resets(&tcb), 1);
+        assert!(tcb.held_tail().is_none());
+        // One segment, the reset, where the next byte would have gone.
+        let output = tcb.poll_output(now);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].flags, flags::RST);
+        assert_eq!(output[0].seq, next);
+        assert!(output[0].payload.is_empty());
+        assert!(tcb.poll_output(now).is_empty());
+        // Again is nothing, and so is aborting what never opened.
+        tcb.abort();
+        assert_eq!(resets(&tcb), 1);
+
+        // Mid-handshake: the SYN is not sent (again), the peer is reset.
+        let mut tcb = Tcb::new_active(tuple());
+        tcb.abort();
+        assert!(tcb.is_closed());
+        let output = tcb.poll_output(now);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].flags, flags::RST);
     }
 
     #[test]

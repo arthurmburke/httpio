@@ -84,6 +84,19 @@ as before.
   before it measures: requests flushed at eight points from "at once" to
   "long since staged", cleartext and TLS, must all be answered.
 
+- **Calling a request off.** `FlushHandle::terminate()` ends the
+  request's connection instead of releasing it: the held tail is
+  discarded, the peer gets a reset, and the request fails
+  (`ConnectionAborted`). It reaches the worker the same direct way, ahead
+  of anything the stream had queued, and like a flush it is final and
+  cannot come too early -- a request terminated before it has a
+  connection never gets one. The reset is ready for the driver 0.8-0.9 us
+  after the call (median). The benchmark checks, before it measures, that
+  requests terminated at eight points of being staged all fail and that
+  the server's count of requests received does not move. A handle reaches
+  only its own request's connection: not one that has gone on to another
+  request, and not a shared HTTP/2 connection.
+
 Then the packet itself is built ahead:
 
 - **A prebuilt packet per held tail.** Whenever the engine visits a

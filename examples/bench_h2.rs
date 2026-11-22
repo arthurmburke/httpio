@@ -82,6 +82,9 @@ fn runtime(io: bool) -> tokio::runtime::Runtime {
 
 // ---- the kernel server -----------------------------------------------------
 
+/// Requests whose head the server has received.
+static SERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 async fn serve<S>(io: S, bodies: Arc<Vec<Bytes>>, h1: bool)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -89,6 +92,17 @@ where
     let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
         let bodies = bodies.clone();
         async move {
+            // How many requests have reached the server, for a client that
+            // needs to know one did not (`bench_cork`). Not itself counted.
+            if req.uri().path() == "/served" {
+                let served = SERVED.load(std::sync::atomic::Ordering::SeqCst).to_string();
+                let mut response = Response::builder();
+                if h1 {
+                    response = response.header("connection", "close");
+                }
+                return Ok(response.body(Full::new(Bytes::from(served))).unwrap());
+            }
+            SERVED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let size: usize = req.uri().path().trim_start_matches('/').parse().unwrap();
             let index = SIZES.iter().position(|n| *n == size).unwrap();
             let upload = req.method() == http::Method::POST;

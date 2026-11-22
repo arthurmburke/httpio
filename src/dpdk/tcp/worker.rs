@@ -128,25 +128,29 @@ pub(crate) struct SendCredit {
     app_gone: AtomicBool,
     pub(crate) bytes: AtomicUsize,
     pub(crate) failed: AtomicBool,
-    /// A [`FlushHandle`](super::stream::FlushHandle) asked for the held
-    /// tail to be released: set from whichever thread called it, taken by
-    /// the worker. A flag beside the command ring rather than a command on
-    /// it, because the ring has one producer (the stream) and the request
-    /// must not wait for that producer's task to be scheduled.
+    /// What a [`FlushHandle`](super::stream::FlushHandle) has asked of
+    /// the worker: a count of flush requests in the low bits, and
+    /// [`TERMINATE`] once termination has been asked for. Written from
+    /// whichever thread called the handle, read by the worker. Beside the
+    /// command ring rather than commands on it, because the ring has one
+    /// producer (the stream) and neither request must wait for that
+    /// producer's task to be scheduled.
     ///
     /// While the connection is corked the worker reads this on every turn
-    /// of its loop instead of waiting to be notified, so setting it costs
-    /// the request one cache line crossing between the cores -- hence a
-    /// line of its own, which nothing else dirties.
-    ///
-    /// A count of requests rather than a flag to be cleared: the worker
-    /// compares it with [`flush_seen`](Self::flush_seen), which only it
-    /// writes, so taking a request does not pull this line back to the
-    /// worker's core for a write.
-    flush: OwnLine<AtomicU32>,
-    /// The value of `flush` the worker has acted on. Worker-only.
-    flush_seen: AtomicU32,
+    /// of its loop instead of waiting to be notified, so a request costs
+    /// one cache line crossing between the cores -- hence a line of its
+    /// own, which nothing else dirties. And a count rather than a flag to
+    /// be cleared: the worker compares it with
+    /// [`signals_seen`](Self::signals_seen), which only it writes, so
+    /// taking a request does not pull this line back to the worker's core
+    /// for a write.
+    signals: OwnLine<AtomicU32>,
+    /// The value of `signals` the worker has acted on. Worker-only.
+    signals_seen: AtomicU32,
 }
+
+/// Set in [`SendCredit::signals`] when the connection is to be terminated.
+const TERMINATE: u32 = 1 << 31;
 
 impl SendCredit {
     /// Asks the worker, directly, to release the connection's held tail
@@ -154,37 +158,68 @@ impl SendCredit {
     /// doing nothing, when no worker is listening (a stream built without
     /// one, in tests).
     pub(crate) fn request_flush(&self) -> bool {
-        // The flag before anything else, even before looking at the rest
-        // of this struct: a worker watching it acts on this store alone,
-        // and every other field here sits on lines the worker writes,
-        // which would have to cross between the cores first.
-        let previous = self.flush.0.fetch_add(1, Ordering::AcqRel);
+        // The signal before anything else, even before looking at the
+        // rest of this struct: a worker watching it acts on this store
+        // alone, and every other field here sits on lines the worker
+        // writes, which would have to cross between the cores first.
+        self.signals.0.fetch_add(1, Ordering::AcqRel);
         if self.wake.is_none() {
             // Nobody to act on it: as if it had been seen.
-            self.flush_seen
-                .store(previous.wrapping_add(1), Ordering::Release);
+            self.mark_signals_seen();
             return false;
         }
-        // For a connection the worker is not watching; after the flag, so
-        // the visit it causes sees it.
+        // For a connection the worker is not watching; after the signal,
+        // so the visit it causes sees it.
         self.notify();
         true
     }
 
-    /// Whether a flush request is pending, without taking it.
-    fn flush_requested(&self) -> bool {
-        self.flush.0.load(Ordering::Acquire) != self.flush_seen.load(Ordering::Relaxed)
+    /// Asks the worker, directly, to end the connection now, sending
+    /// nothing more on it; see [`TcpEngine::reset`]. Unlike a flush it
+    /// does not wait for the command ring: what the stream queued is not
+    /// to be sent either. `false` when no worker is listening.
+    pub(crate) fn request_terminate(&self) -> bool {
+        self.signals.0.fetch_or(TERMINATE, Ordering::AcqRel);
+        if self.wake.is_none() {
+            self.mark_signals_seen();
+            return false;
+        }
+        self.notify();
+        true
+    }
+
+    fn mark_signals_seen(&self) {
+        self.signals_seen
+            .store(self.signals.0.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// Whether a flush or a termination is waiting to be taken.
+    fn signalled(&self) -> bool {
+        self.signals.0.load(Ordering::Acquire) != self.signals_seen.load(Ordering::Relaxed)
+    }
+
+    /// Takes a pending termination request. It is asked for once and
+    /// stays asked for.
+    fn take_terminate(&self) -> bool {
+        let seen = self.signals_seen.load(Ordering::Relaxed);
+        if seen & TERMINATE != 0 || self.signals.0.load(Ordering::Acquire) & TERMINATE == 0 {
+            return false;
+        }
+        self.signals_seen.store(seen | TERMINATE, Ordering::Relaxed);
+        true
     }
 
     /// Takes the pending flush requests, however many: one release serves
     /// them all. This runs for every connection the worker visits, and
     /// almost none has one.
     fn take_flush(&self) -> bool {
-        let requested = self.flush.0.load(Ordering::Acquire);
-        if requested == self.flush_seen.load(Ordering::Relaxed) {
+        let requested = self.signals.0.load(Ordering::Acquire) & !TERMINATE;
+        let seen = self.signals_seen.load(Ordering::Relaxed);
+        if requested == seen & !TERMINATE {
             return false;
         }
-        self.flush_seen.store(requested, Ordering::Relaxed);
+        self.signals_seen
+            .store(requested | seen & TERMINATE, Ordering::Relaxed);
         true
     }
 
@@ -313,8 +348,8 @@ fn command_channel_with_wake(
         app_gone: AtomicBool::new(false),
         bytes: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
-        flush: OwnLine(AtomicU32::new(0)),
-        flush_seen: AtomicU32::new(0),
+        signals: OwnLine(AtomicU32::new(0)),
+        signals_seen: AtomicU32::new(0),
     });
     (
         CmdTx {
@@ -474,6 +509,9 @@ struct WorkerConn {
     /// loop turns it into one notification at the end of the iteration,
     /// after the change is visible.
     notify_app: bool,
+    /// Ended through its flush handle: commands still arriving on the
+    /// ring are not applied.
+    terminated: bool,
 }
 
 impl WorkerConn {
@@ -494,6 +532,7 @@ impl WorkerConn {
             teardown: Teardown::Open,
             app_wake: None,
             notify_app: false,
+            terminated: false,
         }
     }
 
@@ -511,6 +550,16 @@ impl WorkerConn {
             return false;
         }
         true
+    }
+
+    /// A termination asked for through the flush handle: the engine drops
+    /// what it had not sent and resets the peer, and the application is
+    /// told as for any reset -- at once, whether or not the engine still
+    /// knows the connection.
+    fn terminate(&mut self, engine: &mut TcpEngine) {
+        self.terminated = true;
+        engine.reset(self.tuple);
+        self.on_event(Event::Reset);
     }
 
     /// `Command::Close`: half-close the engine side, once.
@@ -1060,7 +1109,7 @@ fn run(
         // A flush request on a watched connection: visit it now. The flag
         // is taken below, once the connection's commands are applied.
         for (tuple, credit) in &watched {
-            if credit.flush_requested() {
+            if credit.signalled() {
                 work.insert(*tuple);
             }
         }
@@ -1069,6 +1118,16 @@ fn run(
             let Some(conn) = conns.get_mut(tuple) else {
                 continue;
             };
+            // Terminated through its flush handle: nothing more is sent,
+            // so whatever the stream queued is dropped unapplied.
+            if conn.outstanding.take_terminate() {
+                conn.terminate(&mut engine);
+                watched.retain(|(watched, _)| *watched != conn.tuple);
+            }
+            if conn.terminated {
+                while conn.cmd_rx.pop().is_some() {}
+                continue;
+            }
             for _ in 0..CMD_CAP {
                 let Some(cmd) = conn.cmd_rx.pop() else {
                     break;
@@ -1224,7 +1283,7 @@ mod tests {
         let (_notifier, ready) = crate::dpdk::tcp::app_wake::channel();
         let flush = crate::dpdk::tcp::stream::FlushHandle::new();
         let _state = flush.attach(&ready.wake_handle(), tx.credit());
-        assert!(!conn.outstanding.flush_requested());
+        assert!(!conn.outstanding.signalled());
 
         // From another thread, as a caller reacting to something would.
         let handle = flush.clone();
@@ -1235,7 +1294,7 @@ mod tests {
         .join()
         .unwrap();
         assert!(conn.cmd_rx.is_empty(), "the ring has one producer");
-        assert!(conn.outstanding.flush_requested());
+        assert!(conn.outstanding.signalled());
         let mut conns = HashMap::default();
         conns.insert(tuple, conn);
         let mut work = HashSet::default();
@@ -1244,14 +1303,88 @@ mod tests {
         let conn = &conns[&tuple];
         assert!(conn.outstanding.take_flush());
         assert!(!conn.outstanding.take_flush(), "two requests, one release");
-        assert!(!conn.outstanding.flush_requested());
+        assert!(!conn.outstanding.signalled());
         flush.flush();
         assert!(conn.outstanding.take_flush());
 
         // With no worker behind the stream the request is not left here.
         let (tx, conn, _) = fixture_with_wake(None);
         assert!(!tx.credit().request_flush());
-        assert!(!conn.outstanding.flush_requested());
+        assert!(!conn.outstanding.signalled());
+        assert!(!tx.credit().request_terminate());
+        assert!(!conn.outstanding.signalled());
+    }
+
+    /// A `FlushHandle` can end its connection the same way: the worker is
+    /// told directly, the engine resets the peer, and the application is
+    /// told at once. What the stream had queued is not applied.
+    #[test]
+    fn a_flush_handle_terminates_its_connection() {
+        let wake_for = |tuple| {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let wake = Wake {
+                tuple,
+                queued: AtomicBool::new(false),
+                sender: ReadySender {
+                    tx: ready_tx,
+                    overflow: Arc::new(AtomicBool::new(false)),
+                },
+            };
+            (wake, ready_rx)
+        };
+        let (_, base, _) = fixture();
+        let tuple = base.tuple;
+        let (wake, ready_rx) = wake_for(tuple);
+        let (tx, mut conn, mut engine) = fixture_with_wake(Some(wake));
+        let (_notifier, ready) = crate::dpdk::tcp::app_wake::channel();
+        let handle = crate::dpdk::tcp::stream::FlushHandle::new();
+        let _state = handle.attach(&ready.wake_handle(), tx.credit());
+        assert!(
+            tx.push(Command::Send(Bytes::from_static(b"queued")))
+                .is_ok()
+        );
+        while ready_rx.pop().is_some() {}
+        conn.outstanding.clear_notification();
+
+        // A flush and a termination both waiting: the termination is
+        // taken first, and it is taken once.
+        handle.flush();
+        let other = handle.clone();
+        std::thread::spawn(move || other.terminate())
+            .join()
+            .unwrap();
+        assert!(handle.is_terminated());
+        assert!(conn.outstanding.signalled());
+        assert_eq!(ready_rx.pop(), Some(tuple), "the worker is notified");
+        assert!(conn.outstanding.take_terminate());
+        assert!(!conn.outstanding.take_terminate());
+        handle.terminate();
+        assert!(!conn.outstanding.take_terminate());
+
+        conn.terminate(&mut engine);
+        assert!(conn.terminated);
+        assert!(tx.failed(), "the application can queue nothing more");
+        assert!(matches!(
+            conn.delivery,
+            Delivery::Terminal(Inbound::ConnectFailed)
+        ));
+        assert_eq!(
+            engine.state(tuple),
+            Some(TcpState::Closed),
+            "reset, waiting only for the poll that sends it"
+        );
+        assert_eq!(engine.buffered_send_bytes(tuple), 0);
+
+        // A handle terminated before it had a connection ends the one it
+        // is then given.
+        let (wake, ready_rx) = wake_for(tuple);
+        let (tx, conn, _) = fixture_with_wake(Some(wake));
+        let early = crate::dpdk::tcp::stream::FlushHandle::new();
+        early.terminate();
+        assert!(!conn.outstanding.signalled());
+        let _state = early.attach(&ready.wake_handle(), tx.credit());
+        assert!(conn.outstanding.take_terminate());
+        assert_eq!(ready_rx.pop(), Some(tuple));
     }
 
     #[test]

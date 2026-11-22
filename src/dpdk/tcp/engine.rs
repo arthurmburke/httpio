@@ -407,6 +407,24 @@ impl TcpEngine {
             .map_or(0, |c| c.tcb.buffered_send_bytes())
     }
 
+    /// Application-initiated abort: ends the connection now, sending
+    /// nothing more of what was written to it (a held tail and its
+    /// prebuilt packet included, and whatever was queued for the port but
+    /// has not left) and resetting the peer. The connection reports
+    /// [`Event::Reset`] on the next poll, which also sends the reset and
+    /// forgets the connection.
+    pub fn reset(&mut self, tuple: FourTuple) {
+        let Some(id) = self.connections.id_of(&tuple) else {
+            return;
+        };
+        self.discard_queued(id);
+        if let Some(conn) = self.connections.by_id_mut(id) {
+            conn.prebuilt = None;
+            conn.tcb.abort();
+            Self::mark_active(&mut self.active, conn, id);
+        }
+    }
+
     /// Discards an abandoned connection and all its retained buffers.
     pub(crate) fn abort(&mut self, tuple: FourTuple) {
         let Some(id) = self.connections.id_of(&tuple) else {

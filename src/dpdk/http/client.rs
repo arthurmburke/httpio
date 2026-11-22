@@ -341,6 +341,13 @@ impl Client {
         if flush_handle.is_none() && tcp_options.cork {
             return Err(HttpError::CorkWithoutFlushHandle);
         }
+        // Called off before it began: no connection is taken for it.
+        if flush_handle
+            .as_ref()
+            .is_some_and(FlushHandle::is_terminated)
+        {
+            return Err(HttpError::Connect(std::io::ErrorKind::ConnectionAborted));
+        }
 
         let uri = parts.uri.clone();
         let is_https = http_scheme_is_tls(uri.scheme_str())?;
@@ -358,8 +365,7 @@ impl Client {
                 let (tls, idle) = self
                     .corked_tls_h1(&host, port, tcp_options, flush_handle.as_ref())
                     .await?;
-                return send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port, idle)
-                    .await;
+                return send_tls_h1(tls, parts, EncodedBody::Full(body), &host, port, idle).await;
             }
 
             // One more attempt if the server did not process the first:
@@ -415,6 +421,13 @@ impl Client {
 
         if flush_handle.is_none() && tcp_options.cork {
             return Err(HttpError::CorkWithoutFlushHandle);
+        }
+        // Called off before it began: no connection is taken for it.
+        if flush_handle
+            .as_ref()
+            .is_some_and(FlushHandle::is_terminated)
+        {
+            return Err(HttpError::Connect(std::io::ErrorKind::ConnectionAborted));
         }
 
         let uri = parts.uri.clone();
@@ -590,9 +603,14 @@ impl Client {
             .connect(server_name, tcp)
             .await
             .map_err(|e| HttpError::TlsHandshake(e.kind()))?;
+        let mut tls = tls;
         if tls.alpn_protocol() != Some(b"h2".as_slice()) {
             return Ok(TlsConnection::H1(Box::new(tls), idle));
         }
+        // From here the connection is shared by every request to the
+        // origin: the one that happened to open it must not be able to
+        // end it through its flush handle.
+        tls.set_flush_handle(None);
         let send_request = handshake_h2(tls);
         // Pool a clone; on a race where two tasks dialed the same origin
         // concurrently, last-in wins and the loser's connection just
