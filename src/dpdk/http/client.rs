@@ -344,7 +344,7 @@ impl Client {
         // Called off before it began: no connection is taken for it.
         if flush_handle
             .as_ref()
-            .is_some_and(FlushHandle::is_terminated)
+            .is_some_and(FlushHandle::is_aborted)
         {
             return Err(HttpError::Connect(std::io::ErrorKind::ConnectionAborted));
         }
@@ -425,7 +425,7 @@ impl Client {
         // Called off before it began: no connection is taken for it.
         if flush_handle
             .as_ref()
-            .is_some_and(FlushHandle::is_terminated)
+            .is_some_and(FlushHandle::is_aborted)
         {
             return Err(HttpError::Connect(std::io::ErrorKind::ConnectionAborted));
         }

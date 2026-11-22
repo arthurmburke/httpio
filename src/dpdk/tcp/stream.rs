@@ -129,7 +129,7 @@ pub(crate) struct FlushState {
     flushed: AtomicBool,
     /// [`FlushHandle::terminate`] has been called. Never cleared: a
     /// stream paired with the handle fails everything from then on.
-    terminated: AtomicBool,
+    aborted: AtomicBool,
     /// A flush the stream has to pass on itself, as a command, because no
     /// worker could be told directly (the connection did not exist yet).
     requested: AtomicBool,
@@ -144,7 +144,7 @@ impl Default for FlushState {
     fn default() -> Self {
         Self {
             flushed: AtomicBool::new(false),
-            terminated: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
             requested: AtomicBool::new(false),
             stream: SpinLock::new(None),
             worker: SpinLock::new(None),
@@ -202,13 +202,13 @@ impl FlushHandle {
     /// request fails without getting one. Called after the request is
     /// over, when its connection has gone on to another, it does nothing.
     /// It cannot take back what has already been sent.
-    pub fn terminate(&self) {
+    pub fn abort(&self) {
         // First, and for good: a stream paired with this handle, now or
         // later, fails whatever it is asked to do.
-        self.state.terminated.store(true, Ordering::SeqCst);
+        self.state.aborted.store(true, Ordering::SeqCst);
         self.state.worker.with(|worker| {
             if let Some(worker) = worker {
-                worker.request_terminate();
+                worker.request_abort();
             }
         });
         // The request may be waiting on the stream: it has an answer now.
@@ -218,9 +218,9 @@ impl FlushHandle {
         }
     }
 
-    /// Whether [`terminate`](Self::terminate) has been called.
-    pub fn is_terminated(&self) -> bool {
-        self.state.terminated.load(Ordering::SeqCst)
+    /// Whether [`abort`](Self::abort) has been called.
+    pub fn is_aborted(&self) -> bool {
+        self.state.aborted.load(Ordering::SeqCst)
     }
 
     pub(crate) fn attach(
@@ -230,12 +230,12 @@ impl FlushHandle {
     ) -> Arc<FlushState> {
         self.state.stream.with(|slot| *slot = Some(stream.clone()));
         self.state.worker.with(|slot| *slot = Some(worker.clone()));
-        // Terminated before it had a connection to end: end this one.
-        // (`terminate` sets its mark before it looks for the connection,
+        // Aborted before it had a connection to end: end this one.
+        // (`abort` sets its mark before it looks for the connection,
         // and this looks for the mark after providing one, so between
         // them the worker is always told.)
-        if self.is_terminated() {
-            worker.request_terminate();
+        if self.is_aborted() {
+            worker.request_abort();
         }
         self.state.clone()
     }
@@ -251,11 +251,11 @@ impl FlushState {
     }
 }
 
-/// What a stream reports once its [`FlushHandle`] has terminated it.
-fn terminated() -> io::Error {
+/// What a stream reports once its [`FlushHandle`] has aborted it.
+fn aborted() -> io::Error {
     io::Error::new(
         io::ErrorKind::ConnectionAborted,
-        "connection terminated through its flush handle",
+        "connection aborted through its flush handle",
     )
 }
 
@@ -444,8 +444,8 @@ impl TcpStream {
         flush: Option<&FlushHandle>,
     ) -> io::Result<Self> {
         // Called off before it began: no connection is opened for it.
-        if flush.is_some_and(FlushHandle::is_terminated) {
-            return Err(terminated());
+        if flush.is_some_and(FlushHandle::is_aborted) {
+            return Err(aborted());
         }
         let endpoints = worker
             .open(remote_ip, remote_port, local_port, options.nodelay)
@@ -521,13 +521,13 @@ impl TcpStream {
 
     /// The error every operation gives once the connection has been ended
     /// through its [`FlushHandle`]. The handle's word, not the worker's:
-    /// the stream fails from the moment `terminate` is called, without
+    /// the stream fails from the moment `abort` is called, without
     /// waiting to be told the connection is gone.
-    fn terminated(&self) -> Option<io::Error> {
+    fn aborted(&self) -> Option<io::Error> {
         self.flush
             .as_ref()
-            .is_some_and(|flush| flush.terminated.load(Ordering::SeqCst))
-            .then(terminated)
+            .is_some_and(|flush| flush.aborted.load(Ordering::SeqCst))
+            .then(aborted)
     }
 
     /// Whether the connection, idle between two requests, can carry
@@ -543,7 +543,7 @@ impl TcpStream {
         {
             return false;
         }
-        if self.terminated().is_some() {
+        if self.aborted().is_some() {
             return false;
         }
         self.drain_flush();
@@ -646,7 +646,7 @@ impl TcpStream {
     /// One attempt at [`poll_send`](Self::poll_send): pushes as much of
     /// `data` as ring space and send credit allow.
     fn try_send(&mut self, data: &mut Option<Bytes>) -> Poll<io::Result<()>> {
-        if let Some(error) = self.terminated() {
+        if let Some(error) = self.aborted() {
             return Poll::Ready(Err(error));
         }
         self.drain_inbound();
@@ -721,7 +721,7 @@ impl TcpStream {
     }
 
     fn try_recv(&mut self) -> Poll<io::Result<Option<MbufSlice>>> {
-        if let Some(error) = self.terminated() {
+        if let Some(error) = self.aborted() {
             return Poll::Ready(Err(error));
         }
         self.drain_flush();
@@ -750,7 +750,7 @@ impl TcpStream {
     }
 
     fn try_established(&mut self) -> Poll<io::Result<()>> {
-        if let Some(error) = self.terminated() {
+        if let Some(error) = self.aborted() {
             return Poll::Ready(Err(error));
         }
         self.drain_inbound();
@@ -857,7 +857,7 @@ impl TcpStream {
     /// One attempt at `poll_read`. Nothing is written to `buf` when it
     /// returns `Pending`.
     fn try_read(&mut self, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        if let Some(error) = self.terminated() {
+        if let Some(error) = self.aborted() {
             return Poll::Ready(Err(error));
         }
         let this = self;
@@ -911,7 +911,7 @@ impl TcpStream {
     /// share a packet, else the heap. Returns the bytes accepted, which
     /// may end mid-slice. Nothing is enqueued when it returns `Pending`.
     fn try_write(&mut self, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
-        if let Some(error) = self.terminated() {
+        if let Some(error) = self.aborted() {
             return Poll::Ready(Err(error));
         }
         self.drain_inbound();
@@ -1018,7 +1018,7 @@ impl TcpStream {
 
     /// One attempt at `poll_shutdown`.
     fn try_shutdown(&mut self) -> Poll<io::Result<()>> {
-        if let Some(error) = self.terminated() {
+        if let Some(error) = self.aborted() {
             return Poll::Ready(Err(error));
         }
         if self.cmd_tx.is_closed() || self.cmd_tx.failed() {
@@ -1444,7 +1444,7 @@ mod tests {
         let handle = FlushHandle::new();
         stream.flush = Some(handle.attach(&wake, stream.cmd_tx.credit()));
         stream.request_cork();
-        assert!(!handle.is_terminated());
+        assert!(!handle.is_aborted());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -1459,7 +1459,7 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             assert!(!reader.is_finished());
-            waiting.terminate();
+            waiting.abort();
             let (mut stream, result) = reader.await.unwrap();
             let aborted = |error: io::Error| error.kind() == io::ErrorKind::ConnectionAborted;
             assert!(aborted(result.unwrap_err()));
@@ -1484,15 +1484,15 @@ mod tests {
         first.flush();
         let second = FlushHandle::new();
         stream.set_flush_handle(Some(&second));
-        first.terminate();
-        assert!(stream.terminated().is_none());
+        first.abort();
+        assert!(stream.aborted().is_none());
         second.flush();
         assert!(stream.reusable());
         // And one terminated before it is paired ends what it is given.
         let late = FlushHandle::new();
-        late.terminate();
+        late.abort();
         stream.set_flush_handle(Some(&late));
-        assert!(stream.terminated().is_some());
+        assert!(stream.aborted().is_some());
         assert!(!stream.reusable());
     }
 

@@ -178,7 +178,7 @@ impl SendCredit {
     /// nothing more on it; see [`TcpEngine::reset`]. Unlike a flush it
     /// does not wait for the command ring: what the stream queued is not
     /// to be sent either. `false` when no worker is listening.
-    pub(crate) fn request_terminate(&self) -> bool {
+    pub(crate) fn request_abort(&self) -> bool {
         self.signals.0.fetch_or(TERMINATE, Ordering::AcqRel);
         if self.wake.is_none() {
             self.mark_signals_seen();
@@ -1311,7 +1311,7 @@ mod tests {
         let (tx, conn, _) = fixture_with_wake(None);
         assert!(!tx.credit().request_flush());
         assert!(!conn.outstanding.signalled());
-        assert!(!tx.credit().request_terminate());
+        assert!(!tx.credit().request_abort());
         assert!(!conn.outstanding.signalled());
     }
 
@@ -1350,15 +1350,15 @@ mod tests {
         // taken first, and it is taken once.
         handle.flush();
         let other = handle.clone();
-        std::thread::spawn(move || other.terminate())
+        std::thread::spawn(move || other.abort())
             .join()
             .unwrap();
-        assert!(handle.is_terminated());
+        assert!(handle.is_aborted());
         assert!(conn.outstanding.signalled());
         assert_eq!(ready_rx.pop(), Some(tuple), "the worker is notified");
         assert!(conn.outstanding.take_terminate());
         assert!(!conn.outstanding.take_terminate());
-        handle.terminate();
+        handle.abort();
         assert!(!conn.outstanding.take_terminate());
 
         conn.terminate(&mut engine);
@@ -1380,7 +1380,7 @@ mod tests {
         let (wake, ready_rx) = wake_for(tuple);
         let (tx, conn, _) = fixture_with_wake(Some(wake));
         let early = crate::dpdk::tcp::stream::FlushHandle::new();
-        early.terminate();
+        early.abort();
         assert!(!conn.outstanding.signalled());
         let _state = early.attach(&ready.wake_handle(), tx.credit());
         assert!(conn.outstanding.take_terminate());

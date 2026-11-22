@@ -13,7 +13,7 @@
 //! Sums and products saturate rather than overflow; a `u64` of nanoseconds
 //! covers 584 years.
 
-use std::ops::{Add, AddAssign, Div, Mul, ShlAssign, Sub, SubAssign};
+use std::ops::{Add, AddAssign, Div, Mul, Sub, SubAssign};
 
 /// A span of time, in nanoseconds.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
