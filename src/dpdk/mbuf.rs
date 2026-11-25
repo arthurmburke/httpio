@@ -153,6 +153,18 @@ impl Mbuf {
         unsafe { (*self.raw).pkt_len }
     }
 
+    /// How many mbufs the pool this one belongs to has free, and how many
+    /// it holds in all. Counting the free ones visits every lcore's cache
+    /// of the pool, so this is not for every packet.
+    pub fn pool_level(&self) -> (u32, u32) {
+        // SAFETY: `raw` is a valid mbuf, and its `pool` the live pool it
+        // was allocated from (pools are never freed; see `Mempool`).
+        unsafe {
+            let pool = (*self.raw).pool;
+            (ffi::rte_mempool_avail_count(pool), (*pool).size)
+        }
+    }
+
     pub fn data_len(&self) -> u16 {
         // SAFETY: as above.
         unsafe { (*self.raw).data_len }
@@ -416,6 +428,27 @@ impl Mbuf {
                 | ffi::RTE_MBUF_F_TX_IP_CKSUM
                 | ffi::RTE_MBUF_F_TX_TCP_CKSUM;
             // tx_offload bitfield: l2_len in bits [0,7), l3_len in [7,16).
+            (*self.raw).__bindgen_anon_3.tx_offload =
+                (l2_len as u64 & 0x7f) | ((l3_len as u64 & 0x1ff) << 7);
+        }
+    }
+
+    /// Requests NIC TX checksum offload for an IPv4 + UDP packet, the UDP
+    /// counterpart of [`set_tx_ipv4_tcp_cksum`](Self::set_tx_ipv4_tcp_cksum):
+    /// the IPv4 checksum field must be zero and the UDP checksum field must
+    /// hold the pseudo-header sum.
+    ///
+    /// `RTE_MBUF_F_TX_L4_MASK` is a 2-bit *field*, not a set of flags:
+    /// TCP is `01`, UDP `11`. The bits are therefore assigned, never ORed
+    /// onto whatever L4 request the mbuf may already carry.
+    pub fn set_tx_ipv4_udp_cksum(&mut self, l2_len: u16, l3_len: u16) {
+        // SAFETY: as for `set_tx_ipv4_tcp_cksum`.
+        unsafe {
+            let flags = (*self.raw).ol_flags & !ffi::RTE_MBUF_F_TX_L4_MASK;
+            (*self.raw).ol_flags = flags
+                | ffi::RTE_MBUF_F_TX_IPV4
+                | ffi::RTE_MBUF_F_TX_IP_CKSUM
+                | ffi::RTE_MBUF_F_TX_UDP_CKSUM;
             (*self.raw).__bindgen_anon_3.tx_offload =
                 (l2_len as u64 & 0x7f) | ((l3_len as u64 & 0x1ff) << 7);
         }

@@ -244,6 +244,11 @@ impl ArpTable {
         due
     }
 
+    /// How many requests are queued for [`drain_requests`](Self::drain_requests).
+    pub fn pending_requests_len(&self) -> usize {
+        self.pending_requests.len()
+    }
+
     /// The addresses to send ARP requests for now. Draining keeps the
     /// vector's allocation.
     pub fn drain_requests(&mut self) -> impl Iterator<Item = Ipv4Addr> + '_ {

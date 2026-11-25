@@ -1,5 +1,9 @@
 //! Worker -> application wake-ups: which connections have something new.
 //!
+//! "Connection" below means anything the worker serves through rings: a
+//! `TcpStream`, or one half of a UDP socket (`crate::dpdk::udp`), which
+//! has a wake handle per worker it is bound on.
+//!
 //! A `TcpStream` that cannot make progress used to wake its own task and
 //! return `Pending`, so every waiting stream was re-polled on every turn of
 //! the runtime whether or not anything had happened to it. Here the worker
@@ -230,6 +234,17 @@ impl AppWake {
         if let Some(waker) = self.take() {
             waker.wake();
         }
+    }
+}
+
+/// A waiter's hold on its waker slot; forgets the stored waker when the
+/// waiter (a stream, a UDP socket half) goes away, so the driver stops
+/// spinning on its behalf.
+pub(crate) struct Parker(pub(crate) Arc<AppWake>);
+
+impl Drop for Parker {
+    fn drop(&mut self) {
+        self.0.unpark();
     }
 }
 

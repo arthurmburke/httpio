@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test of the HTTP client over the DPDK TCP stack.
+# End-to-end test of the HTTP client (and of UDP) over the DPDK stack.
 #
 # Wiring: a kernel tap device (dtap0) carries frames between the DPDK
 # net_tap vdev (our stack's port, 10.9.0.1) and the kernel network stack
@@ -9,6 +9,8 @@
 #   - nghttpd                       :9443  HTTPS, ALPN h2
 #   - python http.server            10.8.0.2:8081, off-subnet (on lo), for
 #                                   the --gateway routing checks
+#   - python UDP echo               :7007  for `udp_echo client`
+# and `udp_echo server` is checked from a python UDP client.
 # TLS uses a freshly generated custom CA; the client must be told to
 # trust it via --ca, and resolves the cert's hostname via --resolve.
 #
@@ -24,9 +26,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
-cargo build --bin http_get --bin ws_client
+cargo build --bin http_get --bin ws_client --bin udp_echo
 BIN="$TARGET_DIR/debug/http_get"
 WSBIN="$TARGET_DIR/debug/ws_client"
+UDPBIN="$TARGET_DIR/debug/udp_echo"
 
 WORK=$(mktemp -d)
 SERVER_PIDS=()
@@ -89,6 +92,15 @@ PYEOF
     nghttpd -d "$WORK/docroot" -a 10.9.0.2 9443 "$WORK/server.key" "$WORK/server.pem" &
     SERVER_PIDS+=($!)
     (cd "$WORK/docroot" && exec python3 -m http.server --bind 10.8.0.2 --protocol HTTP/1.1 8081) &
+    SERVER_PIDS+=($!)
+    python3 - <<'PYEOF' &
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("10.9.0.2", 7007))
+while True:
+    data, peer = s.recvfrom(65535)
+    s.sendto(data, peer)
+PYEOF
     SERVER_PIDS+=($!)
     sleep 1
 }
@@ -212,5 +224,48 @@ fi
 grep -qi "TLS handshake with the origin failed" "$WORK/nocaperr" \
     || { echo "FAIL unknown-CA rejection: unexpected error:"; cat "$WORK/nocaperr"; exit 1; }
 echo "PASS unknown CA rejected"
+
+# UDP, client side: numbered datagrams to the kernel's echo server, each
+# of which must come back intact (udp_echo exits non-zero on any loss or
+# mismatch). The first one waits for ARP; the last is a full 1472-byte
+# payload (1500 MTU less the IPv4 and UDP headers).
+UDPRUN=("$UDPBIN" -l 0-1 --no-huge --vdev=net_tap0,iface=dtap0 -- 10.9.0.1)
+udp_client() { # name, args...
+    local name=$1 out; shift
+    fresh_net
+    out=$("${UDPRUN[@]}" client 10.9.0.2:7007 "$@" 2>"$WORK/udp_err") \
+        || { echo "FAIL $name:"; cat "$WORK/udp_err"; echo "$out"; exit 1; }
+    grep -q "lost=0" <<<"$out" || { echo "FAIL $name: $out"; exit 1; }
+    echo "PASS $name ($(grep rtt_us <<<"$out"))"
+}
+udp_client "UDP echo client, 100 x 64 bytes" --count 100
+udp_client "UDP echo client, 20 x 1472 bytes" --count 20 --size 1472
+
+# UDP, server side: the stack echoes what a kernel socket sends it. The
+# server exits after its --count echoes; the script waits for it to bind
+# first, since datagrams sent before that are (rightly) dropped.
+fresh_net
+timeout 60 "${UDPRUN[@]}" server 7008 --count 5 2>"$WORK/udp_server_err" &
+UDP_SERVER=$!
+for _ in $(seq 150); do
+    grep -q "listening on" "$WORK/udp_server_err" && break
+    sleep 0.2
+done
+python3 - <<'PYEOF' || { echo "FAIL UDP echo server: kernel client:"; cat "$WORK/udp_server_err"; exit 1; }
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("10.9.0.2", 0))
+s.settimeout(5)
+for i in range(5):
+    msg = b"udp e2e %d " % i + bytes(range(i * 40 % 256))
+    s.sendto(msg, ("10.9.0.1", 7008))
+    data, peer = s.recvfrom(65535)
+    if data != msg or peer != ("10.9.0.1", 7008):
+        sys.exit(f"bad echo {i}: {data!r} from {peer}")
+PYEOF
+wait "$UDP_SERVER" || { echo "FAIL UDP echo server: exit status $?"; cat "$WORK/udp_server_err"; exit 1; }
+grep -q "echoed=5" "$WORK/udp_server_err" \
+    || { echo "FAIL UDP echo server:"; cat "$WORK/udp_server_err"; exit 1; }
+echo "PASS UDP echo server (5 datagrams from a kernel socket)"
 
 echo "ALL E2E TESTS PASSED"

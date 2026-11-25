@@ -31,8 +31,17 @@ fn check(what: &'static str, rc: i32) -> Result<(), PortError> {
 /// Negotiated device features. Unsupported features stay disabled.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Offloads {
+    /// IPv4 + TCP checksums are computed by the NIC on TX.
     pub tx_checksum: bool,
+    /// IPv4 + TCP checksums are verified by the NIC on RX.
     pub rx_checksum: bool,
+    /// IPv4 + UDP checksums are computed by the NIC on TX. Negotiated
+    /// independently of [`tx_checksum`](Self::tx_checksum): a device
+    /// without UDP offload keeps its TCP fast path.
+    pub tx_udp_checksum: bool,
+    /// IPv4 + UDP checksums are verified by the NIC on RX; only then is an
+    /// L4-good flag on a received datagram trusted.
+    pub rx_udp_checksum: bool,
     pub tso_max_payload: usize,
     pub tx_multi_segment: bool,
     pub tx_max_segments: usize,
@@ -97,6 +106,10 @@ pub struct EthPort {
     /// via mbuf flags, so the stack can skip software verification when the
     /// flag says GOOD.
     rx_cksum_offload: bool,
+    /// Datagrams to a local ephemeral port arrive on the queue
+    /// [`PortSteering::queue_of`](super::steering::PortSteering::queue_of)
+    /// names; see [`EthPort::udp_steered`].
+    udp_steered: bool,
 }
 
 impl EthPort {
@@ -189,6 +202,23 @@ impl EthPort {
         // state per packet.
         let tx_cksum_offload = tx_en == tx_want;
         let rx_cksum_offload = rx_en == rx_want;
+        // UDP the same way, but on its own: a device that can offload one
+        // L4 protocol and not the other still gets the one it can. The IPv4
+        // checksum offload is shared, so UDP needs it too.
+        let tx_udp_want =
+            (ffi::RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | ffi::RTE_ETH_TX_OFFLOAD_UDP_CKSUM) as u64;
+        let rx_udp_want =
+            (ffi::RTE_ETH_RX_OFFLOAD_IPV4_CKSUM | ffi::RTE_ETH_RX_OFFLOAD_UDP_CKSUM) as u64;
+        let tx_udp_cksum_offload = tx_udp_want & info.tx_offload_capa == tx_udp_want;
+        let rx_udp_cksum_offload = rx_udp_want & info.rx_offload_capa == rx_udp_want;
+        if tx_udp_cksum_offload {
+            tx_en |= tx_udp_want;
+        }
+        let rx_en = if rx_udp_cksum_offload {
+            rx_en | rx_udp_want
+        } else {
+            rx_en
+        };
 
         let multi = info.tx_offload_capa & ffi::RTE_ETH_TX_OFFLOAD_MULTI_SEGS as u64 != 0;
         let tx_max_segments = if multi {
@@ -231,6 +261,8 @@ impl EthPort {
         let offloads = Offloads {
             tx_checksum: tx_cksum_offload,
             rx_checksum: rx_cksum_offload,
+            tx_udp_checksum: tx_udp_cksum_offload,
+            rx_udp_checksum: rx_udp_cksum_offload,
             tso_max_payload,
             tx_multi_segment: multi,
             tx_max_segments,
@@ -252,8 +284,13 @@ impl EthPort {
         conf.rxmode.offloads = rx_en;
         // Traffic no flow rule claims is spread by RSS over the TCP
         // 4-tuple, with the device's default key: all that matters is that
-        // one connection always hashes to one queue.
-        let rss = (ffi::RTE_ETH_RSS_IPV4 | ffi::RTE_ETH_RSS_NONFRAG_IPV4_TCP) as u64
+        // one connection always hashes to one queue. UDP is hashed over
+        // its 4-tuple too where the device can, which spreads a server
+        // port's peers over the queues (each worker binds such a port; see
+        // `udp_steered`) instead of piling them all onto one.
+        let rss = (ffi::RTE_ETH_RSS_IPV4
+            | ffi::RTE_ETH_RSS_NONFRAG_IPV4_TCP
+            | ffi::RTE_ETH_RSS_NONFRAG_IPV4_UDP) as u64
             & info.flow_type_rss_offloads;
         if queues > 1 && rss != 0 {
             conf.rxmode.mq_mode = ffi::RTE_ETH_MQ_RX_RSS;
@@ -301,9 +338,40 @@ impl EthPort {
             ffi::rte_eth_promiscuous_enable(port_id)
         })?;
 
+        // UDP is steered by the same rules as TCP where the device takes
+        // them, so a datagram to a local ephemeral port reaches the one
+        // worker that bound it. Unlike TCP's, these rules are best effort:
+        // without them a datagram may arrive on any queue, which the
+        // worker layer handles by binding such ports on every queue
+        // (fan-in), at no cost to TCP. A device that takes only some of the
+        // rules gets none, so that no port is half steered. With one queue,
+        // or when the harness plays the NIC (`Unmanaged`), there is nothing
+        // to install and every port counts as steered.
+        let mut udp_steered = true;
         if steering == QueueSteering::FlowRules {
             for rule in super::steering::PortSteering::new(queues).rules() {
-                install_flow_rule(port_id, rule)?;
+                install_flow_rule(port_id, rule, L4Proto::Tcp)?;
+            }
+            let mut udp_flows = Vec::new();
+            for rule in super::steering::PortSteering::new(queues).rules() {
+                match install_flow_rule(port_id, rule, L4Proto::Udp) {
+                    Ok(flow) => udp_flows.push(flow),
+                    Err(_) => {
+                        udp_steered = false;
+                        break;
+                    }
+                }
+            }
+            if !udp_steered {
+                for flow in udp_flows {
+                    // SAFETY: `flow` was created on this port and is
+                    // destroyed once. A failure leaves the rule in place,
+                    // which only steers those ports as intended.
+                    unsafe {
+                        let mut error: ffi::rte_flow_error = core::mem::zeroed();
+                        ffi::rte_flow_destroy(port_id, flow, &mut error);
+                    }
+                }
             }
         }
 
@@ -318,6 +386,7 @@ impl EthPort {
                 mtu,
                 tx_cksum_offload,
                 rx_cksum_offload,
+                udp_steered,
             })
             .collect())
     }
@@ -364,6 +433,28 @@ impl EthPort {
     /// Whether IPv4 + TCP RX checksum offload is active on this port.
     pub fn rx_cksum_offload(&self) -> bool {
         self.rx_cksum_offload
+    }
+
+    /// Whether IPv4 + UDP TX checksum offload is active on this port
+    /// (independently of TCP's): outgoing datagrams then carry only the
+    /// pseudo-header sum, with the mbuf's UDP offload flag set.
+    pub fn tx_udp_cksum_offload(&self) -> bool {
+        self.offloads.tx_udp_checksum
+    }
+
+    /// Whether IPv4 + UDP RX checksum offload is active on this port, so a
+    /// datagram the NIC marks L4-good skips software verification.
+    pub fn rx_udp_cksum_offload(&self) -> bool {
+        self.offloads.rx_udp_checksum
+    }
+
+    /// Whether UDP datagrams to a local ephemeral port are delivered to the
+    /// queue that [`steering`](Self::steering) assigns that port, as TCP
+    /// segments are. Always true with one queue. False when the device
+    /// refused the UDP flow rules: a datagram may then arrive on any
+    /// queue, and a socket must be bound on all of them to see it.
+    pub fn udp_steered(&self) -> bool {
+        self.udp_steered
     }
 
     pub fn mac_addr(&self) -> Result<EthAddr, PortError> {
@@ -474,19 +565,47 @@ impl EthPort {
     }
 }
 
-/// Programs the device to deliver TCP segments whose destination port
-/// matches `rule` to its queue: `eth / ipv4 / tcp dst is PORT mask MASK`,
-/// action `queue`.
-fn install_flow_rule(port_id: u16, rule: super::steering::FlowRule) -> Result<(), PortError> {
+/// The transport protocol a flow rule matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum L4Proto {
+    Tcp,
+    Udp,
+}
+
+/// Programs the device to deliver segments (or datagrams) of `proto` whose
+/// destination port matches `rule` to its queue:
+/// `eth / ipv4 / {tcp|udp} dst is PORT mask MASK`, action `queue`.
+fn install_flow_rule(
+    port_id: u16,
+    rule: super::steering::FlowRule,
+    proto: L4Proto,
+) -> Result<*mut ffi::rte_flow, PortError> {
     // SAFETY: every structure is plain C data for which all-zero is valid,
     // and all of it outlives the two calls that read it.
     unsafe {
         let mut attr: ffi::rte_flow_attr = core::mem::zeroed();
         attr.set_ingress(1);
-        let mut spec: ffi::rte_flow_item_tcp = core::mem::zeroed();
-        let mut mask: ffi::rte_flow_item_tcp = core::mem::zeroed();
-        spec.hdr.dst_port = rule.dst_port.to_be();
-        mask.hdr.dst_port = rule.mask.to_be();
+        let mut tcp_spec: ffi::rte_flow_item_tcp = core::mem::zeroed();
+        let mut tcp_mask: ffi::rte_flow_item_tcp = core::mem::zeroed();
+        tcp_spec.hdr.dst_port = rule.dst_port.to_be();
+        tcp_mask.hdr.dst_port = rule.mask.to_be();
+        let mut udp_spec: ffi::rte_flow_item_udp = core::mem::zeroed();
+        let mut udp_mask: ffi::rte_flow_item_udp = core::mem::zeroed();
+        udp_spec.hdr.dst_port = rule.dst_port.to_be();
+        udp_mask.hdr.dst_port = rule.mask.to_be();
+        let (l4_type, spec, mask): (_, *const std::ffi::c_void, *const std::ffi::c_void) =
+            match proto {
+                L4Proto::Tcp => (
+                    ffi::RTE_FLOW_ITEM_TYPE_TCP,
+                    (&raw const tcp_spec).cast(),
+                    (&raw const tcp_mask).cast(),
+                ),
+                L4Proto::Udp => (
+                    ffi::RTE_FLOW_ITEM_TYPE_UDP,
+                    (&raw const udp_spec).cast(),
+                    (&raw const udp_mask).cast(),
+                ),
+            };
         let item = |type_| ffi::rte_flow_item {
             type_,
             spec: ptr::null(),
@@ -497,10 +616,10 @@ fn install_flow_rule(port_id: u16, rule: super::steering::FlowRule) -> Result<()
             item(ffi::RTE_FLOW_ITEM_TYPE_ETH),
             item(ffi::RTE_FLOW_ITEM_TYPE_IPV4),
             ffi::rte_flow_item {
-                type_: ffi::RTE_FLOW_ITEM_TYPE_TCP,
-                spec: (&raw const spec).cast(),
+                type_: l4_type,
+                spec,
                 last: ptr::null(),
-                mask: (&raw const mask).cast(),
+                mask,
             },
             item(ffi::RTE_FLOW_ITEM_TYPE_END),
         ];
@@ -517,7 +636,10 @@ fn install_flow_rule(port_id: u16, rule: super::steering::FlowRule) -> Result<()
         ];
         let mut error: ffi::rte_flow_error = core::mem::zeroed();
         check(
-            "rte_flow_validate (device cannot steer by TCP destination port)",
+            match proto {
+                L4Proto::Tcp => "rte_flow_validate (device cannot steer by TCP destination port)",
+                L4Proto::Udp => "rte_flow_validate (device cannot steer by UDP destination port)",
+            },
             ffi::rte_flow_validate(
                 port_id,
                 &attr,
@@ -539,6 +661,6 @@ fn install_flow_rule(port_id: u16, rule: super::steering::FlowRule) -> Result<()
                 rc: -libc::EIO,
             });
         }
+        Ok(flow)
     }
-    Ok(())
 }

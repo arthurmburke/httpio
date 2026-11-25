@@ -6,6 +6,7 @@ use super::checksum;
 
 pub const IPV4_HDR_LEN: usize = 20;
 pub const PROTO_TCP: u8 = 6;
+pub const PROTO_UDP: u8 = 17;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4Header {

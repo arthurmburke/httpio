@@ -35,7 +35,7 @@ use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::core::spinlock::SpinLock;
-use crate::dpdk::tcp::app_wake::AppWake;
+use crate::dpdk::tcp::app_wake::{AppWake, Parker};
 use crate::dpdk::tcp::worker::{
     CmdTx, Command, Inbound, InboundRx, OpenError, SendCredit, WorkerHandle,
 };
@@ -257,16 +257,6 @@ fn aborted() -> io::Error {
         io::ErrorKind::ConnectionAborted,
         "connection aborted through its flush handle",
     )
-}
-
-/// A stream's hold on its waker slot; forgets the stored waker when the
-/// stream goes away, so the driver stops spinning on its behalf.
-struct Parker(Arc<AppWake>);
-
-impl Drop for Parker {
-    fn drop(&mut self) {
-        self.0.unpark();
-    }
 }
 
 /// Where a connection stands as seen from the application side, driven by

@@ -1,4 +1,6 @@
-mod app_wake;
+/// Shared with UDP sockets (`crate::dpdk::udp`), which wait for their
+/// worker the same way streams do.
+pub(crate) mod app_wake;
 pub mod congestion;
 pub mod engine;
 pub mod rto;

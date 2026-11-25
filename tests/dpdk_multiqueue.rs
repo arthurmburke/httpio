@@ -2,11 +2,14 @@
 //! against a server on a second port. `net_ring` has neither flow rules
 //! nor a wire, so the test plays the NIC: it carries frames between the
 //! ports and delivers each one to the queue that the port's
-//! `PortSteering` (and so the real flow rules) would.
+//! `PortSteering` (and so the real flow rules) would, and spreads the rest
+//! of UDP over the queues as RSS would. UDP runs on the same engines after
+//! TCP: a steered ephemeral port, a server port bound on both engines, and
+//! the fallback for a device that refused the UDP flow rules.
 #![cfg(dpdk)]
 
 use httpio::core::time::Instant;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use bytes::Bytes;
 use httpio::dpdk::net::arp::SharedNeighbors;
@@ -20,14 +23,25 @@ const CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 1);
 const SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 9, 0, 2);
 
 /// The queue a NIC programmed with `steering`'s rules puts `frame` on:
-/// TCP by destination port, everything else (ARP) on queue 0.
-fn nic_queue(steering: PortSteering, frame: &[u8]) -> usize {
-    let is_ipv4_tcp = frame.len() >= 38 && frame[12..14] == [0x08, 0x00] && frame[23] == 6;
-    if !is_ipv4_tcp {
+/// TCP by destination port; UDP by destination port too where a rule
+/// matches it and the device took the UDP rules (`udp_steered`), else
+/// spread by RSS (played here by the source port); everything else (ARP)
+/// on queue 0.
+fn nic_queue(steering: PortSteering, udp_steered: bool, frame: &[u8]) -> usize {
+    if frame.len() < 38 || frame[12..14] != [0x08, 0x00] {
         return 0;
     }
+    let src_port = u16::from_be_bytes([frame[34], frame[35]]);
     let dst_port = u16::from_be_bytes([frame[36], frame[37]]);
-    usize::from(steering.queue_of(dst_port).unwrap_or(0))
+    let rss = usize::from(src_port) % usize::from(steering.queues());
+    match frame[23] {
+        6 => usize::from(steering.queue_of(dst_port).unwrap_or(0)),
+        17 => match steering.queue_of(dst_port) {
+            Some(queue) if udp_steered => usize::from(queue),
+            _ => rss,
+        },
+        _ => 0,
+    }
 }
 
 #[test]
@@ -114,7 +128,7 @@ fn each_queue_carries_the_connections_whose_ports_lead_to_it() {
                 server.poll(&server_port, &server_pool, now);
                 // Server to client: the NIC picks the queue.
                 for frame in server_port.rx_burst(64) {
-                    let queue = nic_queue(steering, frame.data());
+                    let queue = nic_queue(steering, true, frame.data());
                     delivered[queue] += 1;
                     let port: &EthPort = [&queue0, &queue1][queue];
                     assert!(port.tx_burst(vec![frame]).is_empty());
@@ -183,10 +197,116 @@ fn each_queue_carries_the_connections_whose_ports_lead_to_it() {
         assert_eq!(engine0.state(conn1), None);
         assert_eq!(engine1.state(conn0), None);
 
+        udp_on_both_queues(
+            [&mut engine0, &mut engine1],
+            &mut server,
+            [(&queue0, &pool0), (&queue1, &pool1)],
+            (&server_port, &server_pool),
+        );
+
         drop((engine0, engine1, server));
         let _: Vec<Mbuf> = queue0.rx_burst(64);
         let _: Vec<Mbuf> = queue1.rx_burst(64);
         let _: Vec<Mbuf> = server_port.rx_burst(64);
     }
     eal::cleanup();
+}
+
+/// Datagrams from `SENDERS` server ports, one each, which RSS spreads over
+/// both queues unless a flow rule claims their destination port.
+const SENDERS: std::ops::Range<u16> = 9000..9008;
+
+/// UDP on the engines the TCP part left running (their ARP tables, shared,
+/// already know the server). `bind` is what `WorkerHandle::bind_udp` would
+/// do per engine.
+fn udp_on_both_queues(
+    clients: [&mut TcpEngine; 2],
+    server: &mut TcpEngine,
+    queues: [(&EthPort, &Mempool); 2],
+    (server_port, server_pool): (&EthPort, &Mempool),
+) {
+    let steering = queues[0].0.steering();
+    let [engine0, engine1] = clients;
+    let mut engines = [engine0, engine1];
+    let pump = |engines: &mut [&mut TcpEngine; 2], server: &mut TcpEngine, udp_steered| {
+        for _ in 0..5 {
+            let now = Instant::now();
+            for (engine, (queue, pool)) in engines.iter_mut().zip(queues) {
+                engine.poll(queue, pool, now);
+                let frames = queue.rx_burst(64);
+                assert!(server_port.tx_burst(frames).is_empty());
+            }
+            server.poll(server_port, server_pool, now);
+            for frame in server_port.rx_burst(64) {
+                let queue = nic_queue(steering, udp_steered, frame.data());
+                assert!(queues[queue].0.tx_burst(vec![frame]).is_empty());
+            }
+        }
+    };
+    for port in SENDERS {
+        server.udp_mut().bind(port).unwrap();
+    }
+    let send_all = |server: &mut TcpEngine, dst: u16| {
+        for port in SENDERS {
+            let to = SocketAddrV4::new(CLIENT_IP, dst);
+            let payload = Bytes::copy_from_slice(&port.to_be_bytes());
+            server.udp_mut().send_to(port, to, payload).unwrap();
+        }
+    };
+    let received = |engine: &TcpEngine, port| engine.udp().pending_rx(port);
+    let first_on = |queue| {
+        (EPHEMERAL_FIRST + 2..)
+            .find(|&port| steering.queue_of(port) == Some(queue))
+            .unwrap()
+    };
+    let total = SENDERS.len();
+
+    // A steered ephemeral port is bound on its one engine, and every
+    // datagram to it lands there, whatever RSS would have made of it.
+    let steered = first_on(1);
+    engines[1].udp_mut().bind(steered).unwrap();
+    send_all(server, steered);
+    pump(&mut engines, server, true);
+    assert_eq!(received(engines[1], steered), total);
+    assert_eq!(engines[0].udp().counters().rx_unbound, 0, "none strayed");
+
+    // A server port matches no rule: RSS spreads its peers over both
+    // queues, and the port is bound on both engines (fan-in).
+    for engine in &mut engines {
+        engine.udp_mut().bind(7007).unwrap();
+    }
+    send_all(server, 7007);
+    pump(&mut engines, server, true);
+    let (on0, on1) = (received(engines[0], 7007), received(engines[1], 7007));
+    assert_eq!(on0 + on1, total);
+    assert!(on0 > 0 && on1 > 0, "RSS used both queues: {on0} + {on1}");
+    // Either engine replies through its own queue.
+    let reply = SocketAddrV4::new(SERVER_IP, SENDERS.start);
+    for engine in &mut engines {
+        let pong = Bytes::from_static(b"pong");
+        engine.udp_mut().send_to(7007, reply, pong).unwrap();
+    }
+    pump(&mut engines, server, true);
+    assert_eq!(received(server, SENDERS.start), 2);
+
+    // A device that refused the UDP rules: even an ephemeral port's
+    // datagrams go where RSS puts them, so the port is bound on every
+    // engine (`udp_steered == false`), and those that land off its steered
+    // queue still arrive.
+    let unsteered = first_on(0);
+    for engine in &mut engines {
+        engine.udp_mut().bind(unsteered).unwrap();
+    }
+    send_all(server, unsteered);
+    pump(&mut engines, server, false);
+    let (on0, on1) = (
+        received(engines[0], unsteered),
+        received(engines[1], unsteered),
+    );
+    assert_eq!(on0 + on1, total);
+    assert!(on1 > 0, "some landed off the steered queue");
+    for engine in &engines {
+        assert_eq!(engine.udp().counters().rx_unbound, 0);
+        assert_eq!(engine.udp().counters().rx_bad_checksum, 0);
+    }
 }

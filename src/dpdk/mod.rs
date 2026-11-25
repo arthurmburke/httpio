@@ -21,6 +21,7 @@ pub mod tcp;
 pub(crate) mod testing;
 pub mod tls;
 pub mod tokio;
+pub mod udp;
 
 pub use lcore::{WorkerJoin, first_worker_lcore, launch};
 pub use mbuf::{Mbuf, MbufSlice};

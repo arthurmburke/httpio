@@ -23,6 +23,7 @@ use crate::core::hashset::HashSet;
 use crate::dpdk::net::arp::ArpTable;
 use crate::dpdk::net::eth::EthAddr;
 use crate::dpdk::net::{arp, eth, ipv4, tcp};
+use crate::dpdk::udp::UdpEngine;
 use crate::dpdk::{EthPort, Mbuf, MbufSlice, Mempool};
 use table::{ConnId, ConnTable};
 
@@ -34,6 +35,9 @@ use super::tx_queue::Payload;
 
 const MAX_RX_BURST: usize = 64;
 const MAX_PENDING_TX: usize = 256;
+/// Slots under [`MAX_PENDING_TX`] that UDP output leaves free for the ARP
+/// requests it may queue itself.
+const UDP_CONTROL_RESERVE: usize = 4;
 pub const DEFAULT_TX_BUDGET: usize = 64;
 const ARP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the port may refuse the packet at the head of the transmit
@@ -203,6 +207,14 @@ impl EngineConfig {
     }
 }
 
+/// An Ethernet frame carrying IPv4 protocol 17 (by its headers' fixed
+/// offsets; nothing else is checked).
+fn is_ipv4_udp(frame: &[u8]) -> bool {
+    frame.len() > eth::ETH_HDR_LEN + 9
+        && frame[12..14] == eth::ETHERTYPE_IPV4.to_be_bytes()
+        && frame[eth::ETH_HDR_LEN + 9] == ipv4::PROTO_UDP
+}
+
 fn parse_ipv4(s: &str) -> Result<Ipv4Addr, String> {
     s.parse::<Ipv4Addr>()
         .map_err(|_| format!("invalid IPv4 address {s:?}"))
@@ -255,6 +267,9 @@ pub struct TcpEngine {
     /// eagerly (mac already resolved) rather than routed through a Tcb,
     /// since there is no Tcb for an unknown 4-tuple.
     pending_raw_resets: Vec<(EthAddr, Ipv4Addr, tcp::TcpHeader)>,
+    /// The UDP layer, which shares this engine's queue, receive loop, ARP
+    /// table and transmit batch (see [`crate::dpdk::udp`]).
+    udp: UdpEngine,
 }
 
 impl TcpEngine {
@@ -282,7 +297,19 @@ impl TcpEngine {
             pending_tx: VecDeque::new(),
             updated: Vec::new(),
             segments: Vec::new(),
+            udp: UdpEngine::new(),
         }
+    }
+
+    /// The UDP layer of this engine.
+    pub fn udp(&self) -> &UdpEngine {
+        &self.udp
+    }
+
+    /// The UDP layer of this engine, to bind ports and send and receive
+    /// datagrams.
+    pub fn udp_mut(&mut self) -> &mut UdpEngine {
+        &mut self.udp
     }
 
     /// Maximum output packets per connection per poll, clamped to the global
@@ -586,6 +613,7 @@ impl TcpEngine {
         let metrics_start = Instant::now();
         events.clear();
         self.updated.clear();
+        self.udp.begin_poll(port, pool);
         self.arp.expire(now);
         // The burst is received into uninitialized stack storage and each
         // packet is taken out of it exactly once: an idle poll (most polls)
@@ -610,6 +638,9 @@ impl TcpEngine {
             // corresponding software check. When RX offload is off the
             // flags read UNKNOWN, so both fall back to software verify.
             if mbuf.rx_ip_cksum_bad() || mbuf.rx_l4_cksum_bad() {
+                if is_ipv4_udp(mbuf.data()) {
+                    self.udp.count_nic_bad_checksum();
+                }
                 continue;
             }
             let ip_ok = mbuf.rx_ip_cksum_good();
@@ -801,10 +832,14 @@ impl TcpEngine {
             }
         }
 
+        // Control frames: ARP replies and resets for unknown 4-tuples.
+        // They are few (at most one per received packet) and are never
+        // held back by the batch's cap: a cap that broke out of these
+        // drains would discard what was left, and an unanswered ARP
+        // request strands every peer that wants to reach us. They overshoot
+        // `MAX_PENDING_TX` by at most a receive burst, and the batch's stall
+        // handling still bounds it.
         for (dst_mac, dst_ip) in self.pending_arp_replies.drain(..) {
-            if self.tx_batch.len() + self.pending_tx.len() >= MAX_PENDING_TX {
-                break;
-            }
             if let Some(mbuf) = build_arp_frame(
                 pool,
                 arp::OP_REPLY,
@@ -817,26 +852,7 @@ impl TcpEngine {
                 self.tx_owners.push(None);
             }
         }
-        for dst_ip in self.arp.drain_requests() {
-            if self.tx_batch.len() + self.pending_tx.len() >= MAX_PENDING_TX {
-                break;
-            }
-            if let Some(mbuf) = build_arp_frame(
-                pool,
-                arp::OP_REQUEST,
-                self.config.local_mac,
-                self.config.local_ip,
-                EthAddr::BROADCAST,
-                dst_ip,
-            ) {
-                self.tx_batch.push(mbuf);
-                self.tx_owners.push(None);
-            }
-        }
         for (dst_mac, dst_ip, hdr) in self.pending_raw_resets.drain(..) {
-            if self.tx_batch.len() + self.pending_tx.len() >= MAX_PENDING_TX {
-                break;
-            }
             if let Some(mbuf) = build_ip_tcp_frame(
                 pool,
                 self.config.local_mac,
@@ -847,6 +863,39 @@ impl TcpEngine {
                 &Payload::default(),
                 tx_offload,
                 0,
+            ) {
+                self.tx_batch.push(mbuf);
+                self.tx_owners.push(None);
+            }
+        }
+
+        // UDP output joins the same batch, unowned, after TCP's (whose
+        // packets were produced first) and before the ARP requests: a
+        // datagram whose next hop is unknown queues its request, and that
+        // goes out in this same poll. UDP is not congestion controlled, so
+        // it leaves a few slots under the cap for those requests.
+        if self.udp.has_output() {
+            let reserve = self.arp.pending_requests_len() + UDP_CONTROL_RESERVE;
+            let room = MAX_PENDING_TX
+                .saturating_sub(self.tx_batch.len() + self.pending_tx.len() + reserve);
+            let (tx_batch, tx_owners) = (&mut self.tx_batch, &mut self.tx_owners);
+            self.udp
+                .poll_output(pool, &self.config, &mut self.arp, now, room, |mbuf| {
+                    tx_batch.push(mbuf);
+                    tx_owners.push(None);
+                });
+        }
+
+        // Like the control frames above, never capped: a request left
+        // unsent here would also be rate-limited for `REQUEST_INTERVAL`.
+        for dst_ip in self.arp.drain_requests() {
+            if let Some(mbuf) = build_arp_frame(
+                pool,
+                arp::OP_REQUEST,
+                self.config.local_mac,
+                self.config.local_ip,
+                EthAddr::BROADCAST,
+                dst_ip,
             ) {
                 self.tx_batch.push(mbuf);
                 self.tx_owners.push(None);
@@ -1044,7 +1093,14 @@ impl TcpEngine {
         let Some(ip_hdr) = ipv4::Ipv4Header::parse(buf, !ip_ok) else {
             return;
         };
-        if ip_hdr.protocol != ipv4::PROTO_TCP || ip_hdr.dst != self.config.local_ip {
+        if ip_hdr.protocol != ipv4::PROTO_TCP {
+            if ip_hdr.protocol == ipv4::PROTO_UDP {
+                self.udp
+                    .on_datagram(mbuf, &ip_hdr, self.config.local_ip, l4_ok);
+            }
+            return;
+        }
+        if ip_hdr.dst != self.config.local_ip {
             return;
         }
         let total_len = ip_hdr.total_length as usize;

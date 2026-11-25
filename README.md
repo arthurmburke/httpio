@@ -3,8 +3,8 @@
 A userspace TCP/IP stack over raw DPDK FFI bindings (bindgen-generated at
 build time from the installed DPDK headers — no `dpdk-sys` crate), plus
 an HTTPS-capable HTTP/1.1 + HTTP/2 client that uses it as its transport.
-Terminates TCP directly on top of a DPDK ethdev port: Ethernet + ARP +
-IPv4 + TCP, no kernel network stack involved.
+Terminates TCP and UDP directly on top of a DPDK ethdev port: Ethernet +
+ARP + IPv4 + TCP/UDP, no kernel network stack involved.
 
 ## Status / what's implemented
 
@@ -37,8 +37,8 @@ IPv4 + TCP, no kernel network stack involved.
   collected, not streamed). The transport is `DpdkTcpStream`, a tokio
   `AsyncRead`/`AsyncWrite` adapter that pumps the DPDK engine on every
   poll (busy-poll, matching DPDK's run-to-completion model; use a
-  `current_thread` tokio runtime). No DNS (this stack has no UDP): use
-  IP-literal URLs or map hostnames with `HttpClientBuilder::resolve()`
+  `current_thread` tokio runtime). No DNS client (the stack carries UDP,
+  but nothing resolves names over it yet): use IP-literal URLs or map hostnames with `HttpClientBuilder::resolve()`
   (curl `--resolve` style); certificates still validate against the
   hostname. HTTP/2 connections are pooled per origin and multiplexed
   (requests to the same host share one TCP+TLS connection until the
@@ -83,6 +83,34 @@ IPv4 + TCP, no kernel network stack involved.
   replies to that worker's queue. Local ports must come from 49152..=65535
   when there is more than one worker. See `src/dpdk/steering.rs`.
 
+- **UDP**: datagrams share each worker's engine, receive loop, ARP table
+  and transmit batch with TCP (`UdpEngine` is a layer of `TcpEngine`; the
+  TCP per-packet path pays one protocol branch). Applications use
+  `dpdk::udp::UdpSocket::bind(&handle, port)` (0 = ephemeral):
+  `send_to`/`recv_from` (plus `try_`/`poll_` forms, `connect` +
+  `send`/`recv`, and `split()` into a `Sink` and a `Stream`). Received
+  payloads are views of the RX mbuf, never copied; outgoing payloads are
+  copied once into the packet's mbuf (cheaper than attaching for anything
+  up to an MTU), except one larger than a pool buffer, which is attached
+  from DMA memory on multi-segment-capable ports. With several workers, an ephemeral port is bound on the
+  worker its UDP flow rule steers it to; a server port (or any port on a
+  device that refuses UDP flow rules, which is best effort and leaves TCP
+  steering unaffected) is bound on every worker and received from all of
+  them (fan-in), sending through the first. UDP checksums are offloaded on
+  TX and RX where the NIC supports it, negotiated separately from TCP's,
+  and computed in software otherwise. Queues are bounded: sends apply
+  backpressure up to the engine, then drop on ARP timeout (3 s); a full
+  receive queue drops the newest datagram, and held datagrams never take
+  the last quarter of a worker's receive pool; every drop the engine makes
+  is counted in per-socket `stats()` or engine counters (datagrams a
+  connected socket skips because they were queued before it connected are
+  not). Limits: no IP fragmentation
+  (payloads over MTU - 28, 1472 bytes on a 1500 MTU, are refused; every
+  packet has DF set), received datagrams in chained mbufs are dropped, no
+  ICMP (no port-unreachable), no multicast group membership (IGMP; sending
+  to multicast and limited broadcast works). `udp_echo` is an echo server
+  and round-trip client. See [docs/udp.md](docs/udp.md).
+
 Not implemented (explicitly out of scope): timestamps, tail-loss
 probes, IPv6, IP fragmentation/options, multi-segment (chained) mbufs,
 a route table beyond the single default gateway.
@@ -123,6 +151,28 @@ generates a throwaway CA + server certificate, and exercises the
 - an off-subnet peer reached only via `--gateway` (needs a writable
   `/proc/sys`, i.e. a `--privileged` container; skipped otherwise)
 - and verifies the TLS handshake is *rejected* when the CA isn't trusted.
+- UDP: `udp_echo client` against a python UDP echo server on the kernel
+  side (64-byte and full 1472-byte datagrams, all must come back intact),
+  and `udp_echo server` echoing a kernel socket's datagrams.
+
+The UDP engine and socket API are also covered without a tap device by
+`cargo test --test dpdk_udp` (the engine against a `net_ring` peer) and
+`cargo test --test dpdk_udp_worker` (a real worker lcore driven by
+`UdpSocket` from tokio).
+
+### UDP echo manually
+
+```sh
+# server: echo everything sent to 10.9.0.1:7007
+cargo run --bin udp_echo -- -l 0-1 --no-huge --vdev=net_tap0,iface=dtap0 -- \
+    10.9.0.1 server 7007
+# client: 100 round trips to an echo server, with RTT percentiles
+cargo run --bin udp_echo -- -l 0-1 --no-huge --vdev=net_tap0,iface=dtap0 -- \
+    10.9.0.1 client 10.9.0.2:7007 --count 100 --size 64
+```
+
+`LOCAL_IP[/PREFIX]` and `--gateway IP` work as for `http_get`; `--workers
+N` runs N workers (needs N worker lcores).
 
 ### Fetching a URL manually
 

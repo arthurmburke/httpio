@@ -167,7 +167,7 @@ mod run {
         for _ in 0..yields {
             tokio::task::yield_now().await;
         }
-        handle.terminate();
+        handle.abort();
         let Ok(outcome) = tokio::time::timeout(Duration::from_secs(3), &mut task).await else {
             task.abort();
             panic!("a request terminated {yields} turns into {url} is still waiting");
@@ -209,7 +209,7 @@ mod run {
         probe::arm();
         let start = probe::now_ns();
         if terminate {
-            flush.terminate();
+            flush.abort();
         } else {
             flush.flush();
         }

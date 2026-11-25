@@ -43,7 +43,8 @@ use super::engine::TcpEngine;
 use super::state::TcpState;
 use super::tcb::{Event, FourTuple};
 use crate::dpdk::net::arp::SharedNeighbors;
-use crate::dpdk::steering::PortSteering;
+use crate::dpdk::steering::{EPHEMERAL_FIRST, EPHEMERAL_LAST, PortSteering};
+use crate::dpdk::udp::worker::{self as udp_worker, UdpEndpoints, UdpLink, UdpWorker};
 
 /// Control ring depth (concurrent connection opens in flight).
 const CTRL_CAP: usize = 256;
@@ -254,7 +255,10 @@ impl SendCredit {
 
     fn clear_notification(&self) {
         if let Some(wake) = &self.wake {
-            wake.queued.store(false, Ordering::Release);
+            // A swap, not a store: it reads the application's release
+            // swap if that came first, so the ring pops that follow see
+            // what it pushed (see `app_wake`).
+            wake.queued.swap(false, Ordering::AcqRel);
         }
     }
 }
@@ -692,6 +696,9 @@ struct WorkerLink {
     /// A cross-core observability counter (e.g. to confirm h2 connection
     /// reuse), not a live count.
     connections_opened: Arc<AtomicU64>,
+    /// UDP socket registration and notifications (see
+    /// [`crate::dpdk::udp::worker`]).
+    udp: UdpLink,
 }
 
 /// Why [`WorkerHandle::open`] could not start a connection.
@@ -734,6 +741,14 @@ pub struct WorkerHandle {
     /// the attachment's extra mbufs cost slightly more than the copy.
     dma_writes: bool,
     local_ip: Ipv4Addr,
+    /// Whether the NIC steers UDP like TCP: each ephemeral port's
+    /// datagrams to the one queue `steering` names (see
+    /// [`EthPort::udp_steered`]). If not, a UDP socket is bound on every
+    /// worker, since any of them may receive its datagrams.
+    udp_steered: bool,
+    /// Where the search for a free ephemeral UDP port resumes; shared by
+    /// clones, so sockets bound through any of them take distinct ports.
+    udp_ports: Arc<AtomicU32>,
     /// Shared only by application-side handles. Dropping the final clone drops
     /// `WorkerLifetime`, which signals the worker without a racy strong-count
     /// check. The worker itself deliberately does not own this token.
@@ -815,6 +830,7 @@ impl WorkerHandle {
         let (first_engine, first_port, ..) = workers.first().expect("at least one worker");
         let local_ip = first_engine.local_ip();
         let steering = first_port.steering();
+        let udp_steered = first_port.udp_steered();
         let dma_writes = first_port.offloads().tso_max_payload > 0;
         assert_eq!(
             usize::from(steering.queues()),
@@ -851,6 +867,8 @@ impl WorkerHandle {
                 steering,
                 dma_writes,
                 local_ip,
+                udp_steered,
+                udp_ports: Arc::new(AtomicU32::new(0)),
                 _lifetime: stop,
             },
             joins,
@@ -876,6 +894,7 @@ impl WorkerHandle {
             overflow: overflow.clone(),
         };
         let (notifier, app_ready) = app_wake::channel();
+        let (udp, udp_worker) = udp_worker::channel();
 
         #[cfg(feature = "tcp-metrics")]
         let metrics = super::metrics::Report::default();
@@ -896,6 +915,7 @@ impl WorkerHandle {
                 ready_rx,
                 overflow,
                 notifier,
+                udp_worker,
             );
             #[cfg(feature = "tcp-metrics")]
             {
@@ -912,6 +932,7 @@ impl WorkerHandle {
                 ready,
                 app_ready,
                 connections_opened,
+                udp,
             },
             join,
         ))
@@ -1004,6 +1025,69 @@ impl WorkerHandle {
             .map(|link| link.connections_opened.load(Ordering::Acquire))
             .sum()
     }
+
+    /// The address every worker serves.
+    pub fn local_ip(&self) -> Ipv4Addr {
+        self.local_ip
+    }
+
+    /// Whether the NIC delivers each ephemeral UDP port's datagrams to one
+    /// worker's queue, as it does TCP's. When it does not (a device that
+    /// refused the UDP flow rules), a UDP socket is bound on every worker.
+    pub fn udp_steered(&self) -> bool {
+        self.udp_steered
+    }
+
+    /// Registers a UDP socket on `local_port` with the workers that may
+    /// receive its datagrams, returning the application's ends of its
+    /// rings on each, in worker order. Each worker's reply (bound, or the
+    /// port already in use) is the first message on its inbound ring.
+    ///
+    /// Which workers: just the one whose queue the NIC steers the port to,
+    /// when there are several and the NIC steers UDP (an ephemeral port);
+    /// otherwise all of them, since RSS or a device without UDP rules may
+    /// hand the port's datagrams to any queue (fan-in). One worker serves
+    /// everything.
+    pub(crate) fn bind_udp(
+        &self,
+        local_port: u16,
+        connected: Option<std::net::SocketAddrV4>,
+    ) -> Result<Vec<UdpEndpoints>, OpenError> {
+        udp_workers(&self.links, self.steering, self.udp_steered, local_port)
+            .iter()
+            .map(|link| {
+                link.udp
+                    .bind(local_port, connected, &link.app_ready)
+                    .map_err(|udp_worker::Busy| OpenError::Busy)
+            })
+            .collect()
+    }
+
+    /// The next ephemeral port to try binding a UDP socket to, cycling
+    /// through 49152..=65535.
+    pub(crate) fn next_udp_port(&self) -> u16 {
+        let span = u32::from(EPHEMERAL_LAST - EPHEMERAL_FIRST) + 1;
+        let offset = self.udp_ports.fetch_add(1, Ordering::Relaxed) % span;
+        EPHEMERAL_FIRST + offset as u16
+    }
+}
+
+/// The workers a UDP socket on `local_port` is bound on; see
+/// [`WorkerHandle::bind_udp`].
+fn udp_workers(
+    links: &[WorkerLink],
+    steering: PortSteering,
+    udp_steered: bool,
+    local_port: u16,
+) -> &[WorkerLink] {
+    match steering.queue_of(local_port) {
+        _ if links.len() == 1 => links,
+        Some(queue) if udp_steered => {
+            let queue = usize::from(queue);
+            &links[queue..=queue]
+        }
+        _ => links,
+    }
 }
 
 /// Drains bounded notifications, visiting the map only on queue overflow.
@@ -1048,6 +1132,7 @@ fn run(
     ready_rx: MpscRx<FourTuple, READY_CAP>,
     overflow: Arc<AtomicBool>,
     mut notifier: AppNotifier,
+    mut udp: UdpWorker,
 ) {
     let mut conns: HashMap<FourTuple, WorkerConn> = HashMap::default();
     // Mirror of the last value published to `connections_opened`, so the
@@ -1103,6 +1188,8 @@ fn run(
                 connections_opened.store(opened, Ordering::Release);
             }
         }
+
+        udp.register(&mut engine, &port, &pool, &mut notifier);
 
         collect_ready(&ready_rx, &overflow, &conns, &mut work);
         work.extend(closing.iter().copied());
@@ -1170,6 +1257,9 @@ fn run(
             }
         }
 
+        // UDP sockets' sends, to go out in this iteration's poll.
+        udp.apply(&mut engine, &mut notifier);
+
         // 3. Pump the engine: rx burst, state machines, timers, tx burst.
         // One clock read per iteration serves the engine and the reaping
         // below; an iteration is far shorter than any deadline it checks.
@@ -1183,6 +1273,7 @@ fn run(
             };
             conn.on_event(ev);
         }
+        udp.deliver(&mut engine, &mut notifier);
 
         // 4. Deliver received bytes, then the terminal signal, to the app.
         for tuple in work.drain() {
@@ -1236,6 +1327,7 @@ fn run(
     while let Some(nc) = ctrl_rx.pop() {
         wakes.push(nc.app_wake.clone());
     }
+    udp.shutdown(&mut wakes);
     for wake in &wakes {
         notifier.notify(wake);
     }
@@ -1679,6 +1771,7 @@ mod tests {
                 },
                 app_ready: app_wake::channel().1,
                 connections_opened: Arc::new(AtomicU64::new(0)),
+                udp: udp_worker::channel().0,
             };
             (link, ctrl_rx)
         };
@@ -1688,6 +1781,8 @@ mod tests {
             links: links.into(),
             local_ip: Ipv4Addr::UNSPECIFIED,
             dma_writes: false,
+            udp_steered: true,
+            udp_ports: Arc::new(AtomicU32::new(0)),
             _lifetime: Signal::new(),
         };
         let remote = Ipv4Addr::new(10, 0, 0, 2);
@@ -1723,6 +1818,88 @@ mod tests {
         assert_eq!(rx.pop().unwrap().local_port, 1234);
     }
 
+    /// A UDP socket goes to the one worker its port is steered to when the
+    /// NIC steers UDP, and to every worker when its datagrams may land on
+    /// any queue: a port outside the steered range, or a device that
+    /// refused the UDP rules.
+    #[test]
+    fn a_udp_socket_is_bound_where_its_datagrams_can_arrive() {
+        let link = || {
+            let (ctrl_tx, _) = mpsc::channel::<NewConn, CTRL_CAP>();
+            let (tx, _) = mpsc::channel();
+            WorkerLink {
+                #[cfg(feature = "tcp-metrics")]
+                metrics: crate::dpdk::tcp::metrics::Report::default(),
+                ctrl_tx,
+                ready: ReadySender {
+                    tx,
+                    overflow: Arc::new(AtomicBool::new(false)),
+                },
+                app_ready: app_wake::channel().1,
+                connections_opened: Arc::new(AtomicU64::new(0)),
+                udp: udp_worker::channel().0,
+            }
+        };
+        let links: Vec<_> = (0..3).map(|_| link()).collect();
+        let indices = |chosen: &[WorkerLink]| -> Vec<usize> {
+            chosen
+                .iter()
+                .map(|c| links.iter().position(|l| std::ptr::eq(l, c)).unwrap())
+                .collect()
+        };
+        let steering = PortSteering::new(3);
+        for port in [
+            EPHEMERAL_FIRST,
+            EPHEMERAL_FIRST + 1,
+            EPHEMERAL_FIRST + 2,
+            60001,
+        ] {
+            let queue = usize::from(steering.queue_of(port).unwrap());
+            assert_eq!(indices(udp_workers(&links, steering, true, port)), [queue]);
+            assert_eq!(
+                indices(udp_workers(&links, steering, false, port)),
+                [0, 1, 2]
+            );
+        }
+        assert_eq!(indices(udp_workers(&links, steering, true, 53)), [0, 1, 2]);
+        let single = udp_workers(&links[..1], PortSteering::single(), false, 53);
+        assert_eq!(indices(single), [0]);
+    }
+
+    #[test]
+    fn ephemeral_udp_ports_cycle_through_the_range_across_clones() {
+        let (ctrl_tx, _) = mpsc::channel::<NewConn, CTRL_CAP>();
+        let (tx, _) = mpsc::channel();
+        let handle = WorkerHandle {
+            send_config: SendConfig::default(),
+            links: Arc::new([WorkerLink {
+                #[cfg(feature = "tcp-metrics")]
+                metrics: crate::dpdk::tcp::metrics::Report::default(),
+                ctrl_tx,
+                ready: ReadySender {
+                    tx,
+                    overflow: Arc::new(AtomicBool::new(false)),
+                },
+                app_ready: app_wake::channel().1,
+                connections_opened: Arc::new(AtomicU64::new(0)),
+                udp: udp_worker::channel().0,
+            }]),
+            steering: PortSteering::single(),
+            local_ip: Ipv4Addr::UNSPECIFIED,
+            dma_writes: false,
+            udp_steered: true,
+            udp_ports: Arc::new(AtomicU32::new(0)),
+            _lifetime: Signal::new(),
+        };
+        let clone = handle.clone();
+        assert_eq!(handle.next_udp_port(), EPHEMERAL_FIRST);
+        assert_eq!(clone.next_udp_port(), EPHEMERAL_FIRST + 1);
+        for _ in 0..(EPHEMERAL_LAST - EPHEMERAL_FIRST - 1) {
+            assert!(handle.next_udp_port() >= EPHEMERAL_FIRST);
+        }
+        assert_eq!(handle.next_udp_port(), EPHEMERAL_FIRST, "wraps around");
+    }
+
     #[test]
     fn dropping_a_cloned_handle_does_not_stop_the_worker() {
         let (ctrl_tx, _ctrl_rx) = mpsc::channel::<NewConn, CTRL_CAP>();
@@ -1741,10 +1918,13 @@ mod tests {
                 },
                 app_ready: app_wake::channel().1,
                 connections_opened: Arc::new(AtomicU64::new(0)),
+                udp: udp_worker::channel().0,
             }]),
             steering: PortSteering::single(),
             local_ip: Ipv4Addr::UNSPECIFIED,
             dma_writes: false,
+            udp_steered: true,
+            udp_ports: Arc::new(AtomicU32::new(0)),
             _lifetime: stop,
         };
 
